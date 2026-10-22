@@ -24,7 +24,7 @@ Usage:
         -b, --bind HOST:GUEST        Bind host path to custom path inside guest
         -w, --workdir DIR            Initial working directory (default: /root)
         -e, --env KEY=VAL            Pass custom environment variable
-        --no-root-id                 Disable UID/GID 0 virtualization
+        --no-root-id                 Run as the host user (host name/UID/GID); sudo/su still work
         --trace                      Enable debug syscall & seccomp tracing
   prx list                           List all installed rootfs containers
   prx fixperm NAME                   Fix file permissions & clear cache
@@ -214,10 +214,72 @@ return 0
 fi
 LP="$LP:$1"
 }
+prx_addmember() {
+local f="$1" g="$2" m="$3" tmp="$1.prx.$$" line list
+{
+while IFS= read -r line || [ -n "$line" ]; do
+case "$line" in
+"$g":*)
+list="${line##*:}"
+case ",$list," in
+*",$m,"*) ;;
+*) if [ -n "$list" ]; then line="$line,$m"; else line="$line$m"; fi ;;
+esac ;;
+esac
+printf '%s\n' "$line"
+done < "$f"
+} > "$tmp" && cat "$tmp" > "$f"
+rm -f "$tmp"
+}
+prx_setup_user() {
+local R="$1" u="$2" uid="$3" gid="$4"
+local P="$R/etc/passwd" G="$R/etc/group" S="$R/etc/shadow"
+local tmp line n id1 gline="" f
+chmod u+rw "$P" "$G" 2>/dev/null || true
+tmp="$P.prx.$$"
+{
+while IFS= read -r line || [ -n "$line" ]; do
+n="${line%%:*}"; id1="${line#*:*:}"; id1="${id1%%:*}"
+if [ "$n" != root ] && [ "$id1" != 0 ] && { [ "$n" = "$u" ] || [ "$id1" = "$uid" ]; }; then continue; fi
+printf '%s\n' "$line"
+done < "$P"
+printf '%s:x:%s:%s:%s:/home/%s:/bin/bash\n' "$u" "$uid" "$gid" "$u" "$u"
+} > "$tmp" && cat "$tmp" > "$P"
+rm -f "$tmp"
+while IFS= read -r line || [ -n "$line" ]; do
+id1="${line#*:*:}"; id1="${id1%%:*}"
+if [ "$id1" = "$gid" ]; then gline="$line"; break; fi
+done < "$G"
+if [ "$gid" != 0 ] && { [ -z "$gline" ] || [ "$gid" -ge 1000 ]; }; then
+tmp="$G.prx.$$"
+{
+while IFS= read -r line || [ -n "$line" ]; do
+n="${line%%:*}"; id1="${line#*:*:}"; id1="${id1%%:*}"
+if [ "$id1" != 0 ] && { [ "$id1" = "$gid" ] || [ "$n" = "$u" ]; }; then continue; fi
+printf '%s\n' "$line"
+done < "$G"
+printf '%s:x:%s:\n' "$u" "$gid"
+} > "$tmp" && cat "$tmp" > "$G"
+rm -f "$tmp"
+fi
+prx_addmember "$G" sudo "$u"
+if [ -f "$S" ]; then
+chmod u+w "$S" 2>/dev/null || true
+grep -q "^$u:" "$S" 2>/dev/null || printf '%s:*:19000:0:99999:7:::\n' "$u" >> "$S" 2>/dev/null || true
+fi
+if [ ! -d "$R/home/$u" ]; then
+mkdir -p "$R/home/$u"
+if [ -d "$R/etc/skel" ]; then cp -a "$R/etc/skel/." "$R/home/$u/" 2>/dev/null || true; fi
+fi
+chmod 755 "$R/home/$u" 2>/dev/null || true
+for f in usr/bin/sudo usr/bin/su usr/bin/passwd usr/bin/chsh usr/bin/chfn usr/bin/newgrp usr/bin/gpasswd; do
+if [ -f "$R/$f" ] && [ ! -L "$R/$f" ]; then chmod u+s "$R/$f" 2>/dev/null || true; fi
+done
+}
 cmd_login() {
 [ $# -ge 1 ] || { usage; exit 1; }
 local name="$1"; shift
-local R binds="" wd=/root fake=1 bh bg trace=0
+local R binds="" wd=/root wdset=0 fake=1 bh bg trace=0
 local -a extra_envs=()
 chk "$name"
 R="$(rootdir "$name")"
@@ -274,7 +336,7 @@ mkdir -p "$R$bh" 2>/dev/null || true
 binds="${binds:+$binds:}$bh" ;;
 esac
 shift 2 ;;
--w|--workdir) [ $# -ge 2 ] || die "-w requires a directory"; case "$2" in /*) wd="$2" ;; *) die "-w requires an absolute guest path: $2" ;; esac; shift 2 ;;
+-w|--workdir) [ $# -ge 2 ] || die "-w requires a directory"; case "$2" in /*) wd="$2"; wdset=1 ;; *) die "-w requires an absolute guest path: $2" ;; esac; shift 2 ;;
 -e|--env)     [ $# -ge 2 ] || die "-e requires KEY=VALUE"; extra_envs+=("$2"); shift 2 ;;
 --no-root-id) fake=0; shift ;;
 --trace)      trace=1; shift ;;
@@ -282,6 +344,22 @@ shift 2 ;;
 *) break ;;
 esac
 done
+local vuser="" vhome="/root"
+if [ "$fake" = 0 ]; then
+local huid hgid hu
+huid="$(id -u)"; hgid="$(id -g)"
+hu="$(id -un 2>/dev/null)" || hu=""
+[ -n "$hu" ] || hu="$(whoami 2>/dev/null)" || hu=""
+hu="$(printf '%s' "$hu" | tr -c 'A-Za-z0-9._-' '_')"
+case "$hu" in ""|[!A-Za-z_]*) hu="u${hu:-$huid}" ;; esac
+if [ "$huid" = 0 ]; then
+vuser=root; vhome=/root
+else
+vuser="$hu"; vhome="/home/$hu"
+prx_setup_user "$R" "$hu" "$huid" "$hgid"
+[ "$wdset" = 1 ] || wd="$vhome"
+fi
+fi
 if [ ! -f "$SHIM" ] || [ "$SELF" -nt "$SHIM" ]; then
 info "Compiling path-translation shim..."
 cmd_build
@@ -380,8 +458,8 @@ local -a term_envs=()
 [ -n "${COLORTERM:-}" ] && term_envs+=(COLORTERM="$COLORTERM")
 local user_val="root" home_val="/root"
 if [ "$fake" = 0 ]; then
-user_val="$(whoami 2>/dev/null || echo "user")"
-home_val="$wd"
+user_val="$vuser"
+home_val="$vhome"
 fi
 local cur_dns; cur_dns="$(detect_dns)"
 env -i \
@@ -391,7 +469,7 @@ LOCPATH="$R/usr/lib/locale" GCONV_PATH="$GCONV" \
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
 PRX_ROOTFS="$R" PRX_SHIM="$SHIM" PRX_LIBPATH="$LP" PRX_BIND="$binds" \
 PRX_SESSION="$tok" PRX_SELF_EXE="$gshell" \
-LD_LIBRARY_PATH="$LP" PRX_DNS="$cur_dns" PRX_FAKEROOT="$fake" \
+LD_LIBRARY_PATH="$LP" PRX_DNS="$cur_dns" PRX_FAKEROOT="$fake" PRX_VUSER="$vuser" \
 PRX_TRACE="$trace" PRX_LOADER="$PL" \
 GLIBC_TUNABLES="${GLIBC_TUNABLES:-glibc.pthread.rseq=0}" \
 LD_PRELOAD="$SHIM" \
@@ -757,6 +835,21 @@ static char g_self_exe[PM];
 static int g_fake;
 static int g_trace;
 static u32 g_ruid, g_rgid;
+/* virtual credentials for --no-root-id (host user, setuid/sudo emulation) */
+static int g_user;
+static char g_vuser[64];
+static char g_credbuf[1024];
+#define CR_NA ((u32)-1)
+enum { C_RU, C_EU, C_SU, C_FU, C_RG, C_EG, C_SG, C_FG };
+static u32 g_cr[8];
+#define NVG 64
+static u32 g_vg[NVG];
+static int g_nvg;
+static u32 g_pcr[8];
+static int g_pcr_ok;
+#define VROOT() (g_fake || (g_user && g_cr[C_EU] == 0))
+static void cred_init(void);
+static int cr_collect(const char*user, u32 gid, u32*out, int max);
 #define MAXB 64
 static char g_bind[MAXB][160];
 static size_t g_bindlen[MAXB];
@@ -866,6 +959,8 @@ __attribute__((constructor)) static void prx_init(int argc, char**argv, char**en
         else if (envmatch(s, "PRX_SELF_EXE")) copyval(g_self_exe, PM, s+13);
         else if (envmatch(s, "PRX_TRACE")) g_trace = (s[10] == '1');
         else if (envmatch(s, "PRX_FAKEROOT")) g_fake = (s[13] == '1');
+        else if (envmatch(s, "PRX_VUSER")) copyval(g_vuser, sizeof g_vuser, s+10);
+        else if (envmatch(s, "PRX_CRED")) copyval(g_credbuf, sizeof g_credbuf, s+9);
     }
     g_rl = strlen(g_root);
     while (g_rl>1 && g_root[g_rl-1] == '/') g_root[--g_rl] = 0;
@@ -895,6 +990,8 @@ __attribute__((constructor)) static void prx_init(int argc, char**argv, char**en
     if (g_rl) install_sigsys();
     g_ruid = (u32) sc(N_getuid, 0, 0, 0, 0, 0, 0);
     g_rgid = (u32) sc(N_getgid, 0, 0, 0, 0, 0, 0);
+    g_user = (!g_fake && g_vuser[0] && g_rl) ? 1 : 0;
+    if (g_user) cred_init();
 }
 static int in_bind(const char*g) {
     int best = 0;
@@ -1439,22 +1536,44 @@ static int l2_has(u64 d, u64 i) {
     }
     return 0;
 }
-static void fixstat(void*b) {
+static int own_under(const char*g, const char*d) {
+    size_t l = strlen(d);
+    return strncmp(g, d, l) == 0 && (g[l] == 0 || g[l] == '/');
+}
+/* user mode: files that physically belong to the host user are shown as root
+   for system paths of the rootfs and as the user for home/tmp/binds. */
+static int own_is_root_host(const char*h) {
+    if (!h || h[0] != '/' || !hasroot(h)) return 0;
+    const char*g = h+g_rl;
+    if (!*g) return 1;
+    if (!strncmp(g, "/home/", 6) || own_under(g, "/tmp") || own_under(g, "/var/tmp") || own_under(g, "/dev/shm") || own_under(g, "/run/user")) return 0;
+    return 1;
+}
+static int own_is_root_fd(int fd) {
+    char pp[40], hp[PM];
+    if (fd == AT_FDCWD) memcpy(pp, "/proc/self/cwd", 15);
+    else fdpath(pp, fd);
+    long n = sc(N_readlinkat, AT_FDCWD, (long) pp, (long) hp, PM-1, 0, 0);
+    if (n <= 0) return 0;
+    hp[n] = 0;
+    return own_is_root_host(hp);
+}
+static void fixstat_c(void*b, int root) {
     u32*nl = (u32*)((char*) b+OFF_NLINK);
     if (g_l2n && *nl == 1 && l2_has(*(u64*) b, *(u64*)((char*) b+8)))*nl = 2;
-    if (!g_fake) return;
+    if (!g_fake && !(g_user && root)) return;
     u32*u = (u32*)((char*) b+OFF_UID);
     if (u[0] == g_ruid) u[0] = 0;
     if (u[1] == g_rgid) u[1] = 0;
 }
 static int do_stat(int dfd, const char*p, void*buf, int fl) {
     TR1(dfd, p, !(fl&AT_SYMLINK_NOFOLLOW)) long r = SC4(N_newfstatat, dfd, h1, buf, fl);
-    if (r == 0) fixstat(buf);
+    if (r == 0) fixstat_c(buf, g_user ? ((p && *p && h1[0] == '/') ? own_is_root_host(h1) : own_is_root_fd(dfd)) : 1);
     return (int) ret(r);
 }
 static int do_fstat(int fd, void*buf) {
     long r = SC3(N_fstat, fd, buf, 0);
-    if (r == 0) fixstat(buf);
+    if (r == 0) fixstat_c(buf, g_user ? own_is_root_fd(fd) : 1);
     return (int) ret(r);
 }
 EXP int stat(const char*p, void*b) {
@@ -1523,7 +1642,7 @@ EXP int statx(int dfd, const char*p, int fl, unsigned mask, void*buf) {
             u64 dev = ((ma&0xfffff000ULL)<<32)|((ma&0xfffULL)<<8)|((mi&0xffffff00ULL)<<12)|(mi&0xffULL);
             if (l2_has(dev, *(u64*)(c+32)))*nl = 2;
         }
-        if (g_fake) {
+        if (g_fake || (g_user && ((p && *p && h1[0] == '/') ? own_is_root_host(h1) : own_is_root_fd(dfd)))) {
             u32*u = (u32*)(c+20);
             if (u[0] == g_ruid) u[0] = 0;
             if (u[1] == g_rgid) u[1] = 0;
@@ -1533,7 +1652,7 @@ EXP int statx(int dfd, const char*p, int fl, unsigned mask, void*buf) {
 }
 static int do_access(int dfd, const char*p, int mode, int fl) {
     TR1(dfd, p, !(fl&AT_SYMLINK_NOFOLLOW)) long r = SC3(N_faccessat, dfd, h1, mode);
-    if (r == -EACCES && g_fake) {
+    if (r == -EACCES && VROOT()) {
         char st[256];
         if (SC4(N_newfstatat, dfd, h1, st, fl&AT_SYMLINK_NOFOLLOW) == 0) {
             u32 fmode = *(u32*)(st+MODE_OFF);
@@ -1773,7 +1892,7 @@ static long link_fallback(int od, const char*src, int nd, const char*dst, int fo
         }
     }
     copy_done : if (!err) {
-        sc(N_fchmod, out, (g_fake ? (mode|0600) : mode)&07777, 0, 0, 0, 0);
+        sc(N_fchmod, out, (VROOT() ? (mode|0600) : mode)&07777, 0, 0, 0, 0);
         l2_note(st);
     }
     sc(N_close, in, 0, 0, 0, 0, 0);
@@ -1807,20 +1926,20 @@ EXP int symlinkat(const char*target, int d, const char*p) {
     TR1(d, p, 0) return (int) ret(SC3(N_symlinkat, target, d, h1));
 }
 static int fake_mode(const char*st, int m) {
-    if (!g_fake) return m;
+    if (!VROOT()) return m;
     u32 fmode = *(const u32*)(st+MODE_OFF);
     if ((fmode&0170000) == 0040000) return m|0700;
     return m|0600;
 }
 EXP int chmod(const char*p, int m) {
-    TR1(AT_FDCWD, p, 1) if (g_fake) {
+    TR1(AT_FDCWD, p, 1) if (VROOT()) {
         char st[256];
         if (SC4(N_newfstatat, AT_FDCWD, h1, st, 0) == 0) m = fake_mode(st, m);
     }
     return (int) ret(SC3(N_fchmodat, AT_FDCWD, h1, m));
 }
 EXP int fchmod(int fd, int m) {
-    if (g_fake) {
+    if (VROOT()) {
         char st[256];
         if (sc(N_fstat, fd, (long) st, 0, 0, 0, 0) == 0) m = fake_mode(st, m);
     }
@@ -1831,21 +1950,21 @@ EXP int fchmodat(int d, const char*p, int m, int f) {
     if (f&AT_SYMLINK_NOFOLLOW) {
         long r = SC4(N_newfstatat, d, h1, st, AT_SYMLINK_NOFOLLOW);
         if (r<0) {
-            if (g_fake) return 0;
+            if (VROOT()) return 0;
             return (int) ret(r);
         }
         u32 mode = *(u32*)(st+MODE_OFF);
         if ((mode&0170000) == 0120000) return (int) fail(EOPNOTSUPP);
         m = fake_mode(st, m);
-    } else if (g_fake && SC4(N_newfstatat, d, h1, st, 0) == 0) {
+    } else if (VROOT() && SC4(N_newfstatat, d, h1, st, 0) == 0) {
         m = fake_mode(st, m);
     }
     long res = SC3(N_fchmodat, d, h1, m);
-    if (res<0 && g_fake) return 0;
+    if (res<0 && VROOT()) return 0;
     return (int) ret(res);
 }
 static int do_chown(int d, const char*p, u32 u, u32 g, int fl) {
-    TR1(d, p, !(fl&AT_SYMLINK_NOFOLLOW)) if (g_fake) {
+    TR1(d, p, !(fl&AT_SYMLINK_NOFOLLOW)) if (VROOT()) {
         return 0;
     }
     return (int) ret(SC5(N_fchownat, d, h1, u, g, fl));
@@ -1861,7 +1980,7 @@ EXP int fchownat(int d, const char*p, u32 u, u32 g, int f) {
 }
 EXP int fchown(int fd, u32 u, u32 g) {
     static int(*f)(int, u32, u32);
-    if (g_fake) return 0;
+    if (VROOT()) return 0;
     if (!f) f = nextsym("fchown");
     return f(fd, u, g);
 }
@@ -1887,7 +2006,7 @@ EXP int utimensat(int d, const char*p, const void*t, int f) {
 }
 static int do_mknod(int d, const char*p, int m, unsigned long dev) {
     TR1(d, p, 0) long r = SC4(N_mknodat, d, h1, m, dev);
-    if (r == -EPERM && g_fake && ((m&0170000) == 0020000 || (m&0170000) == 0060000)) {
+    if (r == -EPERM && VROOT() && ((m&0170000) == 0020000 || (m&0170000) == 0060000)) {
         long fd = SC4(N_openat, d, h1, O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, 0600);
         if (fd >= 0) {
             sc(N_close, fd, 0, 0, 0, 0, 0);
@@ -1911,7 +2030,7 @@ EXP int mkfifoat(int d, const char*p, int m) {
 }
 EXP int chroot(const char*path) {
     (void) path;
-    if (g_fake) return 0;
+    if (VROOT()) return 0;
     static int(*f)(const char*);
     if (!f) f = nextsym("chroot");
     return f ? f(path) : 0;
@@ -1919,7 +2038,7 @@ EXP int chroot(const char*path) {
 EXP int pivot_root(const char*new_root, const char*put_old) {
     (void) new_root;
     (void) put_old;
-    if (g_fake) return 0;
+    if (VROOT()) return 0;
     return (int) fail(EPERM);
 }
 EXP int mount(const char*s, const char*t, const char*fs, unsigned long flags, const void*data) {
@@ -1928,29 +2047,29 @@ EXP int mount(const char*s, const char*t, const char*fs, unsigned long flags, co
     (void) fs;
     (void) flags;
     (void) data;
-    if (g_fake) return 0;
+    if (VROOT()) return 0;
     return (int) fail(EPERM);
 }
 EXP int umount(const char*t) {
     (void) t;
-    if (g_fake) return 0;
+    if (VROOT()) return 0;
     return (int) fail(EPERM);
 }
 EXP int umount2(const char*t, int flags) {
     (void) t;
     (void) flags;
-    if (g_fake) return 0;
+    if (VROOT()) return 0;
     return (int) fail(EPERM);
 }
 EXP int swapon(const char*path, int swapflags) {
     (void) path;
     (void) swapflags;
-    if (g_fake) return 0;
+    if (VROOT()) return 0;
     return (int) fail(EPERM);
 }
 EXP int swapoff(const char*path) {
     (void) path;
-    if (g_fake) return 0;
+    if (VROOT()) return 0;
     return (int) fail(EPERM);
 }
 #define XA_GET(name,nr,fol) EXP long name(const char*p,const char*n,void*v,size_t s){TR1(AT_FDCWD,p,fol)return ret(sc(nr,(long)h1,(long)n,(long)v,(long)s,0,0));}
@@ -2056,6 +2175,57 @@ EXP int ioctl(int fd, unsigned long req, void*arg) {
     static int(*f)(int, unsigned long, void*);
     if (!f) f = nextsym("ioctl");
     return f ? f(fd, req, arg) : (int) ret(sc(N_ioctl, fd, (long) req, (long) arg, 0, 0, 0));
+}
+/* Fallback tty untuk glibc baru: Android/SELinux menolak TCGETS2 (EACCES) */
+EXP int isatty(int fd) {
+    static int(*f)(int);
+    u8 k[64];
+    if (!f) f = nextsym("isatty");
+    if (f && f(fd)) return 1;
+    long r = sc(N_ioctl, fd, 0x5401, (long) k, 0, 0, 0);
+    if (r < 0) {
+        *__errno_location() = (int) -r;
+        return 0;
+    }
+    return 1;
+}
+EXP int tcgetattr(int fd, void*t) {
+    static int(*f)(int, void*);
+    u8 k[64];
+    if (!f) f = nextsym("tcgetattr");
+    if (f && f(fd, t) == 0) return 0;
+    long r = sc(N_ioctl, fd, 0x5401, (long) k, 0, 0, 0);
+    if (r < 0) {
+        *__errno_location() = (int) -r;
+        return -1;
+    }
+    u8*d = (u8*) t;
+    memcpy(d, k, 16);
+    d[16] = k[16];
+    memcpy(d+17, k+17, 19);
+    memset(d+36, 0, 16);
+    ((u32*) t)[13] = ((u32*) t)[14] = ((u32*) t)[2] & 0x100f;
+    return 0;
+}
+EXP int tcsetattr(int fd, int act, const void*t) {
+    static int(*f)(int, int, const void*);
+    u8 k[64];
+    if (!f) f = nextsym("tcsetattr");
+    if (f && f(fd, act, t) == 0) return 0;
+    if (act < 0 || act > 2) {
+        *__errno_location() = EINVAL;
+        return -1;
+    }
+    memset(k, 0, sizeof k);
+    memcpy(k, t, 16);
+    k[16] = ((const u8*) t)[16];
+    memcpy(k+17, (const u8*) t+17, 19);
+    long r = sc(N_ioctl, fd, 0x5402+act, (long) k, 0, 0, 0);
+    if (r < 0) {
+        *__errno_location() = (int) -r;
+        return -1;
+    }
+    return 0;
 }
 EXP int fcntl(int fd, int cmd, void*arg) {
     static int(*f)(int, int, void*);
@@ -2398,7 +2568,7 @@ EXP ssize_t recvmsg(int sockfd, struct msghdr_t*msg, int flags) {
     static ssize_t(*real_recvmsg)(int, struct msghdr_t*, int);
     if (!real_recvmsg) real_recvmsg = nextsym("recvmsg");
     ssize_t res = real_recvmsg ? real_recvmsg(sockfd, msg, flags) : -1;
-    if (res >= 0 && g_fake && msg && msg->msg_control && msg->msg_controllen >= sizeof (struct cmsghdr_t)) {
+    if (res >= 0 && VROOT() && msg && msg->msg_control && msg->msg_controllen >= sizeof (struct cmsghdr_t)) {
         char*cmsg_ptr = (char*) msg->msg_control;
         size_t clen = msg->msg_controllen;
         while (clen >= sizeof (struct cmsghdr_t)) {
@@ -2429,7 +2599,14 @@ struct cap_data_t {
     u32 inheritable;
 };
 EXP int capget(struct cap_header_t*hdrp, struct cap_data_t*datap) {
-    if (g_fake) {
+    if (g_user && g_cr[C_EU] != 0) {
+        if (datap) {
+            memset(datap, 0, sizeof (struct cap_data_t));
+            if (hdrp && hdrp->version == 0x20080522) memset(datap+1, 0, sizeof (struct cap_data_t));
+        }
+        return 0;
+    }
+    if (VROOT()) {
         if (datap) {
             datap[0].effective = 0xffffffff;
             datap[0].permitted = 0xffffffff;
@@ -2447,13 +2624,13 @@ EXP int capget(struct cap_header_t*hdrp, struct cap_data_t*datap) {
     return f ? f(hdrp, datap) : 0;
 }
 EXP int capset(struct cap_header_t*hdrp, const struct cap_data_t*datap) {
-    if (g_fake) return 0;
+    if (g_fake || g_user) return 0;
     static int(*f)(struct cap_header_t*, const struct cap_data_t*);
     if (!f) f = nextsym("capset");
     return f ? f(hdrp, datap) : 0;
 }
 EXP int prctl(int option, unsigned long a2, unsigned long a3, unsigned long a4, unsigned long a5) {
-    if (g_fake && option == 23) return 1;
+    if ((g_fake || g_user) && option == 23) return 1;
     if (option == 38) return 0;
     static int(*f)(int, unsigned long, unsigned long, unsigned long, unsigned long);
     if (!f) f = nextsym("prctl");
@@ -2544,12 +2721,22 @@ EXP int pthread_sigmask(int how, const void*set, void*old) {
 EXP int setfsuid(u32 u) {
     static int(*f)(u32);
     if (g_fake) return 0;
+    if (g_user) {
+        u32 o = g_cr[C_FU];
+        if (g_cr[C_EU] == 0 || u == g_cr[C_RU] || u == g_cr[C_EU] || u == g_cr[C_SU] || u == g_cr[C_FU]) g_cr[C_FU] = u;
+        return (int) o;
+    }
     if (!f) f = nextsym("setfsuid");
     return f(u);
 }
 EXP int setfsgid(u32 g) {
     static int(*f)(u32);
     if (g_fake) return 0;
+    if (g_user) {
+        u32 o = g_cr[C_FG];
+        if (g_cr[C_EU] == 0 || g == g_cr[C_RG] || g == g_cr[C_EG] || g == g_cr[C_SG] || g == g_cr[C_FG]) g_cr[C_FG] = g;
+        return (int) o;
+    }
     if (!f) f = nextsym("setfsgid");
     return f(g);
 }
@@ -2584,14 +2771,110 @@ EXP int sysinfo(struct sysinfo_data*info) {
     }
     return res;
 }
-#define IDFN0(name,ty,rn) EXP ty name(void){static ty(*f)(void);if(g_fake)return 0;if(!f)f=nextsym(rn);return f();}
-IDFN0(getuid, u32, "getuid") IDFN0(geteuid, u32, "geteuid") IDFN0(getgid, u32, "getgid") IDFN0(getegid, u32, "getegid")
-#define IDSET1(name) EXP int name(u32 a){static int(*f)(u32);if(g_fake)return 0;if(!f)f=nextsym(#name);return f(a);}
-#define IDSET2(name) EXP int name(u32 a,u32 b){static int(*f)(u32,u32);if(g_fake)return 0;if(!f)f=nextsym(#name);return f(a,b);}
-#define IDSET3(name) EXP int name(u32 a,u32 b,u32 c){static int(*f)(u32,u32,u32);if(g_fake)return 0;if(!f)f=nextsym(#name);return f(a,b,c);}
-IDSET1(setuid) IDSET1(setgid) IDSET1(seteuid) IDSET1(setegid) IDSET2(setreuid) IDSET2(setregid) IDSET3(setresuid) IDSET3(setresgid) static u32 g_fake_groups[32] = {0};
+#define IDFN0(name,ty,rn,ix) EXP ty name(void){static ty(*f)(void);if(g_fake)return 0;if(g_user)return g_cr[ix];if(!f)f=nextsym(rn);return f();}
+IDFN0(getuid, u32, "getuid", C_RU) IDFN0(geteuid, u32, "geteuid", C_EU) IDFN0(getgid, u32, "getgid", C_RG) IDFN0(getegid, u32, "getegid", C_EG)
+static int cr_setres(int b, u32 r, u32 e, u32 s) {
+    int priv = g_cr[C_EU] == 0;
+    u32*c = g_cr+b;
+    if (!priv) {
+        if (r != CR_NA && r != c[0] && r != c[1] && r != c[2]) return (int) fail(EPERM);
+        if (e != CR_NA && e != c[0] && e != c[1] && e != c[2]) return (int) fail(EPERM);
+        if (s != CR_NA && s != c[0] && s != c[1] && s != c[2]) return (int) fail(EPERM);
+    }
+    if (r != CR_NA) c[0] = r;
+    if (e != CR_NA) c[1] = e;
+    if (s != CR_NA) c[2] = s;
+    c[3] = c[1];
+    return 0;
+}
+static int cr_setre(int b, u32 r, u32 e) {
+    int priv = g_cr[C_EU] == 0;
+    u32*c = g_cr+b;
+    u32 ro = c[0];
+    if (!priv) {
+        if (r != CR_NA && r != c[0] && r != c[1]) return (int) fail(EPERM);
+        if (e != CR_NA && e != c[0] && e != c[1] && e != c[2]) return (int) fail(EPERM);
+    }
+    if (r != CR_NA) c[0] = r;
+    if (e != CR_NA) c[1] = e;
+    if (r != CR_NA || (e != CR_NA && e != ro)) c[2] = c[1];
+    c[3] = c[1];
+    return 0;
+}
+static int cr_setone(int b, u32 v) {
+    u32*c = g_cr+b;
+    if (g_cr[C_EU] == 0) return cr_setres(b, v, v, v);
+    if (v != c[0] && v != c[2]) return (int) fail(EPERM);
+    return cr_setres(b, CR_NA, v, CR_NA);
+}
+EXP int setuid(u32 a) {
+    static int(*f)(u32);
+    if (g_fake) return 0;
+    if (g_user) return cr_setone(0, a);
+    if (!f) f = nextsym("setuid");
+    return f(a);
+}
+EXP int setgid(u32 a) {
+    static int(*f)(u32);
+    if (g_fake) return 0;
+    if (g_user) return cr_setone(4, a);
+    if (!f) f = nextsym("setgid");
+    return f(a);
+}
+EXP int seteuid(u32 a) {
+    static int(*f)(u32);
+    if (g_fake) return 0;
+    if (g_user) return cr_setres(0, CR_NA, a, CR_NA);
+    if (!f) f = nextsym("seteuid");
+    return f(a);
+}
+EXP int setegid(u32 a) {
+    static int(*f)(u32);
+    if (g_fake) return 0;
+    if (g_user) return cr_setres(4, CR_NA, a, CR_NA);
+    if (!f) f = nextsym("setegid");
+    return f(a);
+}
+EXP int setreuid(u32 a, u32 b) {
+    static int(*f)(u32, u32);
+    if (g_fake) return 0;
+    if (g_user) return cr_setre(0, a, b);
+    if (!f) f = nextsym("setreuid");
+    return f(a, b);
+}
+EXP int setregid(u32 a, u32 b) {
+    static int(*f)(u32, u32);
+    if (g_fake) return 0;
+    if (g_user) return cr_setre(4, a, b);
+    if (!f) f = nextsym("setregid");
+    return f(a, b);
+}
+EXP int setresuid(u32 a, u32 b, u32 c) {
+    static int(*f)(u32, u32, u32);
+    if (g_fake) return 0;
+    if (g_user) return cr_setres(0, a, b, c);
+    if (!f) f = nextsym("setresuid");
+    return f(a, b, c);
+}
+EXP int setresgid(u32 a, u32 b, u32 c) {
+    static int(*f)(u32, u32, u32);
+    if (g_fake) return 0;
+    if (g_user) return cr_setres(4, a, b, c);
+    if (!f) f = nextsym("setresgid");
+    return f(a, b, c);
+}
+static u32 g_fake_groups[32] = {0};
 static int g_fake_ngroups = 1;
 EXP int getgroups(int size, u32*list) {
+    if (g_user) {
+        if (size == 0) return g_nvg;
+        if (size<g_nvg) {
+            *__errno_location() = EINVAL;
+            return-1;
+        }
+        for (int i = 0; i<g_nvg; i++) list[i] = g_vg[i];
+        return g_nvg;
+    }
     if (g_fake) {
         if (size == 0) return g_fake_ngroups;
         if (size<g_fake_ngroups) {
@@ -2606,6 +2889,13 @@ EXP int getgroups(int size, u32*list) {
     return f ? f(size, list) : 0;
 }
 EXP int setgroups(size_t n, const void*l) {
+    if (g_user) {
+        if (g_cr[C_EU] != 0) return (int) fail(EPERM);
+        if (n>NVG) return (int) fail(EINVAL);
+        for (size_t i = 0; i<n; i++) g_vg[i] = ((const u32*) l)[i];
+        g_nvg = (int) n;
+        return 0;
+    }
     if (g_fake) {
         if (n>32) n = 32;
         for (size_t i = 0; i<n; i++) g_fake_groups[i] = ((const u32*) l)[i];
@@ -2617,6 +2907,11 @@ EXP int setgroups(size_t n, const void*l) {
     return f(n, l);
 }
 EXP int initgroups(const char*u, u32 g) {
+    if (g_user) {
+        if (g_cr[C_EU] != 0) return (int) fail(EPERM);
+        g_nvg = cr_collect(u, g, g_vg, NVG);
+        return 0;
+    }
     if (g_fake) {
         g_fake_groups[0] = g;
         g_fake_ngroups = 1;
@@ -2627,6 +2922,12 @@ EXP int initgroups(const char*u, u32 g) {
     return f(u, g);
 }
 EXP int getresuid(u32*ruid, u32*euid, u32*suid) {
+    if (g_user) {
+        if (ruid)*ruid = g_cr[C_RU];
+        if (euid)*euid = g_cr[C_EU];
+        if (suid)*suid = g_cr[C_SU];
+        return 0;
+    }
     if (g_fake) {
         if (ruid)*ruid = 0;
         if (euid)*euid = 0;
@@ -2638,6 +2939,12 @@ EXP int getresuid(u32*ruid, u32*euid, u32*suid) {
     return f ? f(ruid, euid, suid) : 0;
 }
 EXP int getresgid(u32*rgid, u32*egid, u32*sgid) {
+    if (g_user) {
+        if (rgid)*rgid = g_cr[C_RG];
+        if (egid)*egid = g_cr[C_EG];
+        if (sgid)*sgid = g_cr[C_SG];
+        return 0;
+    }
     if (g_fake) {
         if (rgid)*rgid = 0;
         if (egid)*egid = 0;
@@ -2789,6 +3096,105 @@ static int gr_lookup(const char*name, int bygid, u32 gid, struct gr*o, char*buf,
     free(data);
     return res;
 }
+static char*cr_put(char*p, u32 v) {
+    char t[12];
+    int n = 0;
+    do {
+        t[n++] = (char)('0'+v%10);
+        v /= 10;
+    } while (v);
+    while (n)*p++ = t[--n];
+    return p;
+}
+static void cr_encode(const u32*c, char*out) {
+    char*p = out;
+    for (int i = 0; i<8; i++) {
+        p = cr_put(p, c[i]);
+        *p++ = (i<7) ? ',' : ':';
+    }
+    for (int i = 0; i<g_nvg; i++) {
+        if (i)*p++ = ',';
+        p = cr_put(p, g_vg[i]);
+    }
+    *p = 0;
+}
+static const char*cr_get(const char*p, u32*v) {
+    if (*p<'0' || *p>'9') return NULL;
+    u32 r = 0;
+    while (*p >= '0' && *p <= '9') r = r*10+(u32)(*p++-'0');
+    *v = r;
+    return p;
+}
+static int cr_decode(const char*s) {
+    u32 t[8], gg[NVG];
+    int ng = 0;
+    for (int i = 0; i<8; i++) {
+        s = cr_get(s, &t[i]);
+        if (!s) return 0;
+        if (*s != ((i<7) ? ',' : ':')) return 0;
+        s++;
+    }
+    while (*s && ng<NVG) {
+        u32 v;
+        s = cr_get(s, &v);
+        if (!s) break;
+        gg[ng++] = v;
+        if (*s == ',') s++;
+        else break;
+    }
+    for (int i = 0; i<8; i++) g_cr[i] = t[i];
+    for (int i = 0; i<ng; i++) g_vg[i] = gg[i];
+    g_nvg = ng;
+    return 1;
+}
+static char g_gdata[16384];
+static int cr_collect(const char*user, u32 gid, u32*out, int max) {
+    int n = 0;
+    if (max > 0) out[n++] = gid;
+    long len = read_rel("/etc/group", g_gdata, sizeof g_gdata-1);
+    if (len <= 0) return n;
+    size_t ul = strlen(user);
+    for (char*l = g_gdata; *l; ) {
+        char*e = l;
+        while (*e && *e != '\n') e++;
+        char sv = *e;
+        *e = 0;
+        char*f[4];
+        int k = 0;
+        f[k++] = l;
+        for (char*p = l; *p && k<4; p++) {
+            if (*p == ':') {
+                *p = 0;
+                f[k++] = p+1;
+            }
+        }
+        if (k == 4) {
+            int hit = 0;
+            const char*m = f[3];
+            while (*m) {
+                const char*q = m;
+                while (*q && *q != ',') q++;
+                if ((size_t)(q-m) == ul && !memcmp(m, user, ul)) hit = 1;
+                m = *q ? q+1 : q;
+            }
+            if (hit) {
+                u32 g = atou(f[2]);
+                int dup = 0;
+                for (int i = 0; i<n; i++) if (out[i] == g) dup = 1;
+                if (!dup && n<max) out[n++] = g;
+            }
+        }
+        *e = sv;
+        l = sv ? e+1 : e;
+    }
+    return n;
+}
+static void cred_init(void) {
+    if (g_credbuf[0] && cr_decode(g_credbuf)) return;
+    for (int i = 0; i<4; i++) g_cr[i] = g_ruid;
+    for (int i = 4; i<8; i++) g_cr[i] = g_rgid;
+    g_nvg = cr_collect(g_vuser, g_rgid, g_vg, NVG);
+}
 static char s_pwbuf[2048], s_grbuf[4096];
 static struct pw s_pw;
 static struct gr s_gr;
@@ -2903,7 +3309,7 @@ static char*acat(struct ar*a, const char*k, const char*v) {
     return d;
 }
 static int is_ours(const char*e) {
-    return envmatch(e, "LD_PRELOAD") || envmatch(e, "PRX_ROOTFS") || envmatch(e, "PRX_SHIM") || envmatch(e, "PRX_LIBPATH") || envmatch(e, "PRX_BIND") || envmatch(e, "PRX_FAKEROOT") || envmatch(e, "PRX_DNS") || envmatch(e, "PRX_LOADER") || envmatch(e, "PRX_SELF_EXE");
+    return envmatch(e, "LD_PRELOAD") || envmatch(e, "PRX_ROOTFS") || envmatch(e, "PRX_SHIM") || envmatch(e, "PRX_LIBPATH") || envmatch(e, "PRX_BIND") || envmatch(e, "PRX_FAKEROOT") || envmatch(e, "PRX_DNS") || envmatch(e, "PRX_LOADER") || envmatch(e, "PRX_SELF_EXE") || envmatch(e, "PRX_VUSER") || envmatch(e, "PRX_CRED");
 }
 static int elf_runpath(int fd, const u8*ph, unsigned phes, unsigned phn, char*out, size_t osz) {
     u64 dyn_off = 0, dyn_sz = 0;
@@ -3001,6 +3407,24 @@ static const char*strip_shim(struct ar*a, const char*up) {
     o[k] = 0;
     return o;
 }
+static void exec_cred_prepare(const char*h) {
+    g_pcr_ok = 0;
+    if (!g_user) return;
+    memcpy(g_pcr, g_cr, sizeof g_pcr);
+    char st[256];
+    if (SC4(N_newfstatat, AT_FDCWD, h, st, 0) == 0) {
+        u32 mode = *(const u32*)(st+MODE_OFF);
+        u32 fu = *(const u32*)(st+OFF_UID), fg = *(const u32*)(st+OFF_UID+4);
+        if ((mode&0170000) == 0100000 && (mode&06000) && fu == g_ruid) {
+            int rt = own_is_root_host(h);
+            if (mode&04000) g_pcr[C_EU] = rt ? 0 : fu;
+            if ((mode&02000) && (mode&0010)) g_pcr[C_EG] = rt ? 0 : fg;
+        }
+    }
+    g_pcr[C_SU] = g_pcr[C_FU] = g_pcr[C_EU];
+    g_pcr[C_SG] = g_pcr[C_FG] = g_pcr[C_EG];
+    g_pcr_ok = 1;
+}
 static char**mkenv(struct ar*a, char*const envp[], int native, const char*cur_exe) {
     int n = 0;
     while (envp && envp[n]) n++;
@@ -3027,6 +3451,12 @@ static char**mkenv(struct ar*a, char*const envp[], int native, const char*cur_ex
         ne[k++] = acat(a, "PRX_BIND=", g_bindenv);
         ne[k++] = acat(a, "PRX_DNS=", g_dns);
         ne[k++] = acat(a, "PRX_FAKEROOT=", g_fake ? "1" : "0");
+        if (g_user) {
+            char cb[1024];
+            cr_encode(g_pcr_ok ? g_pcr : g_cr, cb);
+            ne[k++] = acat(a, "PRX_VUSER=", g_vuser);
+            ne[k++] = acat(a, "PRX_CRED=", cb);
+        }
         if (cur_exe && cur_exe[0]) ne[k++] = acat(a, "PRX_SELF_EXE=", cur_exe);
         if (g_loader[0]) ne[k++] = acat(a, "PRX_LOADER=", g_loader);
         int has = 0;
@@ -3042,6 +3472,7 @@ static int prep_exec(struct ar*a, const char*path, char*const argv[], char*const
     while (argv && argv[argc]) argc++;
     char**av = am(a, (size_t)(argc+8)*sizeof (char*));
     if (!av) return (int) fail(ENOMEM);
+    g_pcr_ok = 0;
     for (int i = 0; i<argc; i++) av[i] = argv[i];
     av[argc] = NULL;
     if (!argc) {
@@ -3167,6 +3598,7 @@ static int prep_exec(struct ar*a, const char*path, char*const argv[], char*const
         if (!have) {
             *op = h;
             *oa = av;
+            exec_cred_prepare(h);
             *oe = mkenv(a, envp, 0, gp);
             return*oe ? 0 : (int) fail(ENOMEM);
         }
@@ -3188,6 +3620,7 @@ static int prep_exec(struct ar*a, const char*path, char*const argv[], char*const
         nv[k] = NULL;
         *op = lh;
         *oa = nv;
+        exec_cred_prepare(h);
         *oe = mkenv(a, envp, 0, gp);
         return*oe ? 0 : (int) fail(ENOMEM);
     }
