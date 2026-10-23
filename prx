@@ -12,6 +12,7 @@ aarch64|arm64) TRIPLET=aarch64-linux-gnu; LDNAME=ld-linux-aarch64.so.1; ARCH=aar
 x86_64|amd64)  TRIPLET=x86_64-linux-gnu;  LDNAME=ld-linux-x86-64.so.2;  ARCH=x86_64 ;;
 *) die "Architecture $(uname -m) is not supported." ;;
 esac
+HARCH="$ARCH"
 usage() {
 cat <<EOF
 prx - User-space container and path-translation engine
@@ -39,6 +40,15 @@ Usage:
   prx fixperm NAME                   Fix file permissions & clear cache
   prx remove NAME                    Completely remove a container
   prx source | prx ldsource          Dump embedded C sources
+
+Cross-arch rootfs is detected automatically and run through qemu-user, in both
+directions: x86_64 rootfs on an aarch64 host (needs qemu-x86_64) and aarch64 rootfs
+on an x86_64 host (needs qemu-aarch64). To cross-build the shim you also need
+clang + lld, or a cross gcc (aarch64-linux-gnu-gcc / x86_64-linux-gnu-gcc).
+  Termux:        pkg install qemu-user-x86-64 qemu-user-aarch64 clang
+  Debian/Ubuntu: apt install qemu-user-static clang lld
+  PRX_QEMU=/path/to/qemu-ARCH        Use a specific qemu-user binary
+  QEMU_CPU=max                       Extra QEMU_* variables are passed to qemu
 EOF
 }
 cmd_source()   { sed '1,/^#---C-SOURCE---$/d' "$SELF"; }
@@ -66,6 +76,76 @@ info "Shim built successfully: $SHIM"
 cmd_ldsource > "$PRX_HOME/src/ldpatch.c"
 "$cc" -O2 -o "$PRX_HOME/lib/ldpatch" "$PRX_HOME/src/ldpatch.c" || die "Failed to build ldpatch"
 info "Loader patch tool built successfully: $PRX_HOME/lib/ldpatch"
+}
+set_arch() {
+case "$1" in
+aarch64) TRIPLET=aarch64-linux-gnu; LDNAME=ld-linux-aarch64.so.1; ARCH=aarch64 ;;
+x86_64)  TRIPLET=x86_64-linux-gnu;  LDNAME=ld-linux-x86-64.so.2;  ARCH=x86_64 ;;
+esac
+}
+detect_guest() {
+local r="$1" a
+for a in "$HARCH" x86_64 aarch64; do
+set_arch "$a"
+find_loader "$r" >/dev/null 2>&1 && return 0
+done
+set_arch "$HARCH"
+return 1
+}
+find_qemu() {
+local garch="$1" q
+if [ -n "${PRX_QEMU:-}" ]; then
+q="$PRX_QEMU"
+[ -x "$q" ] || q="$(command -v "$q" 2>/dev/null || true)"
+[ -n "$q" ] && [ -x "$q" ] && { readlink -f "$q" 2>/dev/null || echo "$q"; return 0; }
+return 1
+fi
+for q in "qemu-$garch" "qemu-$garch-static"; do
+if command -v "$q" >/dev/null 2>&1; then
+command -v "$q"
+return 0
+fi
+done
+return 1
+}
+qemu_hint() {
+local g="$1"
+if [ -n "${TERMUX_VERSION:-}" ] || [ -d /data/data/com.termux ]; then echo "pkg install qemu-user-$(echo "$g" | tr _ -)"
+elif command -v apt-get >/dev/null 2>&1; then echo "sudo apt install qemu-user-static"
+elif command -v dnf >/dev/null 2>&1; then echo "sudo dnf install qemu-user-static"
+elif command -v pacman >/dev/null 2>&1; then echo "sudo pacman -S qemu-user"
+elif command -v apk >/dev/null 2>&1; then echo "apk add qemu-$g"
+elif command -v zypper >/dev/null 2>&1; then echo "sudo zypper install qemu-linux-user"
+else echo "install qemu-user for $g with your package manager"
+fi
+}
+build_guest_shim() {
+local garch="$1" out="$2" cc="${CC:-}" tgt extra tflag=""
+case "$garch" in
+x86_64) tgt=x86_64-linux-gnu ;;
+aarch64) tgt=aarch64-linux-gnu ;;
+*) die "Unsupported guest architecture: $garch" ;;
+esac
+if [ -z "$cc" ]; then
+if command -v clang >/dev/null 2>&1; then cc=clang
+elif command -v "$tgt-gcc" >/dev/null 2>&1; then cc="$tgt-gcc"
+else die "Cross-compiling the shim for $garch needs clang+lld (Termux: pkg install clang; Debian/Ubuntu: apt install clang lld) or $tgt-gcc (Debian/Ubuntu: apt install gcc-$(echo "$garch" | tr _ -)-linux-gnu)"
+fi
+fi
+command -v "$cc" >/dev/null 2>&1 || die "Compiler '$cc' executable not found."
+mkdir -p "$PRX_HOME/lib" "$PRX_HOME/src"
+cmd_source > "$PRX_HOME/src/prx.c"
+if "$cc" --version 2>/dev/null | grep -qi clang; then
+extra="-fuse-ld=lld -Wl,-z,max-page-size=65536 -Wl,--pack-dyn-relocs=none"
+tflag="--target=$tgt"
+else
+extra="-Wl,-z,max-page-size=65536"
+fi
+[ "$garch" = aarch64 ] && extra="$extra -mbranch-protection=none"
+"$cc" ${tflag:+"$tflag"} -O2 -fPIC -shared -nostdlib -ffreestanding -fno-stack-protector \
+-fno-builtin -Wl,-z,undefs -Wl,-soname,libprx.so $extra \
+-o "$out" "$PRX_HOME/src/prx.c" || die "Failed to cross-compile shim for $garch (CC=$cc must be able to target $garch; clang also needs lld)"
+info "Guest shim built successfully: $out"
 }
 rootdir() { echo "$PRX_HOME/rootfs/$1"; }
 prx_reap() {
@@ -427,6 +507,8 @@ wfile "$R/etc/sudoers.d/99prx" 'ALL ALL=(ALL) NOPASSWD: ALL\n'
 chmod 0440 "$R/etc/sudoers.d/99prx" 2>/dev/null || true
 wfile "$R/etc/sudoers.d/00_path" 'Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\n'
 chmod 0440 "$R/etc/sudoers.d/00_path" 2>/dev/null || true
+wfile "$R/etc/sudoers.d/01_locale" 'Defaults env_keep += "LOCPATH GCONV_PATH LANG LANGUAGE"\n'
+chmod 0440 "$R/etc/sudoers.d/01_locale" 2>/dev/null || true
 if [ ! -f "$R/etc/passwd" ]; then
 wfile "$R/etc/passwd" 'root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\nbin:x:2:2:bin:/bin:/usr/sbin/nologin\nsys:x:3:3:sys:/dev:/usr/sbin/nologin\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n'
 fi
@@ -522,13 +604,23 @@ prx_setup_user "$R" "$hu" "$huid" "$hgid"
 [ "$wdset" = 1 ] || wd="$vhome"
 fi
 fi
+local QEMU=""
+detect_guest "$R" || true
+if [ "$ARCH" != "$HARCH" ]; then
+QEMU="$(find_qemu "$ARCH")" || die "Rootfs '$name' is $ARCH but this host is $HARCH, and qemu-$ARCH was not found. Install it ($(qemu_hint "$ARCH")) or set PRX_QEMU=/path/to/qemu-$ARCH"
+SHIM="$PRX_HOME/lib/libprx-$ARCH.so"
 if [ ! -f "$SHIM" ] || [ "$SELF" -nt "$SHIM" ]; then
+info "Cross-compiling path-translation shim for $ARCH..."
+build_guest_shim "$ARCH" "$SHIM"
+fi
+info "Running $ARCH rootfs on $HARCH via $QEMU (emulated, expect slowness)"
+elif [ ! -f "$SHIM" ] || [ "$SELF" -nt "$SHIM" ]; then
 info "Compiling path-translation shim..."
 cmd_build
 fi
 local LD; LD="$(find_loader "$R")" || die "Glibc dynamic loader not found. Container must be glibc-based."
 local PL=""
-if [ "$ARCH" = aarch64 ]; then
+if [ "$ARCH" = aarch64 ] && [ -z "$QEMU" ]; then
 [ -x "$PRX_HOME/lib/ldpatch" ] || cmd_build
 PL="$PRX_HOME/lib/ld-$name.so"
 local ldst lcst
@@ -613,9 +705,12 @@ prog=("$SH" -l)
 else
 prog=("$SH" -c 'exec "$@"' prx "$@")
 fi
-local LANGV="C.UTF-8"
+local LANGV=C lcd
 local GCONV="$R/usr/lib/$TRIPLET/gconv:$R/usr/lib/gconv"
-[ -d "$R/usr/lib/locale/C.utf8" ] || [ -d "$R/usr/lib/locale/C.UTF-8" ] || LANGV=C
+for lcd in "$R/usr/lib/locale/C.utf8" "$R/usr/lib/locale/C.UTF-8"; do
+[ -s "$lcd/LC_CTYPE" ] && { LANGV=C.UTF-8; break; }
+done
+if [ "$LANGV" = C ] && [ -s "$R/usr/lib/locale/locale-archive" ] && grep -aqi 'C\.utf-\?8' "$R/usr/lib/locale/locale-archive" 2>/dev/null; then LANGV=C.UTF-8; fi
 cd "$startdir"
 local tok="$$.$RANDOM$RANDOM" rc=0
 trap : INT
@@ -632,6 +727,17 @@ local cur_dns; cur_dns="$(detect_dns)"
 if [ -n "$mem_kb" ] && [ "$hard" = 1 ]; then
 ulimit -v "$mem_kb" 2>/dev/null || warn "Could not apply hard memory cap (ulimit -v)"
 fi
+local -a ldenv=() runner=()
+if [ -n "$QEMU" ]; then
+local qv
+ldenv=(QEMU_SET_ENV="LD_PRELOAD=$SHIM,LD_LIBRARY_PATH=$LP" PRX_QEMU="$QEMU")
+for qv in QEMU_CPU QEMU_STRACE QEMU_LOG QEMU_RESERVED_VA QEMU_GUEST_BASE QEMU_PAGESIZE; do
+[ -n "${!qv:-}" ] && ldenv+=("$qv=${!qv}")
+done
+runner=("$QEMU")
+else
+ldenv=(LD_LIBRARY_PATH="$LP" LD_PRELOAD="$SHIM")
+fi
 ${pin[@]+"${pin[@]}"} env -i \
 HOME="$home_val" USER="$user_val" LOGNAME="$user_val" SHELL="$gshell" \
 TERM="${TERM:-xterm-256color}" LANG="$LANGV" \
@@ -639,14 +745,14 @@ LOCPATH="$R/usr/lib/locale" GCONV_PATH="$GCONV" \
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
 PRX_ROOTFS="$R" PRX_SHIM="$SHIM" PRX_LIBPATH="$LP" PRX_BIND="$binds" \
 PRX_SESSION="$tok" PRX_SELF_EXE="$gshell" \
-LD_LIBRARY_PATH="$LP" PRX_DNS="$cur_dns" PRX_FAKEROOT="$fake" PRX_VUSER="$vuser" \
+PRX_DNS="$cur_dns" PRX_FAKEROOT="$fake" PRX_VUSER="$vuser" \
 PRX_TRACE="$trace" PRX_LOADER="$PL" \
 PRX_CPUS="${cpus:-0}" PRX_MEM_KB="${mem_kb:-0}" \
 GLIBC_TUNABLES="${GLIBC_TUNABLES:-glibc.pthread.rseq=0}" \
-LD_PRELOAD="$SHIM" \
+${ldenv[@]+"${ldenv[@]}"} \
 ${term_envs[@]+"${term_envs[@]}"} \
 ${extra_envs[@]+"${extra_envs[@]}"} \
-"$LD" --library-path "$LP" --argv0 "$(basename "$gshell")" "${prog[@]}" || rc=$?
+${runner[@]+"${runner[@]}"} "$LD" --library-path "$LP" --argv0 "$(basename "$gshell")" "${prog[@]}" || rc=$?
 trap - INT
 kill "$watcher" 2>/dev/null || true
 prx_reap "$tok"
@@ -1010,6 +1116,7 @@ static char g_shim[PM];
 #define LPM 65536
 static char g_libpath[LPM];
 static char g_loader[PM];
+static char g_qemu[PM];
 static char g_bindenv[PM];
 static char g_dns[128] = "8.8.8.8:1.1.1.1";
 static char g_self_exe[PM];
@@ -1164,6 +1271,7 @@ __attribute__((constructor)) static void prx_init(int argc, char**argv, char**en
         if (envmatch(s, "PRX_ROOTFS")) copyval(g_root, PM, s+11);
         else if (envmatch(s, "PRX_SHIM")) copyval(g_shim, PM, s+9);
         else if (envmatch(s, "PRX_LOADER")) copyval(g_loader, PM, s+11);
+        else if (envmatch(s, "PRX_QEMU")) copyval(g_qemu, PM, s+9);
         else if (envmatch(s, "PRX_LIBPATH")) copyval(g_libpath, LPM, s+12);
         else if (envmatch(s, "PRX_BIND")) copyval(g_bindenv, PM, s+9);
         else if (envmatch(s, "PRX_DNS")) copyval(g_dns, sizeof g_dns, s+8);
@@ -1283,12 +1391,21 @@ static int is_proc_exe(const char*p) {
     }
     return 0;
 }
+static int has_dotdot(const char*s) {
+    while (*s) {
+        while (*s == '/') s++;
+        const char*t = s;
+        while (*s && *s != '/') s++;
+        if (s-t == 2 && t[0] == '.' && t[1] == '.') return 1;
+    }
+    return 0;
+}
 static int mkabs(int dfd, const char*in, char*g) {
     size_t il = strlen(in);
     if (in[0] == '/') {
         if (hasroot(in)) return 1;
         int bi = in_bind(in);
-        if (bi && g_bid[bi-1]) return 1;
+        if (bi && g_bid[bi-1] && !has_dotdot(in)) return 1;
         if (il >= PM) {
             fail(ENAMETOOLONG);
             return-1;
@@ -1309,9 +1426,13 @@ static int mkabs(int dfd, const char*in, char*g) {
     if (n <= 0) return 1;
     const char*b;
     char rb[PM];
+    int ib;
     if (hasroot(base)) {
         b = base+g_rl;
         if (!*b) b = "/";
+    } else if ((ib = in_bind(base)) && g_bid[ib-1]) {
+        if (!has_dotdot(in)) return 1;
+        b = base;
     } else if (!(b = rev_bind(base, rb))) {
         return 1;
     }
@@ -1371,6 +1492,7 @@ static int canon(const char*gin, char*res, int follow, int*bind) {
         p = e;
         int bi = in_bind(res);
         if (bi && g_bid[bi-1]) {
+            if (has_dotdot(p)) continue;
             size_t tl = strlen(p);
             if (rl+tl >= PM) {
                 fail(ENAMETOOLONG);
@@ -3856,7 +3978,7 @@ static char*acat(struct ar*a, const char*k, const char*v) {
     return d;
 }
 static int is_ours(const char*e) {
-    return envmatch(e, "LD_PRELOAD") || envmatch(e, "PRX_ROOTFS") || envmatch(e, "PRX_SHIM") || envmatch(e, "PRX_LIBPATH") || envmatch(e, "PRX_BIND") || envmatch(e, "PRX_FAKEROOT") || envmatch(e, "PRX_DNS") || envmatch(e, "PRX_LOADER") || envmatch(e, "PRX_SELF_EXE") || envmatch(e, "PRX_VUSER") || envmatch(e, "PRX_CRED") || envmatch(e, "PRX_CPUS") || envmatch(e, "PRX_MEM_KB");
+    return envmatch(e, "LD_PRELOAD") || envmatch(e, "PRX_ROOTFS") || envmatch(e, "PRX_SHIM") || envmatch(e, "PRX_LIBPATH") || envmatch(e, "PRX_BIND") || envmatch(e, "PRX_FAKEROOT") || envmatch(e, "PRX_DNS") || envmatch(e, "PRX_LOADER") || envmatch(e, "PRX_QEMU") || envmatch(e, "QEMU_SET_ENV") || envmatch(e, "PRX_SELF_EXE") || envmatch(e, "PRX_VUSER") || envmatch(e, "PRX_CRED") || envmatch(e, "PRX_CPUS") || envmatch(e, "PRX_MEM_KB");
 }
 static int elf_runpath(int fd, const u8*ph, unsigned phes, unsigned phn, char*out, size_t osz) {
     u64 dyn_off = 0, dyn_sz = 0;
@@ -4016,9 +4138,28 @@ static char**mkenv(struct ar*a, char*const envp[], int native, const char*cur_ex
         }
         if (cur_exe && cur_exe[0]) ne[k++] = acat(a, "PRX_SELF_EXE=", cur_exe);
         if (g_loader[0]) ne[k++] = acat(a, "PRX_LOADER=", g_loader);
+        if (g_qemu[0]) ne[k++] = acat(a, "PRX_QEMU=", g_qemu);
         int has = 0;
         for (int i = 0; i<n; i++) if (envmatch(envp[i], "GLIBC_TUNABLES")) has = 1;
         if (!has) ne[k++] = acat(a, "GLIBC_TUNABLES=", "glibc.pthread.rseq=0");
+    }
+    if (!native && g_qemu[0]) {
+        const char*pl = NULL, *ll = NULL;
+        int j = 0;
+        for (int i = 0; i<k; i++) {
+            if (envmatch(ne[i], "LD_PRELOAD")) pl = ne[i];
+            else if (envmatch(ne[i], "LD_LIBRARY_PATH")) ll = ne[i];
+            else ne[j++] = ne[i];
+        }
+        k = j;
+        if (pl || ll) {
+            char*se = acat(a, "QEMU_SET_ENV=", pl ? pl : ll);
+            if (se && pl && ll) {
+                char*t = acat(a, se, ",");
+                se = t ? acat(a, t, ll) : NULL;
+            }
+            ne[k++] = se;
+        }
     }
     ne[k] = NULL;
     for (int i = 0; i<k; i++) if (!ne[i]) return NULL;
@@ -4153,8 +4294,22 @@ static int prep_exec(struct ar*a, const char*path, char*const argv[], char*const
             }
         }
         if (!have) {
-            *op = h;
-            *oa = av;
+            if (g_qemu[0]) {
+                char**qv = am(a, (size_t)(argc+8)*sizeof (char*));
+                if (!qv) return (int) fail(ENOMEM);
+                int qk = 0;
+                qv[qk++] = (char*) g_qemu;
+                qv[qk++] = "-0";
+                qv[qk++] = av[0];
+                qv[qk++] = (char*) h;
+                for (int j = 1; j<argc; j++) qv[qk++] = av[j];
+                qv[qk] = NULL;
+                *op = g_qemu;
+                *oa = qv;
+            } else {
+                *op = h;
+                *oa = av;
+            }
             exec_cred_prepare(h);
             *oe = mkenv(a, envp, 0, gp);
             return*oe ? 0 : (int) fail(ENOMEM);
@@ -4167,6 +4322,7 @@ static int prep_exec(struct ar*a, const char*path, char*const argv[], char*const
         if (!nv) return (int) fail(ENOMEM);
         int k = 0;
         if (g_loader[0]) lh = g_loader;
+        if (g_qemu[0]) nv[k++] = (char*) g_qemu;
         nv[k++] = (char*) lh;
         nv[k++] = "--library-path";
         nv[k++] = (char*) build_libpath(a, rpbuf);
@@ -4175,7 +4331,7 @@ static int prep_exec(struct ar*a, const char*path, char*const argv[], char*const
         nv[k++] = (char*) h;
         for (int j = 1; j<argc; j++) nv[k++] = av[j];
         nv[k] = NULL;
-        *op = lh;
+        *op = g_qemu[0] ? g_qemu : lh;
         *oa = nv;
         exec_cred_prepare(h);
         *oe = mkenv(a, envp, 0, gp);
