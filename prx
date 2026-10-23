@@ -2384,6 +2384,7 @@ static char*do_realpath(const char*p, char*out) {
         return NULL;
     }
     char g[PM], res[PM], hb[PM];
+    if (g_rl && g_self_exe[0] && is_proc_exe(p)) p = g_self_exe;
     int m = g_rl ? mkabs(AT_FDCWD, p, g) : 1;
     if (m<0) return NULL;
     if (m>0) {
