@@ -124,7 +124,3 @@ Containers live in `$PRX_HOME/rootfs/NAME`.
 - **User-space interception.** Because it relies on `LD_PRELOAD`, programs that bypass libc (such as statically linked binaries) may not be translated.
 - **No real mounts or namespaces.** `mount`, `chroot` and similar calls are emulated or refused, not performed.
 - **Emulation is slow.** Cross-architecture rootfs run under QEMU user-mode emulation.
-
-## License
-
-Add your license here.
