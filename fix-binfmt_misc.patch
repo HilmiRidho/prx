@@ -1,0 +1,167 @@
+--- a/src/prx.c
++++ b/src/prx.c
+@@ -3938,6 +3938,136 @@ static int bf_elf_static(const char*h) {
+     sc(N_close, fd, 0, 0, 0, 0, 0);
+     return st;
+ }
++#if defined(__aarch64__)
++static const char* ensure_patched_static(const char* h, char* out_buf, size_t out_cap) {
++    if (!h || !*h) return NULL;
++    u64 st[32];
++    if (SC4(N_newfstatat, AT_FDCWD, h, st, 0) < 0) return NULL;
++    u64 sz = st[6], ino = st[1], mtime = st[10];
++    if (sz < 64 || sz > 128 * 1024 * 1024) return NULL;
++    char cdir[PM];
++    if (g_bfdir[0]) {
++        if (bf_path(cdir, "/patched", NULL) < 0) return NULL;
++    } else if (g_shim[0]) {
++        size_t sl = strlen(g_shim);
++        while (sl > 0 && g_shim[sl - 1] != '/') sl--;
++        if (sl == 0 || sl + 16 >= PM) return NULL;
++        memcpy(cdir, g_shim, sl);
++        memcpy(cdir + sl, "patched", 8);
++    } else {
++        return NULL;
++    }
++    SC3(N_mkdirat, AT_FDCWD, cdir, 0700);
++    const char* bn = h;
++    for (const char* q = h; *q; q++) if (*q == '/') bn = q + 1;
++    char inostr[24];
++    u64_dec(inostr, ino);
++    size_t cdl = strlen(cdir), inl = strlen(inostr), bnl = strlen(bn);
++    size_t cfl = cdl + 1 + inl + 1 + bnl;
++    if (cfl + 8 >= PM || cfl + 1 > out_cap) return NULL;
++    char cfile[PM], stamp[PM];
++    memcpy(cfile, cdir, cdl);
++    cfile[cdl] = '/';
++    memcpy(cfile + cdl + 1, inostr, inl);
++    cfile[cdl + 1 + inl] = '_';
++    memcpy(cfile + cdl + 1 + inl + 1, bn, bnl + 1);
++    memcpy(stamp, cfile, cfl);
++    memcpy(stamp + cfl, ".stamp", 7);
++    char sbuf[64], expect[64];
++    long sn = bf_slurp(stamp, sbuf, sizeof sbuf);
++    if (sn > 0) {
++        char n1[24], n2[24];
++        u64_dec(n1, sz);
++        u64_dec(n2, mtime);
++        size_t l1 = strlen(n1), l2 = strlen(n2);
++        memcpy(expect, n1, l1);
++        expect[l1] = ':';
++        memcpy(expect + l1 + 1, n2, l2);
++        size_t el = l1 + 1 + l2;
++        expect[el] = 0;
++        if (strncmp(sbuf, expect, el) == 0) {
++            memcpy(out_buf, cfile, cfl + 1);
++            return out_buf;
++        }
++    }
++    long fd = SC4(N_openat, AT_FDCWD, h, O_RDONLY | O_CLOEXEC, 0);
++    if (fd < 0) return NULL;
++    u8* buf = (u8*) malloc((size_t) sz);
++    if (!buf) { sc(N_close, fd, 0, 0, 0, 0, 0); return NULL; }
++    size_t rd = 0;
++    while (rd < sz) {
++        long k = SC3(N_read, fd, buf + rd, sz - rd);
++        if (k <= 0) break;
++        rd += (size_t) k;
++    }
++    sc(N_close, fd, 0, 0, 0, 0, 0);
++    if (rd != sz) { free(buf); return NULL; }
++    if (buf[0] != 0x7f || buf[1] != 'E' || buf[2] != 'L' || buf[3] != 'F' ||
++        buf[4] != 2 || *(u16*)(buf + 18) != 183) {
++        free(buf);
++        return NULL;
++    }
++    int patched = 0;
++    size_t n = (size_t) sz / 4;
++    for (size_t i = 0; i < n; i++) {
++        u32 w;
++        memcpy(&w, buf + i * 4, 4);
++        if (w != 0xD2800C68u && w != 0x52800C68u &&
++            w != 0xD28024A8u && w != 0x528024A8u &&
++            w != 0xD2803668u && w != 0x52803668u) continue;
++        for (size_t j = i + 1; j < n && j <= i + 12; j++) {
++            u32 o;
++            memcpy(&o, buf + j * 4, 4);
++            if (o == 0xD4000001u) {
++                u32 p = 0x928004A0u;
++                memcpy(buf + j * 4, &p, 4);
++                patched++;
++                break;
++            }
++            if ((o & 0x7C000000u) == 0x14000000u || o == 0xD65F03C0u) break;
++        }
++    }
++    if (!patched) { free(buf); return NULL; }
++    char tmpfile[PM];
++    u32 pid = (u32) sc(N_getpid, 0, 0, 0, 0, 0, 0);
++    char pidstr[24];
++    u64_dec(pidstr, pid);
++    size_t pl = strlen(pidstr);
++    memcpy(tmpfile, cfile, cfl);
++    tmpfile[cfl] = '.';
++    memcpy(tmpfile + cfl + 1, pidstr, pl);
++    memcpy(tmpfile + cfl + 1 + pl, ".tmp", 5);
++    long out_fd = SC4(N_openat, AT_FDCWD, tmpfile, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0755);
++    if (out_fd < 0) { free(buf); return NULL; }
++    size_t wr = 0;
++    while (wr < sz) {
++        long k = SC3(N_write, out_fd, buf + wr, sz - wr);
++        if (k <= 0) break;
++        wr += (size_t) k;
++    }
++    sc(N_fchmod, out_fd, 0755, 0, 0, 0, 0);
++    sc(N_close, out_fd, 0, 0, 0, 0, 0);
++    free(buf);
++    if (wr != sz) { SC3(N_unlinkat, AT_FDCWD, tmpfile, 0); return NULL; }
++    SC4(N_renameat, AT_FDCWD, tmpfile, AT_FDCWD, cfile);
++    char sdata[64], n1[24], n2[24];
++    u64_dec(n1, sz);
++    u64_dec(n2, mtime);
++    size_t l1 = strlen(n1), l2 = strlen(n2);
++    memcpy(sdata, n1, l1);
++    sdata[l1] = ':';
++    memcpy(sdata + l1 + 1, n2, l2);
++    sdata[l1 + 1 + l2] = '\n';
++    bf_spit(stamp, sdata, l1 + 1 + l2 + 1);
++    memcpy(out_buf, cfile, cfl + 1);
++    return out_buf;
++}
++#else
++static const char* ensure_patched_static(const char* h, char* out_buf, size_t out_cap) {
++    (void) h; (void) out_buf; (void) out_cap;
++    return NULL;
++}
++#endif
+ static int prep_exec(struct ar*a, const char*path, char*const argv[], char*const envp[], const char**op, char***oa, char***oe) {
+     int argc = 0;
+     while (argv && argv[argc]) argc++;
+@@ -4036,17 +4166,21 @@ static int prep_exec(struct ar*a, const char*path, char*const argv[], char*const
+             }
+         }
+         if (!have) {
++            const char* exec_target = h;
++            char pbuf[PM];
++            const char* ph = ensure_patched_static(h, pbuf, sizeof pbuf);
++            if (ph) exec_target = ph;
+             if (g_qemu[0]) {
+                 char**qv = am(a, (size_t)(argc+8)*sizeof (char*));
+                 if (!qv) return (int) fail(ENOMEM);
+                 int qk = 0;
+                 qv[qk++] = (char*) g_qemu;
+                 qv[qk++] = "-0";
+                 qv[qk++] = av[0];
+-                qv[qk++] = (char*) h;
+-                for (int j = 1; j<argc; j++) nv[k++] = av[j];
++                qv[qk++] = (char*) exec_target;
++                for (int j = 1; j<argc; j++) qv[qk++] = av[j];
+                 qv[qk] = NULL;
+                 *op = g_qemu;
+                 *oa = qv;
+             } else {
+-                *op = h;
++                *op = exec_target;
+                 *oa = av;
+             }
+             exec_cred_prepare(h);
