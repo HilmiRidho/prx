@@ -12,14 +12,14 @@ case "$target" in
 debian)
   PREFIX=/usr
   DEPENDS='bash (>= 4.3), coreutils, tar, findutils, sed, grep, gcc | clang, libc6-dev | libc-dev'
-  RECOMMENDS='curl, util-linux'
-  SUGGESTS='qemu-user-static, lld'
+  RECOMMENDS='curl, util-linux, xz-utils, lld'
+  SUGGESTS='qemu-user-static, zstd, bzip2'
   FILE="prx_${ver}_all.deb" ;;
 termux)
   PREFIX=/data/data/com.termux/files/usr
-  DEPENDS='bash, coreutils, tar, findutils, sed, grep, clang'
-  RECOMMENDS='curl, util-linux'
-  SUGGESTS='qemu-user-x86-64, qemu-user-aarch64, lld'
+  DEPENDS='bash, coreutils, tar, gzip, findutils, sed, grep, clang'
+  RECOMMENDS='curl, util-linux, xz-utils, lld'
+  SUGGESTS='qemu-user-x86-64, qemu-user-aarch64, zstd, bzip2'
   FILE="prx_${ver}_termux_all.deb" ;;
 *) echo "usage: $0 [debian|termux] [outdir]" >&2; exit 1 ;;
 esac
