@@ -56,7 +56,7 @@ Usage:
 Environment:
   PRX_HOME=DIR      Data directory (default: ~/.prx if present, else \$XDG_DATA_HOME/prx)
   PRX_SRCDIR=DIR    Directory holding prx.c and ldpatch.c
-  PRX_DNS=LIST      IPv4 DNS servers for the guest (separated by ',' or ':')
+  PRX_DNS=LIST      IPv4/IPv6 DNS servers for the guest (separated by ',', ';' or blanks)
   PRX_NO_ARGV0=1    Never pass --argv0 to the loader (auto-detected; glibc < 2.33 lacks it)
   CC=PROGRAM        C compiler used to build the shim
 
@@ -275,51 +275,93 @@ local re='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$' i
 for i in 1 2 3 4; do [ "$((10#${BASH_REMATCH[i]}))" -le 255 ] || return 1; done
 return 0
 }
-# clean_dns LIST: keep only IPv4 addresses (separators: ':' , ',' ';' or blanks).
-# The shim only speaks IPv4 DNS and stores the list colon-separated.
+# valid_ipv6 ADDR: RFC 4291 text form ("::" once, optional trailing dotted quad,
+# no zone id).
+valid_ipv6() {
+local a="$1" pre="$1" post="" dbl=0 n=0 i part g vpart="" gi last
+local -a gs
+case "$a" in ""|*[!0-9a-fA-F:.]*|*:::*) return 1 ;; esac
+case "$a" in *:*) ;; *) return 1 ;; esac
+if [[ "$a" == *::* ]]; then
+dbl=1; pre="${a%%::*}"; post="${a#*::}"
+[[ "$post" == *::* ]] && return 1
+fi
+# the part that may end in an embedded IPv4 address
+if [ -n "$post" ]; then vpart=1
+elif [ "$dbl" = 0 ]; then vpart=0
+fi
+for i in 0 1; do
+if [ "$i" = 0 ]; then part="$pre"; else part="$post"; fi
+[ -z "$part" ] && continue
+[[ "$part" == :* || "$part" == *: ]] && return 1
+gs=(); IFS=: read -r -a gs <<<"$part"
+last=$(( ${#gs[@]} - 1 )); gi=0
+for g in "${gs[@]}"; do
+if [[ "$g" == *.* ]]; then
+{ [ "$vpart" = "$i" ] && [ "$gi" = "$last" ] && valid_ipv4 "$g"; } || return 1
+n=$((n+2))
+else
+[[ "$g" =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1
+n=$((n+1))
+fi
+gi=$((gi+1))
+done
+done
+if [ "$dbl" = 1 ]; then [ "$n" -le 7 ]; else [ "$n" -eq 8 ]; fi
+}
+# clean_dns LIST: keep only valid IPv4 / IPv6 addresses (separators: ',' ';' or
+# blanks; a legacy ':'-separated list of IPv4 addresses is still understood).
+# The result is comma-separated, which is also the format the shim expects.
 clean_dns() {
 local -a toks=() parts=()
 local tok d out="" ok
 read -r -a toks <<<"$(printf '%s' "$1" | tr ',;' '  ')"
 for tok in ${toks[@]+"${toks[@]}"}; do
-case "$tok" in
-*:*)
+tok="${tok#[}"; tok="${tok%]}"
+if valid_ipv4 "$tok" || valid_ipv6 "$tok"; then
+out="${out:+$out,}$tok"
+elif [[ "$tok" == *%* ]] && valid_ipv6 "${tok%%%*}"; then
+warn "ignoring DNS server '$tok' (scoped/zone addresses are not supported)"
+elif [[ "$tok" == *:* ]]; then
 IFS=: read -r -a parts <<<"$tok"
 ok=1
 for d in "${parts[@]}"; do valid_ipv4 "$d" || ok=0; done
 if [ "$ok" = 1 ]; then
-for d in "${parts[@]}"; do out="${out:+$out:}$d"; done
+for d in "${parts[@]}"; do out="${out:+$out,}$d"; done
 else
-warn "ignoring DNS server '$tok' (IPv6 is not supported)"
-fi ;;
-*)
-if valid_ipv4 "$tok"; then out="${out:+$out:}$tok"
-else warn "ignoring invalid DNS server '$tok'"
-fi ;;
-esac
+warn "ignoring invalid DNS server '$tok'"
+fi
+else
+warn "ignoring invalid DNS server '$tok'"
+fi
 done
-echo "${out:-8.8.8.8:1.1.1.1}"
+echo "${out:-8.8.8.8,1.1.1.1}"
 }
 detect_dns() {
 if [ -n "${PRX_DNS:-}" ]; then
 clean_dns "$PRX_DNS"
 return 0
 fi
-local dns="" d
+local d v4="" v6=""
+# collect(): IPv4 servers go first so an IPv6-less host never waits on them
+collect() {
+case "$1" in
+""|127.*|::1|0:0:0:0:0:0:0:1|*%*) ;;
+*:*) v6="${v6:+$v6,}$1" ;;
+*.*) v4="${v4:+$v4,}$1" ;;
+esac
+}
 if command -v getprop >/dev/null 2>&1; then
 for d in $(getprop net.dns1) $(getprop net.dns2) $(getprop net.dns3) $(getprop net.dns4); do
-case "$d" in *.*) dns="${dns:+$dns:}$d" ;; esac
+collect "$d"
 done
 fi
-if [ -z "$dns" ] && [ -r /etc/resolv.conf ]; then
+if [ -z "$v4$v6" ] && [ -r /etc/resolv.conf ]; then
 while read -r _ d _; do
-case "$d" in
-127.0.0.53|127.0.0.1) continue ;;
-*.*) dns="${dns:+$dns:}$d" ;;
-esac
+collect "$d"
 done < <(grep '^nameserver' /etc/resolv.conf 2>/dev/null || true)
 fi
-clean_dns "${dns:-}"
+clean_dns "${v4:+$v4${v6:+,}}${v6}"
 }
 find_loader() {
 local r="$1" c
@@ -423,7 +465,7 @@ chmod 1777 "$(rpath "$dest" /tmp)" "$(rpath "$dest" /var/tmp)"
 chmod -R u+rwX "$(rpath "$dest" /etc/sudoers.d)" "$(rpath "$dest" /etc/pam.d)"
 local cur_dns; cur_dns="$(detect_dns)"
 local resolv_str="" d
-for d in $(echo "$cur_dns" | tr ':' ' '); do
+for d in $(echo "$cur_dns" | tr ',' ' '); do
 resolv_str="${resolv_str}nameserver $d\n"
 done
 rwfile "$dest" /etc/resolv.conf "$resolv_str"

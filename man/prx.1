@@ -92,8 +92,11 @@ C compiler used by \fBprx build\fR.
 Path to a specific qemu-user binary for cross-architecture rootfs.
 .TP
 .B PRX_DNS
-IPv4 nameservers to use inside the guest, separated by commas, blanks or
-colons. Other entries (including IPv6 addresses) are ignored with a warning.
+IPv4 and/or IPv6 nameservers to use inside the guest, separated by commas,
+semicolons or blanks (a legacy colon-separated list of IPv4 addresses is still
+accepted). Invalid entries and scoped addresses such as
+.I fe80::1%eth0
+are ignored with a warning.
 .TP
 .B PRX_NO_ARGV0
 Set to 1 to never pass

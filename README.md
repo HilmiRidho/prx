@@ -19,6 +19,11 @@ The shim is compiled per user on the first `prx login` (needs `gcc` or `clang`).
     tests/smoke.sh offline smoke tests
     packaging/     build-deb.sh [debian|termux]
 
+## Unreleased
+
+- DNS: the shim now queries IPv6 nameservers as well. `PRX_DNS` and the guest `resolv.conf` may mix IPv4 and IPv6 (the list is comma-separated; a legacy colon-separated IPv4 list still works). Scoped addresses (`fe80::1%eth0`) are not supported and are dropped with a warning. Host-detected servers are ordered IPv4 first.
+- passwd/group emulation: `/etc/passwd`, `/etc/group` and `/etc/hosts` are read completely (no 48 KiB / 16 KiB cut-off), groups may have any number of members, and the buffers behind `getpwnam`/`getgrnam`-style calls grow on demand. The virtual supplementary-group limit is raised from 64 to 256.
+
 ## Changes in 1.0.1
 
 - Writes into a rootfs (`login`, `install`) no longer follow symlinks out of it: an absolute link such as `/var/lib/dbus/machine-id -> /etc/machine-id` used to make `cp`/`>` hit the *host* file (dangerous when run as root). All such writes now go through `rpath`, which resolves links as if the rootfs were `/`.
@@ -46,13 +51,11 @@ The shim is compiled per user on the first `prx login` (needs `gcc` or `clang`).
 
 ## Known limits (by design)
 
-- Not a security boundary (LD_PRELOAD + loader patching; static/raw-syscall binaries can bypass it).
+- Not a security boundary (LD_PRELOAD + loader patching; static/raw-syscall binaries can bypass it). This cannot be fixed within an LD_PRELOAD design; it would need a ptrace / seccomp-unotify supervisor or user namespaces.
 - glibc rootfs only; x86_64 / aarch64 only.
 - Guest PAM is `pam_permit` and sudo is `NOPASSWD` because there is no real root to authenticate.
 - Loader patching depends on glibc machine code and may fail on some versions.
 - Bind paths cannot contain `:` or `=` (the shim's `PRX_BIND` format uses them as separators).
-- Only IPv4 DNS servers are supported for the guest.
-- Groups with more than 32 members and `/etc/passwd` files larger than 48 KiB are truncated by the shim's passwd/group emulation.
 
 ## Packages
 

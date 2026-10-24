@@ -68,12 +68,40 @@ if "$PRX" login t1 -b "$T:$long" 2>"$T/err"; then fail "overlong bind accepted";
 grep -q 'too long' "$T/err" && ok "overlong --bind is rejected, not silently dropped" || fail "overlong --bind is rejected, not silently dropped"
 if "$PRX" login t1 -b "$T:/a:/b" 2>"$T/err"; then fail "ambiguous bind accepted"; fi
 grep -q "must not contain ':'" "$T/err" && ok "ambiguous ':' in --bind is rejected" || fail "ambiguous ':' in --bind is rejected"
-# DNS list: only valid IPv4 survives, '%' is never used as a printf format
-PRX_DNS='1.2.3.4%s,5.6.7.8,2001:db8::1,999.1.1.1' "$PRX" install t4 "$T/fs.tar.gz" --sha256 "$good" >/dev/null 2>"$T/err"
+# DNS list: valid IPv4/IPv6 survive, junk is dropped, '%' is never used as a printf format
+PRX_DNS='1.2.3.4%s,5.6.7.8,2001:db8::1,999.1.1.1,fe80::1%eth0,[2606:4700:4700::1111],::ffff:1.2.3.4' "$PRX" install t4 "$T/fs.tar.gz" --sha256 "$good" >/dev/null 2>"$T/err"
 rc4="$HOME/.local/share/prx/rootfs/t4/etc/resolv.conf"
-[ "$(cat "$rc4")" = "nameserver 5.6.7.8" ] && ok "PRX_DNS keeps only valid IPv4" || fail "PRX_DNS keeps only valid IPv4"
-grep -q 'IPv6 is not supported' "$T/err" && ok "IPv6 DNS entry is reported" || fail "IPv6 DNS entry is reported"
+want4="$(printf 'nameserver 5.6.7.8\nnameserver 2001:db8::1\nnameserver 2606:4700:4700::1111\nnameserver ::ffff:1.2.3.4')"
+[ "$(cat "$rc4")" = "$want4" ] && ok "PRX_DNS keeps valid IPv4 and IPv6" || fail "PRX_DNS keeps valid IPv4 and IPv6"
+grep -q "ignoring invalid DNS server '1.2.3.4%s'" "$T/err" && grep -q "ignoring invalid DNS server '999.1.1.1'" "$T/err" && ok "invalid DNS entries are reported" || fail "invalid DNS entries are reported"
+grep -q 'zone addresses are not supported' "$T/err" && ok "scoped IPv6 DNS entry is reported" || fail "scoped IPv6 DNS entry is reported"
 "$PRX" remove t4 >/dev/null 2>&1
+# legacy ':'-separated IPv4 list still works
+PRX_DNS='9.9.9.9:149.112.112.112' "$PRX" install t5 "$T/fs.tar.gz" --sha256 "$good" >/dev/null 2>&1
+want5="$(printf 'nameserver 9.9.9.9\nnameserver 149.112.112.112')"
+[ "$(cat "$HOME/.local/share/prx/rootfs/t5/etc/resolv.conf")" = "$want5" ] && ok "legacy colon-separated IPv4 list" || fail "legacy colon-separated IPv4 list"
+"$PRX" remove t5 >/dev/null 2>&1
+
+# shim: groups with >32 members, >48 KiB passwd/group, IPv6 literal parsing
+mkdir -p "$T/shimroot/etc"
+awk 'BEGIN {
+  print "root:x:0:"
+  for (i = 0; i < 3000; i++) printf "filler%d:x:%d:a,b\n", i, 2000 + i
+  printf "big:x:5000:"
+  for (i = 0; i < 300; i++) printf "%suser%d", (i ? "," : ""), i
+  print ""
+  print "last:x:5001:u1"
+}' > "$T/shimroot/etc/group"
+awk 'BEGIN {
+  g = sprintf("%40s", ""); gsub(/ /, "G", g)
+  for (i = 0; i < 2500; i++) printf "u%d:x:%d:%d:%s:/home/u%d:/bin/sh\n", i, 10000 + i, 10000 + i, g, i
+  print "lastuser:x:99999:99999:Last:/home/last:/bin/bash"
+}' > "$T/shimroot/etc/passwd"
+if "${CC:-cc}" -w -o "$T/shim_unit" "$HERE/tests/shim_unit.c" 2>"$T/err" && "$T/shim_unit" "$T/shimroot" >/dev/null; then
+  ok "shim: >32 group members, >48 KiB passwd/group, IPv6 literals"
+else
+  cat "$T/err" >&2; fail "shim: >32 group members, >48 KiB passwd/group, IPv6 literals"
+fi
 
 # rootfs symlinks must not redirect writes to the host
 mkdir -p "$T/fs2/etc/pam.d" "$T/fs2/var/lib/dbus" "$T/decoy"

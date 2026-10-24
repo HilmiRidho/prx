@@ -192,6 +192,7 @@ static inline long sc(long n, long a, long b, long c, long d, long e, long f) {
 #define SC5(n,a,b,c,d,e) sc((n),(long)(a),(long)(b),(long)(c),(long)(d),(long)(e),0)
 extern int*__errno_location(void);
 extern void*malloc(size_t);
+extern void*realloc(void*, size_t);
 extern void free(void*);
 extern void*memcpy(void*, const void*, size_t);
 extern void*memmove(void*, const void*, size_t);
@@ -251,7 +252,8 @@ static char g_qemu[PM];
 #define BENV 16384
 static char g_bindenv[BENV];
 static int g_noargv0;
-static char g_dns[128] = "8.8.8.8:1.1.1.1";
+/* comma-separated list of IPv4 and/or IPv6 literals */
+static char g_dns[512] = "8.8.8.8,1.1.1.1";
 static char g_self_exe[PM];
 static int g_fake;
 static int g_trace;
@@ -261,11 +263,11 @@ static u32 g_ruid, g_rgid;
 /* virtual credentials for --no-root-id (host user, setuid/sudo emulation) */
 static int g_user;
 static char g_vuser[64];
-static char g_credbuf[1024];
+static char g_credbuf[4096];
 #define CR_NA ((u32)-1)
 enum { C_RU, C_EU, C_SU, C_FU, C_RG, C_EG, C_SG, C_FG };
 static u32 g_cr[8];
-#define NVG 64
+#define NVG 256
 static u32 g_vg[NVG];
 static int g_nvg;
 static u32 g_pcr[8];
@@ -2689,7 +2691,7 @@ EXP int setresgid(u32 a, u32 b, u32 c) {
     if (!f) f = nextsym("setresgid");
     return f(a, b, c);
 }
-static u32 g_fake_groups[32] = {0};
+static u32 g_fake_groups[NVG] = {0};
 static int g_fake_ngroups = 1;
 EXP int getgroups(int size, u32*list) {
     if (g_user) {
@@ -2723,7 +2725,7 @@ EXP int setgroups(size_t n, const void*l) {
         return 0;
     }
     if (g_fake) {
-        if (n>32) n = 32;
+        if (n>NVG) return (int) fail(EINVAL);
         for (size_t i = 0; i<n; i++) g_fake_groups[i] = ((const u32*) l)[i];
         g_fake_ngroups = (int) n;
         return 0;
@@ -2796,23 +2798,47 @@ static u32 atou(const char*s) {
     while (*s >= '0' && *s <= '9') v = v*10+(u32)(*s++-'0');
     return v;
 }
-static long read_rel(const char*rel, char*out, size_t cap) {
+/* Read a whole file below the rootfs into a malloc'd, NUL-terminated buffer.
+ * Loops until EOF (a single read() may return less than the file size), so
+ * there is no fixed size limit other than a sanity cap of 64 MiB. */
+#define READ_ALL_MAX (64L*1024*1024)
+static char*read_rel_all(const char*rel, long*lenp) {
     char p[PM];
     size_t rl = strlen(rel);
-    if (!g_rl || g_rl+rl+1 >= PM) return-1;
+    if (lenp)*lenp = 0;
+    if (!g_rl || g_rl+rl+1 >= PM) return NULL;
     memcpy(p, g_root, g_rl);
     memcpy(p+g_rl, rel, rl+1);
     long fd = SC4(N_openat, AT_FDCWD, p, O_RDONLY|O_CLOEXEC, 0);
-    if (fd<0) return-1;
-    long n = SC3(N_read, fd, out, cap);
+    if (fd<0) return NULL;
+    size_t cap = 65536, len = 0;
+    char*b = malloc(cap);
+    if (!b) {
+        sc(N_close, fd, 0, 0, 0, 0, 0);
+        return NULL;
+    }
+    for (;;) {
+        if (len+1 >= cap) {
+            if ((long) cap >= READ_ALL_MAX) break;
+            char*nb = realloc(b, cap*2);
+            if (!nb) break;
+            b = nb;
+            cap *= 2;
+        }
+        long n = SC3(N_read, fd, b+len, cap-len-1);
+        if (n == -4) continue; /* EINTR */
+        if (n <= 0) break;
+        len += (size_t) n;
+    }
     sc(N_close, fd, 0, 0, 0, 0, 0);
-    if (n>0) out[n] = 0;
-    return n;
+    b[len] = 0;
+    if (lenp)*lenp = (long) len;
+    return b;
 }
 static int pw_lookup(const char*name, int byuid, u32 uid, struct pw*o, char*buf, size_t bl) {
-    char*data = malloc(49152);
-    if (!data) return-1;
-    long n = read_rel("/etc/passwd", data, 49151);
+    long n;
+    char*data = read_rel_all("/etc/passwd", &n);
+    if (!data) return 0;
     if (n <= 0) {
         free(data);
         return 0;
@@ -2863,9 +2889,9 @@ static int pw_lookup(const char*name, int byuid, u32 uid, struct pw*o, char*buf,
     return res;
 }
 static int gr_lookup(const char*name, int bygid, u32 gid, struct gr*o, char*buf, size_t bl) {
-    char*data = malloc(49152);
-    if (!data) return-1;
-    long n = read_rel("/etc/group", data, 49151);
+    long n;
+    char*data = read_rel_all("/etc/group", &n);
+    if (!data) return 0;
     if (n <= 0) {
         free(data);
         return 0;
@@ -2886,14 +2912,19 @@ static int gr_lookup(const char*name, int bygid, u32 gid, struct gr*o, char*buf,
             }
         }
         if (k == 4 && ((bygid && atou(f[2]) == gid) || (!bygid && !strcmp(f[0], name)))) {
-            size_t need = 33*sizeof (char*)+8;
+            size_t nmem = 0;
+            if (f[3][0]) {
+                nmem = 1;
+                for (const char*c = f[3]; *c; c++) if (*c == ',') nmem++;
+            }
+            size_t need = (nmem+1)*sizeof (char*)+8;
             for (int i = 0; i<4; i++) need += strlen(f[i])+1;
             if (need>bl) {
                 res = -1;
                 break;
             }
             char**arr = (char**)(((unsigned long) buf+7)&~7UL);
-            char*d = (char*)(arr+33);
+            char*d = (char*)(arr+nmem+1);
             char*ptr[4];
             for (int i = 0; i<4; i++) {
                 size_t z = strlen(f[i])+1;
@@ -2903,7 +2934,7 @@ static int gr_lookup(const char*name, int bygid, u32 gid, struct gr*o, char*buf,
             }
             int m = 0;
             char*p = ptr[3];
-            while (*p && m<32) {
+            while (*p && (size_t) m<nmem) {
                 arr[m++] = p;
                 while (*p && *p != ',') p++;
                 if (*p)*p++ = 0;
@@ -2973,14 +3004,18 @@ static int cr_decode(const char*s) {
     g_nvg = ng;
     return 1;
 }
-static char g_gdata[65536];
 static int cr_collect(const char*user, u32 gid, u32*out, int max) {
     int n = 0;
     if (max > 0) out[n++] = gid;
-    long len = read_rel("/etc/group", g_gdata, sizeof g_gdata-1);
-    if (len <= 0) return n;
+    long len;
+    char*gdata = read_rel_all("/etc/group", &len);
+    if (!gdata) return n;
+    if (len <= 0) {
+        free(gdata);
+        return n;
+    }
     size_t ul = strlen(user);
-    for (char*l = g_gdata; *l; ) {
+    for (char*l = gdata; *l; ) {
         char*e = l;
         while (*e && *e != '\n') e++;
         char sv = *e;
@@ -3013,6 +3048,7 @@ static int cr_collect(const char*user, u32 gid, u32*out, int max) {
         *e = sv;
         l = sv ? e+1 : e;
     }
+    free(gdata);
     return n;
 }
 static void cred_init(void) {
@@ -3021,30 +3057,68 @@ static void cred_init(void) {
     for (int i = 4; i<8; i++) g_cr[i] = g_rgid;
     g_nvg = cr_collect(g_vuser, g_rgid, g_vg, NVG);
 }
-static char s_pwbuf[2048], s_grbuf[4096];
+/* Non-reentrant getpw*()/getgr*() results live in heap buffers that grow on
+ * demand, so large entries (e.g. groups with hundreds of members) are never
+ * truncated. */
+static char*s_pwbuf, *s_grbuf;
+static size_t s_pwcap, s_grcap;
 static struct pw s_pw;
 static struct gr s_gr;
+static int pw_lookup_dyn(const char*name, int byuid, u32 uid) {
+    if (!s_pwbuf) {
+        s_pwbuf = malloc(s_pwcap = 2048);
+        if (!s_pwbuf) {
+            s_pwcap = 0;
+            return-1;
+        }
+    }
+    for (;;) {
+        int r = pw_lookup(name, byuid, uid, &s_pw, s_pwbuf, s_pwcap);
+        if (r >= 0 || s_pwcap >= (1UL<<26)) return r;
+        char*nb = realloc(s_pwbuf, s_pwcap*2);
+        if (!nb) return-1;
+        s_pwbuf = nb;
+        s_pwcap *= 2;
+    }
+}
+static int gr_lookup_dyn(const char*name, int bygid, u32 gid) {
+    if (!s_grbuf) {
+        s_grbuf = malloc(s_grcap = 4096);
+        if (!s_grbuf) {
+            s_grcap = 0;
+            return-1;
+        }
+    }
+    for (;;) {
+        int r = gr_lookup(name, bygid, gid, &s_gr, s_grbuf, s_grcap);
+        if (r >= 0 || s_grcap >= (1UL<<26)) return r;
+        char*nb = realloc(s_grbuf, s_grcap*2);
+        if (!nb) return-1;
+        s_grbuf = nb;
+        s_grcap *= 2;
+    }
+}
 EXP struct pw*getpwuid(u32 uid) {
     static struct pw*(*f)(u32);
-    if (g_rl && pw_lookup(NULL, 1, uid, &s_pw, s_pwbuf, sizeof s_pwbuf) == 1) return&s_pw;
+    if (g_rl && pw_lookup_dyn(NULL, 1, uid) == 1) return&s_pw;
     if (!f) f = nextsym("getpwuid");
     return f(uid);
 }
 EXP struct pw*getpwnam(const char*n) {
     static struct pw*(*f)(const char*);
-    if (g_rl && pw_lookup(n, 0, 0, &s_pw, s_pwbuf, sizeof s_pwbuf) == 1) return&s_pw;
+    if (g_rl && pw_lookup_dyn(n, 0, 0) == 1) return&s_pw;
     if (!f) f = nextsym("getpwnam");
     return f(n);
 }
 EXP struct gr*getgrgid(u32 gid) {
     static struct gr*(*f)(u32);
-    if (g_rl && gr_lookup(NULL, 1, gid, &s_gr, s_grbuf, sizeof s_grbuf) == 1) return&s_gr;
+    if (g_rl && gr_lookup_dyn(NULL, 1, gid) == 1) return&s_gr;
     if (!f) f = nextsym("getgrgid");
     return f(gid);
 }
 EXP struct gr*getgrnam(const char*n) {
     static struct gr*(*f)(const char*);
-    if (g_rl && gr_lookup(n, 0, 0, &s_gr, s_grbuf, sizeof s_grbuf) == 1) return&s_gr;
+    if (g_rl && gr_lookup_dyn(n, 0, 0) == 1) return&s_gr;
     if (!f) f = nextsym("getgrnam");
     return f(n);
 }
@@ -3288,7 +3362,7 @@ static char**mkenv(struct ar*a, char*const envp[], int native, const char*cur_ex
             ne[k++] = acat(a, "PRX_MEM_KB=", nb);
         }
         if (g_user) {
-            char cb[1024];
+            char cb[4096];
             cr_encode(g_pcr_ok ? g_pcr : g_cr, cb);
             ne[k++] = acat(a, "PRX_VUSER=", g_vuser);
             ne[k++] = acat(a, "PRX_CRED=", cb);
@@ -3819,6 +3893,62 @@ static int parse_v4(const char*s, size_t n, u8 out[4]) {
     }
     return i == n;
 }
+/* IPv6 literal (RFC 4291 text form, incl. "::" and an embedded dotted quad).
+ * Zone ids ("%eth0") are not accepted. */
+static int parse_v6(const char*s, size_t n, u8 out[16]) {
+    u16 w[8];
+    int nw = 0, gap = -1;
+    size_t i = 0;
+    if (!n || n>45) return 0;
+    if (n >= 2 && s[0] == ':' && s[1] == ':') {
+        gap = 0;
+        i = 2;
+        if (i == n) {
+            memset(out, 0, 16);
+            return 1;
+        }
+    } else if (s[0] == ':') return 0;
+    while (i<n) {
+        size_t st = i;
+        unsigned v = 0;
+        int d = 0;
+        while (i<n && ((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f') || (s[i] >= 'A' && s[i] <= 'F'))) {
+            char c = s[i++];
+            v = v*16+(unsigned)(c <= '9' ? c-'0' : (c|32)-'a'+10);
+            if (++d>4) return 0;
+        }
+        if (i<n && s[i] == '.') {
+            u8 q[4];
+            if (nw>6 || !parse_v4(s+st, n-st, q)) return 0;
+            w[nw++] = (u16)((q[0]<<8)|q[1]);
+            w[nw++] = (u16)((q[2]<<8)|q[3]);
+            i = n;
+            break;
+        }
+        if (!d || nw >= 8) return 0;
+        w[nw++] = (u16) v;
+        if (i == n) break;
+        if (s[i] != ':') return 0;
+        i++;
+        if (i<n && s[i] == ':') {
+            if (gap >= 0) return 0;
+            gap = nw;
+            i++;
+            if (i == n) break;
+        } else if (i == n) return 0;
+    }
+    if (gap < 0 ? nw != 8 : nw >= 8) return 0;
+    int z = 8-nw;
+    int o = 0;
+    for (int k = 0; k<8; k++) {
+        u16 v;
+        if (gap >= 0 && k >= gap && k<gap+z) v = 0;
+        else v = w[o++];
+        out[2*k] = (u8)(v>>8);
+        out[2*k+1] = (u8) v;
+    }
+    return 1;
+}
 static void fmt_v4(const u8 ip[4], char*o) {
     for (int i = 0; i<4; i++) {
         unsigned v = ip[i];
@@ -3830,24 +3960,13 @@ static void fmt_v4(const u8 ip[4], char*o) {
     *o = 0;
 }
 static int hosts_lookup(const char*name, u8 ip[4]) {
-    if (!g_rl) return 0;
-    char path[PM];
-    memcpy(path, g_root, g_rl);
-    memcpy(path+g_rl, "/etc/hosts", 11);
-    long fd = SC4(N_openat, AT_FDCWD, path, O_RDONLY|O_CLOEXEC, 0);
-    if (fd<0) return 0;
-    char*buf = malloc(16384);
-    if (!buf) {
-        sc(N_close, fd, 0, 0, 0, 0, 0);
-        return 0;
-    }
-    long n = SC3(N_read, fd, buf, 16383);
-    sc(N_close, fd, 0, 0, 0, 0, 0);
+    long n;
+    char*buf = read_rel_all("/etc/hosts", &n);
+    if (!buf) return 0;
     if (n <= 0) {
         free(buf);
         return 0;
     }
-    buf[n] = 0;
     size_t nl = strlen(name);
     char*p = buf;
     int found = 0;
@@ -3877,6 +3996,91 @@ static int hosts_lookup(const char*name, u8 ip[4]) {
         p = *eol ? eol+1 : eol;
     }
     free(buf);
+    return found;
+}
+/* Ask one server (IPv4 or IPv6) for an A record. Returns 1 and fills ip on
+ * success, 0 otherwise. */
+static int dns_ask(int fam, const u8*saddr, const u8*q, size_t k, const u8 id[2], u8 ip[4]) {
+    int s = socket(fam, 2, 0);
+    if (s < 0) return 0;
+    int found = 0;
+    struct {
+        u16 fam;
+        u16 port;
+        u32 flow;
+        u8 addr[16];
+        u32 scope;
+    } sa6;
+    struct {
+        u16 fam;
+        u16 port;
+        u8 addr[4];
+        u8 z[8];
+    } sa4;
+    const void*sa;
+    unsigned sl;
+    u16 port = (u16)((53>>8)|((53&0xff)<<8));
+    if (fam == 10) {
+        memset(&sa6, 0, sizeof sa6);
+        sa6.fam = 10;
+        sa6.port = port;
+        memcpy(sa6.addr, saddr, 16);
+        sa = &sa6;
+        sl = sizeof sa6;
+    } else {
+        memset(&sa4, 0, sizeof sa4);
+        sa4.fam = 2;
+        sa4.port = port;
+        memcpy(sa4.addr, saddr, 4);
+        sa = &sa4;
+        sl = sizeof sa4;
+    }
+    long tv[2] = {2, 0};
+    setsockopt(s, 1, 20, tv, sizeof tv);
+    if (connect(s, sa, sl) == 0) {
+        for (int tries = 0; tries<2 && !found; tries++) {
+            if (send(s, q, k, 0)<0) break;
+            u8 r[1500];
+            long rn = recv(s, r, sizeof r, 0);
+            if (rn<12 || r[0] != id[0] || r[1] != id[1]) continue;
+            if ((r[3]&0x0f) != 0) break;
+            int an = (r[6]<<8)|r[7];
+            long o = 12;
+            int qd = (r[4]<<8)|r[5];
+            for (int i = 0; i<qd && o<rn; i++) {
+                while (o<rn && r[o]) {
+                    if ((r[o]&0xc0) == 0xc0) {
+                        o++;
+                        break;
+                    }
+                    o += r[o]+1;
+                }
+                o += 1+4;
+            }
+            for (int i = 0; i<an && o<rn; i++) {
+                while (o<rn && r[o]) {
+                    if ((r[o]&0xc0) == 0xc0) {
+                        o++;
+                        break;
+                    }
+                    o += r[o]+1;
+                }
+                o++;
+                if (o+10>rn) break;
+                int ty = (r[o]<<8)|r[o+1];
+                int rl = (r[o+8]<<8)|r[o+9];
+                o += 10;
+                if (ty == 1 && rl == 4 && o+4 <= rn) {
+                    memcpy(ip, r+o, 4);
+                    found = 1;
+                    break;
+                }
+                o += rl;
+            }
+            break;
+        }
+    }
+    sc(N_close, s, 0, 0, 0, 0, 0);
     return found;
 }
 static int dns_query(const char*name, u8 ip[4]) {
@@ -3909,71 +4113,22 @@ static int dns_query(const char*name, u8 ip[4]) {
     q[k++] = 1;
     q[k++] = 0;
     q[k++] = 1;
+    /* g_dns: comma-separated IPv4 / IPv6 literals ("[addr]" is accepted too) */
     const char*sv = g_dns;
     while (*sv) {
         const char*e = sv;
-        while (*e && *e != ':') e++;
-        u8 sip[4];
-        if (parse_v4(sv, (size_t)(e-sv), sip)) {
-            int s = socket(2, 2, 0);
-            if (s >= 0) {
-                struct {
-                    u16 fam;
-                    u16 port;
-                    u8 addr[4];
-                    u8 z[8];
-                } sa;
-                memset(&sa, 0, sizeof sa);
-                sa.fam = 2;
-                sa.port = (u16)((53>>8)|((53&0xff)<<8));
-                memcpy(sa.addr, sip, 4);
-                long tv[2] = {2, 0};
-                setsockopt(s, 1, 20, tv, sizeof tv);
-                if (connect(s, &sa, sizeof sa) == 0) {
-                    for (int tries = 0; tries<2; tries++) {
-                        if (send(s, q, k, 0)<0) break;
-                        u8 r[1500];
-                        long rn = recv(s, r, sizeof r, 0);
-                        if (rn<12 || r[0] != id[0] || r[1] != id[1]) continue;
-                        if ((r[3]&0x0f) != 0) break;
-                        int an = (r[6]<<8)|r[7];
-                        long o = 12;
-                        int qd = (r[4]<<8)|r[5];
-                        for (int i = 0; i<qd && o<rn; i++) {
-                            while (o<rn && r[o]) {
-                                if ((r[o]&0xc0) == 0xc0) {
-                                    o++;
-                                    break;
-                                }
-                                o += r[o]+1;
-                            }
-                            o += 1+4;
-                        }
-                        for (int i = 0; i<an && o<rn; i++) {
-                            while (o<rn && r[o]) {
-                                if ((r[o]&0xc0) == 0xc0) {
-                                    o++;
-                                    break;
-                                }
-                                o += r[o]+1;
-                            }
-                            o++;
-                            if (o+10>rn) break;
-                            int ty = (r[o]<<8)|r[o+1];
-                            int rl = (r[o+8]<<8)|r[o+9];
-                            o += 10;
-                            if (ty == 1 && rl == 4 && o+4 <= rn) {
-                                memcpy(ip, r+o, 4);
-                                sc(N_close, s, 0, 0, 0, 0, 0);
-                                return 1;
-                            }
-                            o += rl;
-                        }
-                        break;
-                    }
-                }
-                sc(N_close, s, 0, 0, 0, 0, 0);
-            }
+        while (*e && *e != ',') e++;
+        const char*a = sv;
+        size_t al = (size_t)(e-sv);
+        if (al >= 2 && a[0] == '[' && a[al-1] == ']') {
+            a++;
+            al -= 2;
+        }
+        u8 sip[16];
+        if (parse_v4(a, al, sip)) {
+            if (dns_ask(2, sip, q, k, id, ip)) return 1;
+        } else if (parse_v6(a, al, sip)) {
+            if (dns_ask(10, sip, q, k, id, ip)) return 1;
         }
         sv = *e ? e+1 : e;
     }
