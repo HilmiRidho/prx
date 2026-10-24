@@ -1,0 +1,750 @@
+diff -ruN -x .tmp a/prx/README.md b/prx/README.md
+--- a/prx/README.md	2026-10-23 19:02:08.000000000 +0000
++++ b/prx/README.md	2026-10-23 19:45:37.882904764 +0000
+@@ -1,4 +1,4 @@
+-# prx 1.0.0
++# prx 1.0.1
+ 
+ User-space container / path-translation engine (glibc rootfs, no root needed).
+ 
+@@ -19,6 +19,17 @@
+     tests/smoke.sh offline smoke tests
+     packaging/     build-deb.sh [debian|termux]
+ 
++## Changes in 1.0.1
++
++- Writes into a rootfs (`login`, `install`) no longer follow symlinks out of it: an absolute link such as `/var/lib/dbus/machine-id -> /etc/machine-id` used to make `cp`/`>` hit the *host* file (dangerous when run as root). All such writes now go through `rpath`, which resolves links as if the rootfs were `/`.
++- `--bind`: paths longer than 159 bytes were silently ignored by the shim. The limit is now 1023 bytes per path, 50 binds, 16000 bytes in total, and `prx` rejects anything beyond that (and paths containing `:` or `=`) with an error.
++- Shim: `sched_getaffinity` returned success on `EINVAL`/`ESRCH`; real errors are now reported (a seccomp-blocked syscall is still emulated).
++- `wfile` used `printf "$@"` with data from `PRX_DNS`/`resolv.conf`; it now uses `%b`. DNS servers are validated: only IPv4 is accepted, anything else is dropped with a warning.
++- Rootfs with glibc < 2.33 (no `ld.so --argv0`) are detected and started without it (`PRX_NO_ARGV0=1` forces this).
++- `prx login NAME --typo` is now an error instead of running `--typo` as a command.
++- `prx set NAME --hard-mem` alone is now saved (and warns that it needs `-m`).
++- Minor: per-install `tar.err` temp file, `execveat(NULL)` returns `EFAULT`, group file buffer raised to 64 KiB.
++
+ ## Changes from the single-file version
+ 
+ - C sources moved out of the script into `src/` (`prx source` / `prx ldsource` still print them).
+@@ -39,6 +50,9 @@
+ - glibc rootfs only; x86_64 / aarch64 only.
+ - Guest PAM is `pam_permit` and sudo is `NOPASSWD` because there is no real root to authenticate.
+ - Loader patching depends on glibc machine code and may fail on some versions.
++- Bind paths cannot contain `:` or `=` (the shim's `PRX_BIND` format uses them as separators).
++- Only IPv4 DNS servers are supported for the guest.
++- Groups with more than 32 members and `/etc/passwd` files larger than 48 KiB are truncated by the shim's passwd/group emulation.
+ 
+ ## Packages
+ 
+diff -ruN -x .tmp a/prx/man/prx.1 b/prx/man/prx.1
+--- a/prx/man/prx.1	2026-10-23 18:56:51.000000000 +0000
++++ b/prx/man/prx.1	2026-10-23 19:45:37.881999007 +0000
+@@ -1,4 +1,4 @@
+-.TH PRX 1 "" "prx 1.0.0" "User Commands"
++.TH PRX 1 "" "prx 1.0.1" "User Commands"
+ .SH NAME
+ prx \- user-space container and path-translation engine
+ .SH SYNOPSIS
+@@ -30,7 +30,12 @@
+ .RS
+ .TP
+ \fB\-b\fR, \fB\-\-bind\fR \fIPATH\fR | \fIHOST\fR:\fIGUEST\fR
+-Bind a host path into the guest.
++Bind a host path into the guest. Paths must be shorter than 1024 bytes and
++must not contain
++.B :
++or
++.BR = ;
++at most 50 binds can be given. Invalid binds are rejected with an error.
+ .TP
+ \fB\-w\fR, \fB\-\-workdir\fR \fIDIR\fR
+ Initial working directory (default /root).
+@@ -87,7 +92,16 @@
+ Path to a specific qemu-user binary for cross-architecture rootfs.
+ .TP
+ .B PRX_DNS
+-Colon-separated nameservers to use inside the guest.
++IPv4 nameservers to use inside the guest, separated by commas, blanks or
++colons. Other entries (including IPv6 addresses) are ignored with a warning.
++.TP
++.B PRX_NO_ARGV0
++Set to 1 to never pass
++.B \-\-argv0
++to the glibc loader. Normally this is detected automatically, because
++.B \-\-argv0
++exists only in glibc 2.33 and later; with an older rootfs the guest shell sees
++its full path as argv[0].
+ .SH SECURITY NOTES
+ Inside the guest, PAM is configured to always succeed and sudo is configured
+ with NOPASSWD, because there is no real root to authenticate against. Do not
+diff -ruN -x .tmp a/prx/prx b/prx/prx
+--- a/prx/prx	2026-10-23 18:56:28.000000000 +0000
++++ b/prx/prx	2026-10-23 19:43:02.552875775 +0000
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env bash
+ # prx - user-space container and path-translation engine
+ # SPDX-License-Identifier: TODO-choose-a-license
+-PRX_VERSION=1.0.0
++PRX_VERSION=1.0.1
+ set -eu
+ # Data directory: $PRX_HOME if set; else legacy ~/.prx if it already exists
+ # (backward compatible); else the XDG location.
+@@ -33,6 +33,7 @@
+   prx login NAME [options] [-- cmd]  Execute shell or command inside guest rootfs
+         -b, --bind PATH              Bind host path to identical path in guest
+         -b, --bind HOST:GUEST        Bind host path to custom path inside guest
++                                     (paths < 1024 bytes, no ':' or '=' inside, max 50 binds)
+         -w, --workdir DIR            Initial working directory (default: /root)
+         -e, --env KEY=VAL            Pass custom environment variable
+         -c, --cpus N                 Limit CPU cores seen by the guest to N (0 = no limit)
+@@ -55,6 +56,8 @@
+ Environment:
+   PRX_HOME=DIR      Data directory (default: ~/.prx if present, else \$XDG_DATA_HOME/prx)
+   PRX_SRCDIR=DIR    Directory holding prx.c and ldpatch.c
++  PRX_DNS=LIST      IPv4 DNS servers for the guest (separated by ',' or ':')
++  PRX_NO_ARGV0=1    Never pass --argv0 to the loader (auto-detected; glibc < 2.33 lacks it)
+   CC=PROGRAM        C compiler used to build the shim
+ 
+ Cross-arch rootfs is detected automatically and run through qemu-user, in both
+@@ -225,14 +228,81 @@
+ return 0
+ }
+ wfile() {
+-local f="$1"; shift
++local f="$1"
+ mkdir -p "$(dirname "$f")"
+ rm -f "$f"
+-printf "$@" > "$f"
++printf '%b' "$2" > "$f"
++}
++# rpath ROOT GUESTPATH [nofollow]
++# Print the host path of GUESTPATH inside ROOT, resolving symbolic links as if
++# ROOT were "/": absolute links stay inside ROOT and ".." cannot climb out of it.
++# Every write into a rootfs goes through this, so a rootfs symlink such as
++# /var/lib/dbus/machine-id -> /etc/machine-id can never redirect a write to the
++# host. With "nofollow" the last component is not resolved.
++rpath() {
++local root="${1%/}" rest="$2" nf="${3:-}" cur="" comp link n=0
++while :; do
++rest="${rest#"${rest%%[!/]*}"}"
++[ -n "$rest" ] || break
++comp="${rest%%/*}"
++if [ "$comp" = "$rest" ]; then rest=""; else rest="${rest#*/}"; fi
++case "$comp" in
++.) continue ;;
++..) cur="${cur%/*}"; continue ;;
++esac
++if [ -L "$root$cur/$comp" ] && { [ -n "$rest" ] || [ "$nf" != nofollow ]; }; then
++n=$((n+1))
++if [ "$n" -gt 40 ]; then echo "prx: error: too many symbolic links in $2" >&2; return 1; fi
++link="$(readlink "$root$cur/$comp")" || return 1
++case "$link" in
++/*) cur=""; rest="$link${rest:+/$rest}" ;;
++*)  rest="$link${rest:+/$rest}" ;;
++esac
++else
++cur="$cur/$comp"
++fi
++done
++printf '%s\n' "$root$cur"
++}
++rwfile() {
++local h
++h="$(rpath "$1" "$2")" || exit 1
++wfile "$h" "$3"
++}
++valid_ipv4() {
++local re='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$' i
++[[ "$1" =~ $re ]] || return 1
++for i in 1 2 3 4; do [ "$((10#${BASH_REMATCH[i]}))" -le 255 ] || return 1; done
++return 0
++}
++# clean_dns LIST: keep only IPv4 addresses (separators: ':' , ',' ';' or blanks).
++# The shim only speaks IPv4 DNS and stores the list colon-separated.
++clean_dns() {
++local -a toks=() parts=()
++local tok d out="" ok
++read -r -a toks <<<"$(printf '%s' "$1" | tr ',;' '  ')"
++for tok in ${toks[@]+"${toks[@]}"}; do
++case "$tok" in
++*:*)
++IFS=: read -r -a parts <<<"$tok"
++ok=1
++for d in "${parts[@]}"; do valid_ipv4 "$d" || ok=0; done
++if [ "$ok" = 1 ]; then
++for d in "${parts[@]}"; do out="${out:+$out:}$d"; done
++else
++warn "ignoring DNS server '$tok' (IPv6 is not supported)"
++fi ;;
++*)
++if valid_ipv4 "$tok"; then out="${out:+$out:}$tok"
++else warn "ignoring invalid DNS server '$tok'"
++fi ;;
++esac
++done
++echo "${out:-8.8.8.8:1.1.1.1}"
+ }
+ detect_dns() {
+ if [ -n "${PRX_DNS:-}" ]; then
+-echo "$PRX_DNS"
++clean_dns "$PRX_DNS"
+ return 0
+ fi
+ local dns="" d
+@@ -249,7 +319,7 @@
+ esac
+ done < <(grep '^nameserver' /etc/resolv.conf 2>/dev/null || true)
+ fi
+-echo "${dns:-8.8.8.8:1.1.1.1}"
++clean_dns "${dns:-}"
+ }
+ find_loader() {
+ local r="$1" c
+@@ -309,28 +379,32 @@
+ fi
+ mkdir -p "$dest"
+ info "Extracting rootfs to $dest ..."
+-local trc=0
++local trc=0 terr
++terr="$(mktemp "$PRX_HOME/dl/tar.err.XXXXXX")"
+ LC_ALL=C tar -xpf "$file" -C "$dest" --delay-directory-restore --no-same-owner \
+---exclude='./dev/*' --exclude='dev/*' 2>"$PRX_HOME/dl/tar.err" || trc=$?
++--exclude='./dev/*' --exclude='dev/*' 2>"$terr" || trc=$?
+ if [ "$trc" -ne 0 ]; then
+-if grep -qiE 'unexpected eof|unexpected end of file|not in gzip format|does not look like a tar|no space left|not recoverable|child returned|corrupt|invalid magic|invalid tar header|file format not recognized' "$PRX_HOME/dl/tar.err"; then
+-tail -n 5 "$PRX_HOME/dl/tar.err" >&2
++if grep -qiE 'unexpected eof|unexpected end of file|not in gzip format|does not look like a tar|no space left|not recoverable|child returned|corrupt|invalid magic|invalid tar header|file format not recognized' "$terr"; then
++tail -n 5 "$terr" >&2
++rm -f "$terr"
+ chmod -R u+rwX "$dest" 2>/dev/null || true
+ rm -rf "$dest"
+ die "Archive is corrupt or incomplete (tar exit status $trc)"
+ fi
+-warn "Archive extraction reported warnings (see $PRX_HOME/dl/tar.err)"
++warn "Archive extraction reported warnings (see $terr)"
+ fi
+ chmod -R u+rwX "$dest" 2>/dev/null || true
+-if [ "$trc" -ne 0 ] && grep -q 'Cannot hard link to' "$PRX_HOME/dl/tar.err" 2>/dev/null; then
++if [ "$trc" -ne 0 ] && grep -q 'Cannot hard link to' "$terr" 2>/dev/null; then
+ local nfix=0 hl ht tab; tab="$(printf '\t')"
+ while IFS="$tab" read -r hl ht; do
+ [ -n "$hl" ] && [ -n "$ht" ] || continue
+-if [ ! -e "$dest/$hl" ] && [ -f "$dest/$ht" ] && [ ! -L "$dest/$ht" ]; then
+-mkdir -p "$(dirname "$dest/$hl")" 2>/dev/null || true
+-cp -p "$dest/$ht" "$dest/$hl" 2>/dev/null && nfix=$((nfix+1))
++local hh ht2
++hh="$(rpath "$dest" "/$hl" nofollow 2>/dev/null)" && ht2="$(rpath "$dest" "/$ht" 2>/dev/null)" || continue
++if [ ! -e "$hh" ] && [ -f "$ht2" ]; then
++mkdir -p "$(dirname "$hh")" 2>/dev/null || true
++cp -p "$ht2" "$hh" 2>/dev/null && nfix=$((nfix+1))
+ fi
+-done < <(sed -n "s/^tar: \(.*\): Cannot hard link to '\(.*\)': .*/\1$tab\2/p" "$PRX_HOME/dl/tar.err")
++done < <(sed -n "s/^tar: \(.*\): Cannot hard link to '\(.*\)': .*/\1$tab\2/p" "$terr")
+ [ "$nfix" -gt 0 ] && info "Hard links that could not be created were replaced by copies: $nfix"
+ fi
+ if [ ! -e "$dest/etc" ] && [ "$(ls -A "$dest" | wc -l)" = 1 ]; then
+@@ -341,23 +415,28 @@
+ fi
+ fi
+ [ -d "$dest/etc" ] || { rm -rf "$dest"; die "Target archive does not contain a standard Linux filesystem (missing /etc)"; }
+-mkdir -p "$dest"/{tmp,proc,sys,dev,root,home,run,var/tmp,etc/apt/apt.conf.d,usr/sbin,etc/sudoers.d,etc/pam.d}
+-chmod 1777 "$dest/tmp" "$dest/var/tmp"
+-chmod -R u+rwX "$dest"/etc/{sudoers.d,pam.d}
++local g
++for g in /tmp /proc /sys /dev /root /home /run /var/tmp /etc/apt/apt.conf.d /usr/sbin /etc/sudoers.d /etc/pam.d; do
++mkdir -p "$(rpath "$dest" "$g")"
++done
++chmod 1777 "$(rpath "$dest" /tmp)" "$(rpath "$dest" /var/tmp)"
++chmod -R u+rwX "$(rpath "$dest" /etc/sudoers.d)" "$(rpath "$dest" /etc/pam.d)"
+ local cur_dns; cur_dns="$(detect_dns)"
+ local resolv_str="" d
+ for d in $(echo "$cur_dns" | tr ':' ' '); do
+ resolv_str="${resolv_str}nameserver $d\n"
+ done
+-wfile "$dest/etc/resolv.conf" "$resolv_str"
+-[ -s "$dest/etc/hosts" ] || wfile "$dest/etc/hosts" '127.0.0.1 localhost\n::1 localhost\n'
+-wfile "$dest/etc/apt/apt.conf.d/99prx" 'APT::Sandbox::User "root";\nDir::Log::Terminal "";\n'
+-wfile "$dest/usr/sbin/policy-rc.d" '#!/bin/sh\nexit 101\n'; chmod +x "$dest/usr/sbin/policy-rc.d"
+-for l in "$dest/sbin/ldconfig" "$dest/usr/sbin/ldconfig" "$dest/usr/bin/ldconfig" "$dest/bin/ldconfig"; do
++rwfile "$dest" /etc/resolv.conf "$resolv_str"
++[ -s "$(rpath "$dest" /etc/hosts)" ] || rwfile "$dest" /etc/hosts '127.0.0.1 localhost\n::1 localhost\n'
++rwfile "$dest" /etc/apt/apt.conf.d/99prx 'APT::Sandbox::User "root";\nDir::Log::Terminal "";\n'
++rwfile "$dest" /usr/sbin/policy-rc.d '#!/bin/sh\nexit 101\n'; chmod +x "$(rpath "$dest" /usr/sbin/policy-rc.d)"
++for g in /sbin/ldconfig /usr/sbin/ldconfig /usr/bin/ldconfig /bin/ldconfig; do
++l="$(rpath "$dest" "$g" nofollow)"
+ if [ -f "$l" ] && [ ! -L "$l" ] && [ ! -e "$l.REAL" ]; then
+ mv "$l" "$l.REAL"; printf '#!/bin/sh\nexit 0\n' > "$l"; chmod +x "$l"
+ fi
+ done
++[ "$trc" -ne 0 ] || rm -f "$terr"
+ info "Installation complete. Enter container using: prx login $name"
+ }
+ lp_add() {
+@@ -386,7 +465,8 @@
+ }
+ prx_setup_user() {
+ local R="$1" u="$2" uid="$3" gid="$4"
+-local P="$R/etc/passwd" G="$R/etc/group" S="$R/etc/shadow"
++local P G S
++P="$(rpath "$R" /etc/passwd)"; G="$(rpath "$R" /etc/group)"; S="$(rpath "$R" /etc/shadow)"
+ local tmp line n id1 gline="" f
+ chmod u+rw "$P" "$G" 2>/dev/null || true
+ tmp="$P.prx.$$"
+@@ -420,13 +500,16 @@
+ chmod u+w "$S" 2>/dev/null || true
+ grep -q "^$u:" "$S" 2>/dev/null || printf '%s:*:19000:0:99999:7:::\n' "$u" >> "$S" 2>/dev/null || true
+ fi
+-if [ ! -d "$R/home/$u" ]; then
+-mkdir -p "$R/home/$u"
+-if [ -d "$R/etc/skel" ]; then cp -a "$R/etc/skel/." "$R/home/$u/" 2>/dev/null || true; fi
++local H SK fh
++H="$(rpath "$R" "/home/$u")"; SK="$(rpath "$R" /etc/skel)"
++if [ ! -d "$H" ]; then
++mkdir -p "$H"
++if [ -d "$SK" ]; then cp -a "$SK/." "$H/" 2>/dev/null || true; fi
+ fi
+-chmod 755 "$R/home/$u" 2>/dev/null || true
++chmod 755 "$H" 2>/dev/null || true
+ for f in usr/bin/sudo usr/bin/su usr/bin/passwd usr/bin/chsh usr/bin/chfn usr/bin/newgrp usr/bin/gpasswd; do
+-if [ -f "$R/$f" ] && [ ! -L "$R/$f" ]; then chmod u+s "$R/$f" 2>/dev/null || true; fi
++fh="$(rpath "$R" "/$f" nofollow)"
++if [ -f "$fh" ] && [ ! -L "$fh" ]; then chmod u+s "$fh" 2>/dev/null || true; fi
+ done
+ }
+ host_cpus() {
+@@ -499,7 +582,7 @@
+ }
+ save_conf() {
+ local cf="$PRX_HOME/conf/$1.conf"
+-if [ -z "$CFG_CPUS" ] && [ -z "$CFG_MEM_KB" ]; then rm -f "$cf"; return 0; fi
++if [ -z "$CFG_CPUS" ] && [ -z "$CFG_MEM_KB" ] && [ "$CFG_HARD" != 1 ]; then rm -f "$cf"; return 0; fi
+ mkdir -p "$PRX_HOME/conf"
+ {
+ [ -z "$CFG_CPUS" ] || echo "cpus=$CFG_CPUS"
+@@ -513,6 +596,8 @@
+ if [ -n "$CFG_MEM_KB" ]; then
+ m="$((CFG_MEM_KB/1024)) MiB"
+ if [ "$CFG_HARD" = 1 ]; then m="$m (hard cap)"; fi
++elif [ "$CFG_HARD" = 1 ]; then
++m="unlimited (hard cap enabled, applies once a limit is set)"
+ fi
+ echo "$1: cpus=$c memory=$m"
+ }
+@@ -539,12 +624,23 @@
+ esac
+ done
+ [ "$changed" = 0 ] || save_conf "$name"
++if [ "$CFG_HARD" = 1 ] && [ -z "$CFG_MEM_KB" ]; then warn "--hard-mem has no effect until a memory limit is set (-m)"; fi
+ show_conf "$name"
+ }
++# The shim keeps at most 64 binds (14 are built in), each path < 1024 bytes,
++# and reads them from one PRX_BIND variable of < 16384 bytes. Refuse anything
++# larger instead of letting the shim drop it silently.
++chk_bind() {
++if [ "${#1}" -ge 1024 ] || [ "${#2}" -ge 1024 ]; then die "Bind path too long (limit 1023 bytes): ${1:0:60}..."; fi
++}
++chk_binds_total() {
++if [ "$nbinds" -gt 50 ]; then die "Too many --bind options (limit 50)"; fi
++if [ "${#binds}" -ge 16000 ]; then die "--bind list too long (limit 16000 bytes in total)"; fi
++}
+ cmd_login() {
+ [ $# -ge 1 ] || { usage; exit 1; }
+ local name="$1"; shift
+-local R binds="" wd=/root wdset=0 fake=1 bh bg trace=0
++local R binds="" nbinds=0 wd=/root wdset=0 fake=1 bh bg trace=0
+ local cpus="" mem_kb="" hard=0
+ local -a extra_envs=() pin=()
+ chk "$name"
+@@ -552,58 +648,67 @@
+ [ -d "$R" ] || die "Rootfs '$name' does not exist. Use: prx install $name ARCHIVE"
+ load_conf "$name"
+ cpus="$CFG_CPUS"; mem_kb="$CFG_MEM_KB"; hard="$CFG_HARD"
+-mkdir -p "$R/etc/pam.d" "$R/etc/sudoers.d"
++mkdir -p "$(rpath "$R" /etc/pam.d)" "$(rpath "$R" /etc/sudoers.d)"
+ for pam_svc in sudo su chfn chsh login other sshd; do
+-printf 'auth sufficient pam_permit.so\naccount sufficient pam_permit.so\nsession sufficient pam_permit.so\npassword sufficient pam_permit.so\n' > "$R/etc/pam.d/$pam_svc"
++rwfile "$R" "/etc/pam.d/$pam_svc" 'auth sufficient pam_permit.so\naccount sufficient pam_permit.so\nsession sufficient pam_permit.so\npassword sufficient pam_permit.so\n'
+ done
+-wfile "$R/etc/sudoers.d/99prx" 'ALL ALL=(ALL) NOPASSWD: ALL\n'
+-chmod 0440 "$R/etc/sudoers.d/99prx" 2>/dev/null || true
+-wfile "$R/etc/sudoers.d/00_path" 'Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\n'
+-chmod 0440 "$R/etc/sudoers.d/00_path" 2>/dev/null || true
+-wfile "$R/etc/sudoers.d/01_locale" 'Defaults env_keep += "LOCPATH GCONV_PATH LANG LANGUAGE"\n'
+-chmod 0440 "$R/etc/sudoers.d/01_locale" 2>/dev/null || true
+-if [ ! -f "$R/etc/passwd" ]; then
+-wfile "$R/etc/passwd" 'root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\nbin:x:2:2:bin:/bin:/usr/sbin/nologin\nsys:x:3:3:sys:/dev:/usr/sbin/nologin\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n'
+-fi
+-if [ ! -f "$R/etc/group" ]; then
+-wfile "$R/etc/group" 'root:x:0:\ndaemon:x:1:\nbin:x:2:\nsys:x:3:\nadm:x:4:\ntty:x:5:\ndisk:x:6:\nsudo:x:27:\naudio:x:29:\nvideo:x:44:\nusers:x:100:\nnogroup:x:65534:\n'
+-fi
+-if [ -f "$R/etc/shadow" ]; then
+-sed -i 's/^root:[^:]*:/root::/' "$R/etc/shadow" 2>/dev/null || true
+-fi
+-mkdir -p "$R/dev/shm" "$R/dev/pts" "$R/tmp" "$R/var/tmp" \
+-"$R/var/log/journal" "$R/var/spool/cron/crontabs" \
+-"$R/run/systemd/netif" "$R/run/dbus" "$R/var/lib/dbus"
+-chmod 1777 "$R/dev/shm" "$R/tmp" "$R/var/tmp" 2>/dev/null || true
+-touch "$R/var/log/wtmp" "$R/var/log/btmp" "$R/var/log/lastlog" 2>/dev/null || true
+-if [ ! -s "$R/etc/machine-id" ] || [ "$(wc -c < "$R/etc/machine-id" 2>/dev/null)" -lt 32 ]; then
+-printf '%08x%08x%08x%08x\n' "$RANDOM$RANDOM" "$RANDOM$RANDOM" "$RANDOM$RANDOM" "$RANDOM$RANDOM" | head -c 32 > "$R/etc/machine-id"
+-printf '\n' >> "$R/etc/machine-id"
+-fi
+-cp -f "$R/etc/machine-id" "$R/var/lib/dbus/machine-id" 2>/dev/null || true
+-rm -f "$R/dev/fd" "$R/dev/stdin" "$R/dev/stdout" "$R/dev/stderr" "$R/dev/ptmx" 2>/dev/null || true
+-ln -sf /proc/self/fd   "$R/dev/fd"     2>/dev/null || true
+-ln -sf /proc/self/fd/0 "$R/dev/stdin"  2>/dev/null || true
+-ln -sf /proc/self/fd/1 "$R/dev/stdout" 2>/dev/null || true
+-ln -sf /proc/self/fd/2 "$R/dev/stderr" 2>/dev/null || true
+-ln -sf /dev/pts/ptmx   "$R/dev/ptmx"   2>/dev/null || true
++rwfile "$R" /etc/sudoers.d/99prx 'ALL ALL=(ALL) NOPASSWD: ALL\n'
++chmod 0440 "$(rpath "$R" /etc/sudoers.d/99prx)" 2>/dev/null || true
++rwfile "$R" /etc/sudoers.d/00_path 'Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\n'
++chmod 0440 "$(rpath "$R" /etc/sudoers.d/00_path)" 2>/dev/null || true
++rwfile "$R" /etc/sudoers.d/01_locale 'Defaults env_keep += "LOCPATH GCONV_PATH LANG LANGUAGE"\n'
++chmod 0440 "$(rpath "$R" /etc/sudoers.d/01_locale)" 2>/dev/null || true
++if [ ! -f "$(rpath "$R" /etc/passwd)" ]; then
++rwfile "$R" /etc/passwd 'root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\nbin:x:2:2:bin:/bin:/usr/sbin/nologin\nsys:x:3:3:sys:/dev:/usr/sbin/nologin\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n'
++fi
++if [ ! -f "$(rpath "$R" /etc/group)" ]; then
++rwfile "$R" /etc/group 'root:x:0:\ndaemon:x:1:\nbin:x:2:\nsys:x:3:\nadm:x:4:\ntty:x:5:\ndisk:x:6:\nsudo:x:27:\naudio:x:29:\nvideo:x:44:\nusers:x:100:\nnogroup:x:65534:\n'
++fi
++local shadow_h gd MID DMID DEVD
++shadow_h="$(rpath "$R" /etc/shadow)"
++if [ -f "$shadow_h" ]; then
++sed -i 's/^root:[^:]*:/root::/' "$shadow_h" 2>/dev/null || true
++fi
++for gd in /dev/shm /dev/pts /tmp /var/tmp /var/log/journal /var/spool/cron/crontabs /run/systemd/netif /run/dbus /var/lib/dbus; do
++mkdir -p "$(rpath "$R" "$gd")"
++done
++chmod 1777 "$(rpath "$R" /dev/shm)" "$(rpath "$R" /tmp)" "$(rpath "$R" /var/tmp)" 2>/dev/null || true
++for gd in /var/log/wtmp /var/log/btmp /var/log/lastlog; do
++touch "$(rpath "$R" "$gd")" 2>/dev/null || true
++done
++MID="$(rpath "$R" /etc/machine-id)"; DMID="$(rpath "$R" /var/lib/dbus/machine-id)"
++if [ ! -s "$MID" ] || [ "$(wc -c < "$MID" 2>/dev/null)" -lt 32 ]; then
++printf '%08x%08x%08x%08x\n' "$RANDOM$RANDOM" "$RANDOM$RANDOM" "$RANDOM$RANDOM" "$RANDOM$RANDOM" | head -c 32 > "$MID"
++printf '\n' >> "$MID"
++fi
++if [ "$MID" != "$DMID" ]; then cp -f "$MID" "$DMID" 2>/dev/null || true; fi
++DEVD="$(rpath "$R" /dev)"
++rm -f "$DEVD/fd" "$DEVD/stdin" "$DEVD/stdout" "$DEVD/stderr" "$DEVD/ptmx" 2>/dev/null || true
++ln -sf /proc/self/fd   "$DEVD/fd"     2>/dev/null || true
++ln -sf /proc/self/fd/0 "$DEVD/stdin"  2>/dev/null || true
++ln -sf /proc/self/fd/1 "$DEVD/stdout" 2>/dev/null || true
++ln -sf /proc/self/fd/2 "$DEVD/stderr" 2>/dev/null || true
++ln -sf /dev/pts/ptmx   "$DEVD/ptmx"   2>/dev/null || true
+ while [ $# -gt 0 ]; do
+ case "$1" in
+ -b|--bind)
+ [ $# -ge 2 ] || die "-b/--bind requires a path argument"
+ case "$2" in
++*:*:*) die "Bind paths must not contain ':' (got '$2'); use HOST:GUEST with a single ':'" ;;
+ *:*) bh="${2%%:*}"; bg="${2#*:}"
+ [ -e "$bh" ] || die "Host bind source does not exist: $bh"
+ case "$bh" in /*) ;; *) bh="$(readlink -f "$bh")" ;; esac
+ case "$bg" in /*) ;; *) die "Guest bind path must be absolute: $bg" ;; esac
+ case "$bh$bg" in *=*) die "Bind paths must not contain '='" ;; esac
+-mkdir -p "$R$bg" 2>/dev/null || true
+-binds="${binds:+$binds:}$bg=$bh" ;;
++chk_bind "$bg" "$bh"
++mkdir -p "$(rpath "$R" "$bg")" 2>/dev/null || true
++binds="${binds:+$binds:}$bg=$bh"; nbinds=$((nbinds+1)); chk_binds_total ;;
+ *)   [ -e "$2" ] || die "Host bind path does not exist: $2"
+ bh="$2"; case "$bh" in /*) ;; *) bh="$(readlink -f "$bh")" ;; esac
+ case "$bh" in *=*) die "Bind paths must not contain '='" ;; esac
+-mkdir -p "$R$bh" 2>/dev/null || true
+-binds="${binds:+$binds:}$bh" ;;
++chk_bind "$bh" "$bh"
++mkdir -p "$(rpath "$R" "$bh")" 2>/dev/null || true
++binds="${binds:+$binds:}$bh"; nbinds=$((nbinds+1)); chk_binds_total ;;
+ esac
+ shift 2 ;;
+ -w|--workdir) [ $# -ge 2 ] || die "-w requires a directory"; case "$2" in /*) wd="$2"; wdset=1 ;; *) die "-w requires an absolute guest path: $2" ;; esac; shift 2 ;;
+@@ -618,6 +723,7 @@
+ shift 2 ;;
+ --hard-mem)   hard=1; shift ;;
+ --) shift; break ;;
++-*) die "Unknown option for 'login': $1 (put '--' before the command if it starts with '-')" ;;
+ *) break ;;
+ esac
+ done
+@@ -672,6 +778,12 @@
+ cmd_build
+ fi
+ local LD; LD="$(find_loader "$R")" || die "Glibc dynamic loader not found. Container must be glibc-based."
++# ld.so --argv0 exists only in glibc >= 2.33; older rootfs get the full path as argv[0].
++local NOARGV0=0
++if [ "${PRX_NO_ARGV0:-}" = 1 ]; then NOARGV0=1
++elif ! { ${QEMU:+"$QEMU"} "$LD" --help 2>&1 || true; } | grep -q -- '--argv0'; then NOARGV0=1
++fi
++if [ "$NOARGV0" = 1 ] && [ "$trace" = 1 ]; then info "loader has no --argv0 (glibc < 2.33): argv[0] will be the full path"; fi
+ local PL=""
+ if [ "$ARCH" = aarch64 ] && [ -z "$QEMU" ]; then
+ [ -x "$PRX_HOME/lib/ldpatch" ] || cmd_build
+@@ -780,7 +892,8 @@
+ if [ -n "$mem_kb" ] && [ "$hard" = 1 ]; then
+ ulimit -v "$mem_kb" 2>/dev/null || warn "Could not apply hard memory cap (ulimit -v)"
+ fi
+-local -a ldenv=() runner=()
++local -a ldenv=() runner=() argv0opt=()
++[ "$NOARGV0" = 1 ] || argv0opt=(--argv0 "$(basename "$gshell")")
+ if [ -n "$QEMU" ]; then
+ local qv
+ ldenv=(QEMU_SET_ENV="LD_PRELOAD=$SHIM,LD_LIBRARY_PATH=$LP" PRX_QEMU="$QEMU")
+@@ -799,13 +912,13 @@
+ PRX_ROOTFS="$R" PRX_SHIM="$SHIM" PRX_LIBPATH="$LP" PRX_BIND="$binds" \
+ PRX_SESSION="$tok" PRX_SELF_EXE="$gshell" \
+ PRX_DNS="$cur_dns" PRX_FAKEROOT="$fake" PRX_VUSER="$vuser" \
+-PRX_TRACE="$trace" PRX_LOADER="$PL" \
++PRX_TRACE="$trace" PRX_LOADER="$PL" PRX_NO_ARGV0="$NOARGV0" \
+ PRX_CPUS="${cpus:-0}" PRX_MEM_KB="${mem_kb:-0}" \
+ GLIBC_TUNABLES="${GLIBC_TUNABLES:-glibc.pthread.rseq=0}" \
+ ${ldenv[@]+"${ldenv[@]}"} \
+ ${term_envs[@]+"${term_envs[@]}"} \
+ ${extra_envs[@]+"${extra_envs[@]}"} \
+-${runner[@]+"${runner[@]}"} "$LD" --library-path "$LP" --argv0 "$(basename "$gshell")" "${prog[@]}" || rc=$?
++${runner[@]+"${runner[@]}"} "$LD" --library-path "$LP" ${argv0opt[@]+"${argv0opt[@]}"} "${prog[@]}" || rc=$?
+ trap - INT
+ kill "$watcher" 2>/dev/null || true
+ prx_reap "$tok"
+diff -ruN -x .tmp a/prx/src/prx.c b/prx/src/prx.c
+--- a/prx/src/prx.c	2026-10-23 18:55:39.000000000 +0000
++++ b/prx/src/prx.c	2026-10-23 19:43:41.842673380 +0000
+@@ -29,6 +29,7 @@
+ #define ENOENT 2
+ #define ENOEXEC 8
+ #define EACCES 13
++#define EFAULT 14
+ #define EEXIST 17
+ #define ENOTDIR 20
+ #define EINVAL 22
+@@ -247,7 +248,9 @@
+ static char g_libpath[LPM];
+ static char g_loader[PM];
+ static char g_qemu[PM];
+-static char g_bindenv[PM];
++#define BENV 16384
++static char g_bindenv[BENV];
++static int g_noargv0;
+ static char g_dns[128] = "8.8.8.8:1.1.1.1";
+ static char g_self_exe[PM];
+ static int g_fake;
+@@ -271,9 +274,10 @@
+ static void cred_init(void);
+ static int cr_collect(const char*user, u32 gid, u32*out, int max);
+ #define MAXB 64
+-static char g_bind[MAXB][160];
++#define BPM 1024
++static char g_bind[MAXB][BPM];
+ static size_t g_bindlen[MAXB];
+-static char g_bhost[MAXB][160];
++static char g_bhost[MAXB][BPM];
+ static size_t g_bhlen[MAXB];
+ static int g_bid[MAXB];
+ static int g_nb;
+@@ -339,37 +343,39 @@
+ }
+ EXP int sched_getaffinity(int pid, size_t cpusetsize, void*mask) {
+     prx_early();
+-    if (mask && cpusetsize>0 && g_ncpu>0) {
+-        u8*m = (u8*) mask;
+-        long r = sc(N_sched_getaffinity, pid, (long) cpusetsize, (long) mask, 0, 0, 0);
+-        size_t got = (r>0 && (size_t) r <= cpusetsize) ? (size_t) r : 0;
+-        int left = g_ncpu;
+-        if (got) {
+-            if (got<cpusetsize) memset(m+got, 0, cpusetsize-got);
+-            for (size_t b = 0; b<cpusetsize*8; b++) {
+-                if (m[b/8]&(1u<<(b%8))) {
+-                    if (left>0) left--;
+-                    else m[b/8] &= (u8)~(1u<<(b%8));
+-                }
+-            }
+-        }
+-        if (!got || left == g_ncpu) {
+-            memset(mask, 0, cpusetsize);
++    long r = sc(N_sched_getaffinity, pid, (long) cpusetsize, (long) mask, 0, 0, 0);
++    u8*m = (u8*) mask;
++    if (r < 0) {
++        /* Genuine errors (EINVAL: buffer too small, ESRCH: no such pid,
++           EFAULT, ...) must reach the caller. Only a syscall that the host's
++           seccomp policy blocks (ENOSYS, or EPERM/EACCES for ourselves) is
++           papered over with a synthetic mask so nproc & co. keep working. */
++        int blocked = r == -ENOSYS || ((r == -EPERM || r == -EACCES) && pid == 0);
++        if (!blocked || !mask || cpusetsize == 0) return (int) ret(r);
++        if (g_ncpu > 0) {
++            memset(m, 0, cpusetsize);
+             for (int i = 0; i<g_ncpu && (size_t)(i/8)<cpusetsize; i++) m[i/8] |= (u8)(1u<<(i%8));
++        } else {
++            memset(m, 0xff, cpusetsize);
+         }
+         return 0;
+     }
+-    if (mask && cpusetsize>0) {
+-        long rr = sc(N_sched_getaffinity, pid, (long) cpusetsize, (long) mask, 0, 0, 0);
+-        if (rr>0 && (size_t) rr <= cpusetsize) {
+-            if ((size_t) rr<cpusetsize) memset((u8*) mask+rr, 0, cpusetsize-(size_t) rr);
+-            return 0;
++    size_t got = (size_t) r < cpusetsize ? (size_t) r : cpusetsize;
++    if (got<cpusetsize) memset(m+got, 0, cpusetsize-got);
++    if (g_ncpu>0) {
++        int left = g_ncpu;
++        for (size_t b = 0; b<got*8; b++) {
++            if (m[b/8]&(1u<<(b%8))) {
++                if (left>0) left--;
++                else m[b/8] &= (u8)~(1u<<(b%8));
++            }
++        }
++        if (left == g_ncpu) {
++            memset(m, 0, cpusetsize);
++            for (int i = 0; i<g_ncpu && (size_t)(i/8)<cpusetsize; i++) m[i/8] |= (u8)(1u<<(i%8));
+         }
+-        memset(mask, 0xff, cpusetsize);
+-        return 0;
+     }
+-    *__errno_location() = EINVAL;
+-    return-1;
++    return 0;
+ }
+ static void sys_handler(int sig, void*info, void*uc) {
+     (void) sig;
+@@ -410,9 +416,10 @@
+         else if (envmatch(s, "PRX_LOADER")) copyval(g_loader, PM, s+11);
+         else if (envmatch(s, "PRX_QEMU")) copyval(g_qemu, PM, s+9);
+         else if (envmatch(s, "PRX_LIBPATH")) copyval(g_libpath, LPM, s+12);
+-        else if (envmatch(s, "PRX_BIND")) copyval(g_bindenv, PM, s+9);
++        else if (envmatch(s, "PRX_BIND")) copyval(g_bindenv, sizeof g_bindenv, s+9);
+         else if (envmatch(s, "PRX_DNS")) copyval(g_dns, sizeof g_dns, s+8);
+         else if (envmatch(s, "PRX_SELF_EXE")) copyval(g_self_exe, PM, s+13);
++        else if (envmatch(s, "PRX_NO_ARGV0")) g_noargv0 = (s[13] == '1');
+         else if (envmatch(s, "PRX_TRACE")) g_trace = (s[10] == '1');
+         else if (envmatch(s, "PRX_FAKEROOT")) g_fake = (s[13] == '1');
+         else if (envmatch(s, "PRX_CPUS")) {
+@@ -2966,7 +2973,7 @@
+     g_nvg = ng;
+     return 1;
+ }
+-static char g_gdata[16384];
++static char g_gdata[65536];
+ static int cr_collect(const char*user, u32 gid, u32*out, int max) {
+     int n = 0;
+     if (max > 0) out[n++] = gid;
+@@ -3128,7 +3135,7 @@
+     return d;
+ }
+ static int is_ours(const char*e) {
+-    return envmatch(e, "LD_PRELOAD") || envmatch(e, "PRX_ROOTFS") || envmatch(e, "PRX_SHIM") || envmatch(e, "PRX_LIBPATH") || envmatch(e, "PRX_BIND") || envmatch(e, "PRX_FAKEROOT") || envmatch(e, "PRX_DNS") || envmatch(e, "PRX_LOADER") || envmatch(e, "PRX_QEMU") || envmatch(e, "QEMU_SET_ENV") || envmatch(e, "PRX_SELF_EXE") || envmatch(e, "PRX_VUSER") || envmatch(e, "PRX_CRED") || envmatch(e, "PRX_CPUS") || envmatch(e, "PRX_MEM_KB");
++    return envmatch(e, "LD_PRELOAD") || envmatch(e, "PRX_ROOTFS") || envmatch(e, "PRX_SHIM") || envmatch(e, "PRX_LIBPATH") || envmatch(e, "PRX_BIND") || envmatch(e, "PRX_FAKEROOT") || envmatch(e, "PRX_DNS") || envmatch(e, "PRX_LOADER") || envmatch(e, "PRX_QEMU") || envmatch(e, "QEMU_SET_ENV") || envmatch(e, "PRX_SELF_EXE") || envmatch(e, "PRX_VUSER") || envmatch(e, "PRX_CRED") || envmatch(e, "PRX_CPUS") || envmatch(e, "PRX_MEM_KB") || envmatch(e, "PRX_NO_ARGV0");
+ }
+ static int elf_runpath(int fd, const u8*ph, unsigned phes, unsigned phn, char*out, size_t osz) {
+     u64 dyn_off = 0, dyn_sz = 0;
+@@ -3247,7 +3254,7 @@
+ static char**mkenv(struct ar*a, char*const envp[], int native, const char*cur_exe) {
+     int n = 0;
+     while (envp && envp[n]) n++;
+-    char**ne = am(a, (size_t)(n+16)*sizeof (char*));
++    char**ne = am(a, (size_t)(n+24)*sizeof (char*));
+     if (!ne) return NULL;
+     int k = 0;
+     const char*user_preload = NULL;
+@@ -3288,6 +3295,7 @@
+         }
+         if (cur_exe && cur_exe[0]) ne[k++] = acat(a, "PRX_SELF_EXE=", cur_exe);
+         if (g_loader[0]) ne[k++] = acat(a, "PRX_LOADER=", g_loader);
++        if (g_noargv0) ne[k++] = acat(a, "PRX_NO_ARGV0=", "1");
+         if (g_qemu[0]) ne[k++] = acat(a, "PRX_QEMU=", g_qemu);
+         int has = 0;
+         for (int i = 0; i<n; i++) if (envmatch(envp[i], "GLIBC_TUNABLES")) has = 1;
+@@ -3476,8 +3484,10 @@
+         nv[k++] = (char*) lh;
+         nv[k++] = "--library-path";
+         nv[k++] = (char*) build_libpath(a, rpbuf);
+-        nv[k++] = "--argv0";
+-        nv[k++] = av[0];
++        if (!g_noargv0) {
++            nv[k++] = "--argv0";
++            nv[k++] = av[0];
++        }
+         nv[k++] = (char*) h;
+         for (int j = 1; j<argc; j++) nv[k++] = av[j];
+         nv[k] = NULL;
+@@ -3521,6 +3531,7 @@
+     char abs_path[PM];
+     char fd_path[32];
+     int empty = (flags&0x1000) && (!pathname || !*pathname);
++    if (!empty && !pathname) return (int) fail(EFAULT);
+     if (!empty && pathname && pathname[0] == '/') {
+         return do_execve(pathname, argv, envp);
+     }
+diff -ruN -x .tmp a/prx/tests/smoke.sh b/prx/tests/smoke.sh
+--- a/prx/tests/smoke.sh	2026-10-23 18:57:03.000000000 +0000
++++ b/prx/tests/smoke.sh	2026-10-23 19:46:11.672520657 +0000
+@@ -52,6 +52,70 @@
+ "$PRX" set t1 -c 1 -m 512M | grep -q 'memory=512 MiB' && ok "set -m 512M"
+ "$PRX" set t1 -m 1X 2>/dev/null && fail "bad memory size accepted"
+ ok "rejects bad memory size"
++# ---- 1.0.1 regression tests -------------------------------------------
++# unknown option must not be run as a command
++if "$PRX" login t1 --bogus 2>"$T/err"; then fail "unknown login option accepted"; fi
++grep -q "Unknown option for 'login'" "$T/err" && ok "login rejects unknown option" || fail "login rejects unknown option"
++# --hard-mem alone is persisted
++"$PRX" set t1 --reset >/dev/null
++"$PRX" set t1 --hard-mem 2>/dev/null | grep -q 'hard cap enabled' && ok "set --hard-mem alone is kept" || fail "set --hard-mem alone is kept"
++grep -qx 'hard=1' "$HOME/.local/share/prx/conf/t1.conf" && ok "hard=1 stored in conf" || fail "hard=1 stored in conf"
++"$PRX" set t1 --reset >/dev/null
++
++# bind validation: too long / ambiguous ':'
++long="/$(printf 'x%.0s' $(seq 1 1100))"
++if "$PRX" login t1 -b "$T:$long" 2>"$T/err"; then fail "overlong bind accepted"; fi
++grep -q 'too long' "$T/err" && ok "overlong --bind is rejected, not silently dropped" || fail "overlong --bind is rejected, not silently dropped"
++if "$PRX" login t1 -b "$T:/a:/b" 2>"$T/err"; then fail "ambiguous bind accepted"; fi
++grep -q "must not contain ':'" "$T/err" && ok "ambiguous ':' in --bind is rejected" || fail "ambiguous ':' in --bind is rejected"
++# DNS list: only valid IPv4 survives, '%' is never used as a printf format
++PRX_DNS='1.2.3.4%s,5.6.7.8,2001:db8::1,999.1.1.1' "$PRX" install t4 "$T/fs.tar.gz" --sha256 "$good" >/dev/null 2>"$T/err"
++rc4="$HOME/.local/share/prx/rootfs/t4/etc/resolv.conf"
++[ "$(cat "$rc4")" = "nameserver 5.6.7.8" ] && ok "PRX_DNS keeps only valid IPv4" || fail "PRX_DNS keeps only valid IPv4"
++grep -q 'IPv6 is not supported' "$T/err" && ok "IPv6 DNS entry is reported" || fail "IPv6 DNS entry is reported"
++"$PRX" remove t4 >/dev/null 2>&1
++
++# rootfs symlinks must not redirect writes to the host
++mkdir -p "$T/fs2/etc/pam.d" "$T/fs2/var/lib/dbus" "$T/decoy"
++echo keep > "$T/decoy/machine-id"; echo keep > "$T/decoy/pam-sudo"
++ln -s "$T/decoy/machine-id" "$T/fs2/var/lib/dbus/machine-id"
++ln -s "$T/decoy/pam-sudo"   "$T/fs2/etc/pam.d/sudo"
++tar -C "$T/fs2" -czf "$T/fs2.tar.gz" .
++"$PRX" install t3 "$T/fs2.tar.gz" >/dev/null 2>&1 || fail "install t3"
++"$PRX" login t3 >/dev/null 2>&1 || true      # stops at 'loader not found', after the writes
++[ "$(cat "$T/decoy/machine-id")" = keep ] && [ "$(cat "$T/decoy/pam-sudo")" = keep ] && ok "rootfs symlinks cannot redirect writes to the host" || fail "rootfs symlinks cannot redirect writes to the host"
++grep -q pam_permit "$HOME/.local/share/prx/rootfs/t3$T/decoy/pam-sudo" && ok "write landed inside the rootfs instead" || fail "write landed inside the rootfs instead"
++"$PRX" remove t3 >/dev/null 2>&1
++
++# shim: sched_getaffinity errors and long bind paths
++SHIMSO="$HOME/.local/share/prx/lib/libprx.so"
++CCB="$(command -v "${CC:-cc}" || command -v cc || command -v gcc || command -v clang || true)"
++if [ -n "$CCB" ] && [ -f "$SHIMSO" ]; then
++cat > "$T/aff.c" <<'CEOF'
++#define _GNU_SOURCE
++#include <sched.h>
++#include <stdio.h>
++#include <errno.h>
++int main(void) {
++    cpu_set_t s; unsigned char b[1];
++    int r = sched_getaffinity(999999, sizeof s, &s);
++    printf("pid invalid: r=%d errno=%d\n", r, errno);
++    errno = 0;
++    r = sched_getaffinity(0, 1, (cpu_set_t *) b);
++    printf("buf 1 byte: r=%d errno=%d\n", r, errno);
++    return 0;
++}
++CEOF
++"$CCB" -o "$T/aff" "$T/aff.c"
++out="$(env -i PRX_ROOTFS="$T/fs" PRX_SHIM="$SHIMSO" LD_PRELOAD="$SHIMSO" "$T/aff")"
++echo "$out" | grep -q 'pid invalid: r=-1 errno=3' && ok "sched_getaffinity reports ESRCH" || fail "sched_getaffinity reports ESRCH"
++echo "$out" | grep -q 'buf 1 byte: r=-1 errno=22' && ok "sched_getaffinity reports EINVAL" || fail "sched_getaffinity reports EINVAL"
++bd="$T/lb"; while [ "${#bd}" -lt 400 ]; do bd="$bd/$(printf 'b%.0s' $(seq 1 60))"; done
++mkdir -p "$bd"; echo bound > "$bd/f"
++[ "$(env -i PRX_ROOTFS="$T/fs" PRX_SHIM="$SHIMSO" LD_PRELOAD="$SHIMSO" PRX_BIND="$bd" "$(command -v cat)" "$bd/f" 2>/dev/null)" = bound ] && ok "bind path > 159 bytes works" || fail "bind path > 159 bytes works"
++fi
++# ------------------------------------------------------------------------
++
+ "$PRX" remove t1 >/dev/null 2>&1 && "$PRX" remove t2 >/dev/null 2>&1
+ [ "$("$PRX" list)" = "(no rootfs installed yet)" ] || [ -z "$("$PRX" list | grep -E '^t[12]$')" ] && ok "remove"
+ 
