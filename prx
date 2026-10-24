@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # prx - user-space container and path-translation engine
-# SPDX-License-Identifier: Apache-2.0 license
+# SPDX-License-Identifier: Apache-2.0
 PRX_VERSION=1.0.1
 set -eu
 # Data directory: $PRX_HOME if set; else legacy ~/.prx if it already exists
