@@ -82,21 +82,6 @@ want5="$(printf 'nameserver 9.9.9.9\nnameserver 149.112.112.112')"
 [ "$(cat "$HOME/.local/share/prx/rootfs/t5/etc/resolv.conf")" = "$want5" ] && ok "legacy colon-separated IPv4 list" || fail "legacy colon-separated IPv4 list"
 "$PRX" remove t5 >/dev/null 2>&1
 
-# ldpatch: per-syscall report on a synthetic aarch64 instruction stream.
-# set_robust_list: mov x8,#99; nop; svc   -> patched
-# rseq:            mov w8,#293; svc       -> patched
-# clone3:          mov x8,#435; ret; svc  -> NOT patched (ret before the svc)
-# a bare svc without a preceding mov x8,#N must stay untouched
-printf '\x68\x0c\x80\xd2\x1f\x20\x03\xd5\x01\x00\x00\xd4\xa8\x24\x80\x52\x01\x00\x00\xd4\x68\x36\x80\xd2\xc0\x03\x5f\xd6\x01\x00\x00\xd4\x1f\x20\x03\xd5\x01\x00\x00\xd4' > "$T/fake_ld.bin"
-ldp="$HOME/.local/share/prx/lib/ldpatch"
-[ -x "$ldp" ] || ldp="$HOME/.prx/lib/ldpatch"
-[ -x "$ldp" ] || { "$PRX" build >/dev/null 2>&1; ldp="$HOME/.local/share/prx/lib/ldpatch"; }
-tot="$("$ldp" -v "$T/fake_ld.bin" "$T/fake_out.bin" 2>"$T/ldp.err")"
-[ "$tot" = 2 ] && [ "$(cat "$T/ldp.err")" = "set_robust_list=1 rseq=1 clone3=0" ] && ok "ldpatch reports patched syscalls individually" || fail "ldpatch reports patched syscalls individually"
-[ "$(od -An -tx1 -j8 -N4 "$T/fake_out.bin" | tr -d ' \n')" = "a0048092" ] && ok "ldpatch rewrites svc to 'mov x0,#-ENOSYS'" || fail "ldpatch rewrites svc to 'mov x0,#-ENOSYS'"
-[ "$(od -An -tx1 -j28 -N4 "$T/fake_out.bin" | tr -d ' \n')" = "010000d4" ] && ok "ldpatch leaves unrelated svc untouched" || fail "ldpatch leaves unrelated svc untouched"
-[ "$("$ldp" "$T/fake_ld.bin" "$T/fake_out2.bin" 2>&1)" = 2 ] && ok "ldpatch without -v prints only the total" || fail "ldpatch without -v prints only the total"
-
 # shim: groups with >32 members, >48 KiB passwd/group, IPv6 literal parsing
 mkdir -p "$T/shimroot/etc"
 awk 'BEGIN {

@@ -24,8 +24,6 @@ The shim is compiled per user on the first `prx login` (needs `gcc` or `clang`).
 - DNS: the shim now queries IPv6 nameservers as well. `PRX_DNS` and the guest `resolv.conf` may mix IPv4 and IPv6 (the list is comma-separated; a legacy colon-separated IPv4 list still works). Scoped addresses (`fe80::1%eth0`) are not supported and are dropped with a warning. Host-detected servers are ordered IPv4 first.
 - passwd/group emulation: `/etc/passwd`, `/etc/group` and `/etc/hosts` are read completely (no 48 KiB / 16 KiB cut-off), groups may have any number of members, and the buffers behind `getpwnam`/`getgrnam`-style calls grow on demand. The virtual supplementary-group limit is raised from 64 to 256.
 
-- Loader patching: `ldpatch -v` reports how many sites it patched per syscall (`set_robust_list`, `rseq`, `clone3`), and the "pattern not found" warning now includes that breakdown. After the loader/libc is (re)patched, `prx login` runs a trivial program (`true`) through it once and warns if it dies with SIGSYS, i.e. the patch did not cover a syscall this device blocks. `libc.so.6` is no longer re-scanned on every login when nothing could be patched.
-
 ## Changes in 1.0.1
 
 - Writes into a rootfs (`login`, `install`) no longer follow symlinks out of it: an absolute link such as `/var/lib/dbus/machine-id -> /etc/machine-id` used to make `cp`/`>` hit the *host* file (dangerous when run as root). All such writes now go through `rpath`, which resolves links as if the rootfs were `/`.
@@ -56,7 +54,7 @@ The shim is compiled per user on the first `prx login` (needs `gcc` or `clang`).
 - Not a security boundary (LD_PRELOAD + loader patching; static/raw-syscall binaries can bypass it). This cannot be fixed within an LD_PRELOAD design; it would need a ptrace / seccomp-unotify supervisor or user namespaces.
 - glibc rootfs only; x86_64 / aarch64 only.
 - Guest PAM is `pam_permit` and sudo is `NOPASSWD` because there is no real root to authenticate.
-- Loader patching depends on glibc machine code and may fail on some versions (native aarch64 only; a failed or incomplete patch is now reported at login, but not fixed).
+- Loader patching depends on glibc machine code and may fail on some versions.
 - Bind paths cannot contain `:` or `=` (the shim's `PRX_BIND` format uses them as separators).
 
 ## Packages

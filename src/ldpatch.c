@@ -3,18 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-/* Usage: ldpatch [-v] INPUT_ELF OUTPUT_ELF
- * stdout: total number of patched syscall sites.
- * -v:     additionally print "set_robust_list=N rseq=N clone3=N" on stderr. */
 int main(int argc, char**argv) {
-    int verbose = 0;
-    if (argc == 4 && !strcmp(argv[1], "-v")) {
-        verbose = 1;
-        argv++;
-        argc--;
-    }
     if (argc != 3) {
-        fprintf(stderr, "usage: ldpatch [-v] INPUT_ELF OUTPUT_ELF\n");
+        fprintf(stderr, "usage: ldpatch INPUT_ELF OUTPUT_ELF\n");
         return 2;
     }
     FILE*f = fopen(argv[1], "rb");
@@ -39,16 +30,11 @@ int main(int argc, char**argv) {
     }
     fclose(f);
     int patched = 0;
-    int cnt[3] = {0, 0, 0}; /* set_robust_list, rseq, clone3 */
     size_t n = (size_t) sz/4;
     for (size_t i = 0; i<n; i++) {
         uint32_t w;
         memcpy(&w, buf+i*4, 4);
-        int which;
-        if (w == 0xD2800C68u || w == 0x52800C68u) which = 0;
-        else if (w == 0xD28024A8u || w == 0x528024A8u) which = 1;
-        else if (w == 0xD2803668u || w == 0x52803668u) which = 2;
-        else continue;
+        if (w != 0xD2800C68u && w != 0x52800C68u && w != 0xD28024A8u && w != 0x528024A8u && w != 0xD2803668u && w != 0x52803668u) continue;
         for (size_t j = i+1; j<n && j <= i+12; j++) {
             uint32_t o;
             memcpy(&o, buf+j*4, 4);
@@ -56,7 +42,6 @@ int main(int argc, char**argv) {
                 uint32_t p = 0x928004A0u;
                 memcpy(buf+j*4, &p, 4);
                 patched++;
-                cnt[which]++;
                 break;
             }
             if ((o&0x7C000000u) == 0x14000000u || o == 0xD65F03C0u) break;
@@ -72,7 +57,6 @@ int main(int argc, char**argv) {
     fclose(f);
     free(buf);
     chmod(argv[2], 0755);
-    if (verbose) fprintf(stderr, "set_robust_list=%d rseq=%d clone3=%d\n", cnt[0], cnt[1], cnt[2]);
     printf("%d\n", patched);
     return 0;
 }

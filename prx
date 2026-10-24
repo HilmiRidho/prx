@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # prx - user-space container and path-translation engine
-# SPDX-License-Identifier: TODO-choose-a-license
+# SPDX-License-Identifier: Apache-2.0 license
 PRX_VERSION=1.0.1
 set -eu
 # Data directory: $PRX_HOME if set; else legacy ~/.prx if it already exists
@@ -16,7 +16,6 @@ die()  { echo "prx: error: $*" >&2; exit 1; }
 warn() { echo "prx: warning: $*" >&2; }
 info() { echo "prx: $*" >&2; }
 chk() { case "$1" in ""|.|..|-*|*[!A-Za-z0-9._-]*) die "Invalid container name: '$1'" ;; esac; }
-TIMEOUT_BIN=""; command -v timeout >/dev/null 2>&1 && TIMEOUT_BIN="$(command -v timeout)"
 case "$(uname -m)" in
 aarch64|arm64) TRIPLET=aarch64-linux-gnu; LDNAME=ld-linux-aarch64.so.1; ARCH=aarch64 ;;
 x86_64|amd64)  TRIPLET=x86_64-linux-gnu;  LDNAME=ld-linux-x86-64.so.2;  ARCH=x86_64 ;;
@@ -827,7 +826,7 @@ if [ "${PRX_NO_ARGV0:-}" = 1 ]; then NOARGV0=1
 elif ! { ${QEMU:+"$QEMU"} "$LD" --help 2>&1 || true; } | grep -q -- '--argv0'; then NOARGV0=1
 fi
 if [ "$NOARGV0" = 1 ] && [ "$trace" = 1 ]; then info "loader has no --argv0 (glibc < 2.33): argv[0] will be the full path"; fi
-local PL="" verify_ld=0
+local PL=""
 if [ "$ARCH" = aarch64 ] && [ -z "$QEMU" ]; then
 [ -x "$PRX_HOME/lib/ldpatch" ] || cmd_build
 PL="$PRX_HOME/lib/ld-$name.so"
@@ -835,14 +834,8 @@ local ldst lcst
 ldst="$(stat -L -c '%s:%Y:%i' "$LD" 2>/dev/null):$(stat -c '%Y' "$PRX_HOME/lib/ldpatch" 2>/dev/null)"
 if [ ! -x "$PL" ] || [ "$(cat "$PL.stamp" 2>/dev/null)" != "$ldst" ]; then
 rm -f "$PL"
-local np nd; np="$("$PRX_HOME/lib/ldpatch" -v "$LD" "$PL" 2>"$PL.log")" || die "Failed to patch ELF loader"
-nd="$(cat "$PL.log" 2>/dev/null || true)"; rm -f "$PL.log"
-if [ "$np" -gt 0 ] 2>/dev/null; then
-[ "$trace" = 1 ] && info "loader patched ($nd)"
-else
-warn "Syscall pattern not found in loader (different glibc version?) [$nd]"
-fi
-verify_ld=1
+local np; np="$("$PRX_HOME/lib/ldpatch" "$LD" "$PL")" || die "Failed to patch ELF loader"
+[ "$np" -gt 0 ] 2>/dev/null || warn "Syscall pattern not found in loader (different glibc version?)"
 printf '%s\n' "$ldst" > "$PL.stamp"
 fi
 LD="$PL"
@@ -859,10 +852,10 @@ done
 if [ -n "$LC" ]; then
 mkdir -p "$PLCD"
 lcst="$(stat -L -c '%s:%Y:%i' "$LC" 2>/dev/null):$(stat -c '%Y' "$PRX_HOME/lib/ldpatch" 2>/dev/null)"
-if [ "$(cat "$PLCD/.stamp" 2>/dev/null)" != "$lcst" ]; then
+if [ ! -x "$PLCD/libc.so.6" ] || [ "$(cat "$PLCD/.stamp" 2>/dev/null)" != "$lcst" ]; then
 rm -f "$PLCD/libc.so.6"
 local nc; nc="$("$PRX_HOME/lib/ldpatch" "$LC" "$PLCD/libc.so.6")" || { warn "Failed to patch libc"; nc=0; }
-if [ "$nc" -gt 0 ] 2>/dev/null; then verify_ld=1; else rm -f "$PLCD/libc.so.6"; fi
+[ "$nc" -gt 0 ] 2>/dev/null || { rm -f "$PLCD/libc.so.6"; }
 printf '%s\n' "$lcst" > "$PLCD/.stamp"
 fi
 [ -x "$PLCD/libc.so.6" ] || PLCD=""
@@ -909,24 +902,6 @@ while IFS= read -r d; do
 case "$d" in /*) [ -d "$R$d" ] && lp_add "$R$d" ;; esac
 done < "$cf"
 done
-# After (re)patching the loader/libc, run a trivial program through them once.
-# A SIGSYS here (exit status 159) means the patch did not cover a syscall that
-# this device blocks, so tell the user now instead of failing later in a session.
-if [ "$verify_ld" = 1 ]; then
-local vt="" vb vrc=0
-for vb in "$R/usr/bin/true" "$R/bin/true"; do
-[ -x "$vb" ] && { vt="$vb"; break; }
-done
-if [ -n "$vt" ]; then
-( ${TIMEOUT_BIN:+"$TIMEOUT_BIN" 10} env -i LD_LIBRARY_PATH="$LP" GLIBC_TUNABLES="${GLIBC_TUNABLES:-glibc.pthread.rseq=0}" \
-"$LD" --library-path "$LP" "$vt" >/dev/null 2>&1; exit $? ) 2>/dev/null || vrc=$?
-case "$vrc" in
-0) [ "$trace" = 1 ] && info "patched loader self-test passed" ;;
-159) warn "Patched loader self-test was killed by SIGSYS: a syscall blocked on this device is not covered by the patch (different glibc version?)" ;;
-*) [ "$trace" = 1 ] && info "patched loader self-test exited with status $vrc" ;;
-esac
-fi
-fi
 local SH; SH="$(find_shell "$R")" || die "No suitable shell (bash/sh) found in rootfs"
 local gshell=/bin/bash
 case "$SH" in */sh) gshell=/bin/sh ;; esac
