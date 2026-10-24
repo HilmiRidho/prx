@@ -1,0 +1,122 @@
+.TH PRX 1 "" "prx 1.0.1" "User Commands"
+.SH NAME
+prx \- user-space container and path-translation engine
+.SH SYNOPSIS
+.B prx
+.I command
+[\fIoptions\fR]
+.SH DESCRIPTION
+.B prx
+runs a glibc-based Linux root filesystem as an unprivileged user, without
+root, namespaces or ptrace. Paths are translated by an
+.B LD_PRELOAD
+shim and the guest's dynamic loader and libc are patched at run time.
+.PP
+.B prx
+is a convenience tool, not a security boundary: a program that issues raw
+syscalls or is statically linked can bypass the translation layer.
+.SH COMMANDS
+.TP
+.B build
+Compile the C runtime shim and loader patcher (needs a C compiler).
+.TP
+\fBinstall\fR \fINAME\fR \fIFILE|URL\fR [\fB\-\-sha256\fR \fIHEX\fR]
+Extract a rootfs archive as container NAME. With
+.B \-\-sha256
+the archive is verified before extraction; without it a warning is printed.
+.TP
+\fBlogin\fR \fINAME\fR [\fIoptions\fR] [\fB\-\-\fR \fIcommand\fR...]
+Start a shell or command inside the container.
+.RS
+.TP
+\fB\-b\fR, \fB\-\-bind\fR \fIPATH\fR | \fIHOST\fR:\fIGUEST\fR
+Bind a host path into the guest. Paths must be shorter than 1024 bytes and
+must not contain
+.B :
+or
+.BR = ;
+at most 50 binds can be given. Invalid binds are rejected with an error.
+.TP
+\fB\-w\fR, \fB\-\-workdir\fR \fIDIR\fR
+Initial working directory (default /root).
+.TP
+\fB\-e\fR, \fB\-\-env\fR \fIKEY=VAL\fR
+Pass an environment variable.
+.TP
+\fB\-c\fR, \fB\-\-cpus\fR \fIN\fR
+CPU cores seen by the guest (0 = no limit).
+.TP
+\fB\-m\fR, \fB\-\-memory\fR \fISIZE\fR
+RAM seen by the guest, e.g. 512M or 2G (0 = no limit).
+.TP
+.B \-\-hard\-mem
+With \-\-memory, also enforce a hard cap via ulimit \-v.
+.TP
+.B \-\-no\-root\-id
+Run as the host user instead of fake root.
+.TP
+.B \-\-trace
+Debug syscall and seccomp tracing.
+.RE
+.TP
+\fBset\fR \fINAME\fR [\fB\-c\fR \fIN\fR] [\fB\-m\fR \fISIZE\fR] [\fB\-\-hard\-mem\fR|\fB\-\-no\-hard\-mem\fR] [\fB\-\-reset\fR] [\fB\-\-show\fR]
+Save default limits for a container.
+.TP
+.B list
+List installed containers.
+.TP
+\fBfixperm\fR \fINAME\fR
+Repair permissions and flush the library-path cache.
+.TP
+\fBremove\fR \fINAME\fR
+Delete a container and its derived files.
+.TP
+.B source, ldsource
+Print the C sources of the shim and the loader patcher.
+.TP
+.B \-\-version
+Print the version.
+.SH ENVIRONMENT
+.TP
+.B PRX_HOME
+Data directory. Default: \fI~/.prx\fR if it exists, otherwise
+\fI$XDG_DATA_HOME/prx\fR (\fI~/.local/share/prx\fR).
+.TP
+.B PRX_SRCDIR
+Directory containing \fIprx.c\fR and \fIldpatch.c\fR.
+.TP
+.B CC
+C compiler used by \fBprx build\fR.
+.TP
+.B PRX_QEMU
+Path to a specific qemu-user binary for cross-architecture rootfs.
+.TP
+.B PRX_DNS
+IPv4 nameservers to use inside the guest, separated by commas, blanks or
+colons. Other entries (including IPv6 addresses) are ignored with a warning.
+.TP
+.B PRX_NO_ARGV0
+Set to 1 to never pass
+.B \-\-argv0
+to the glibc loader. Normally this is detected automatically, because
+.B \-\-argv0
+exists only in glibc 2.33 and later; with an older rootfs the guest shell sees
+its full path as argv[0].
+.SH SECURITY NOTES
+Inside the guest, PAM is configured to always succeed and sudo is configured
+with NOPASSWD, because there is no real root to authenticate against. Do not
+treat the guest as a sandbox for untrusted code.
+.SH LIMITATIONS
+Only glibc rootfs are supported (not musl). Only x86_64 and aarch64 hosts.
+The loader patch depends on glibc's machine code and may not apply to every
+version.
+.SH FILES
+.TP
+.I $PRX_HOME/rootfs/NAME
+Container root filesystems.
+.TP
+.I $PRX_HOME/lib
+Per-user built shim and patched loaders.
+.TP
+.I $PRX_HOME/conf/NAME.conf
+Saved resource limits.

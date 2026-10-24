@@ -1,126 +1,64 @@
-# prx
+# prx 1.0.1
 
-**A single-file, rootless container and path-translation engine for Linux.**
+User-space container / path-translation engine (glibc rootfs, no root needed).
 
-`prx` lets you run a full glibc-based Linux root filesystem (Debian, Ubuntu, etc.) as a regular user, with no root, no `chroot`, no kernel namespaces, and no daemon. It works in user space by preloading a small C shim that translates filesystem paths and fakes the bits of the system a guest expects to see. It is similar in spirit to `proot`, and is aimed at environments where privileged containers are not an option (for example Termux on Android, shared hosts, or locked-down CI).
+## Install
 
-Everything lives in one Bash script. The C sources are embedded in the script itself and compiled on first use, so there is nothing else to download or install.
+    make install                    # PREFIX=/usr/local by default
+    make install PREFIX=/usr DESTDIR=pkgroot   # for packagers
+    make check                      # lint + smoke tests
 
-## Features
+The shim is compiled per user on the first `prx login` (needs `gcc` or `clang`).
 
-- **Rootless.** Runs entirely as an unprivileged user.
-- **Single file.** One script, with the shim and loader-patch tool embedded and built locally.
-- **Path translation.** The guest sees the rootfs as `/`, with correct handling of `..`, symlinks and `/proc/self/exe`.
-- **Bind mounts.** Expose host paths inside the guest, at the same path or at a custom one.
-- **Fake root identity.** The guest runs as `root` by default; `sudo` and `su` work out of the box. Use `--no-root-id` to keep your host user name, UID and GID instead.
-- **Resource limits (guest view).** Limit the CPU count and RAM the guest sees. CPU limits are pinned with `taskset` when available; `--hard-mem` also enforces a hard memory cap with `ulimit -v`. Limits can be saved per container.
-- **Cross-architecture.** x86_64 rootfs on aarch64 hosts, and aarch64 rootfs on x86_64 hosts, run automatically through `qemu-user`.
-- **Housekeeping built in.** Automatic DNS detection, cleanup of leftover guest processes on exit, and permission repair.
+## Layout
 
-## Requirements
+    prx            shell front-end (pure bash, passes `bash -n` / shellcheck)
+    src/prx.c      LD_PRELOAD path-translation shim
+    src/ldpatch.c  glibc loader/libc patcher
+    man/prx.1      manual page
+    tests/smoke.sh offline smoke tests
+    packaging/     build-deb.sh [debian|termux]
 
-- Linux on `x86_64` or `aarch64`
-- Bash, `tar`, and a C compiler (`gcc` or `clang`)
-- `curl`, only if you install a rootfs from a URL
-- `taskset`, optional, for pinning CPUs
-- `qemu-user`, only for cross-architecture rootfs (plus `clang` + `lld`, or a cross `gcc`, to build the guest shim)
+## Changes in 1.0.1
 
-Install hints:
+- Writes into a rootfs (`login`, `install`) no longer follow symlinks out of it: an absolute link such as `/var/lib/dbus/machine-id -> /etc/machine-id` used to make `cp`/`>` hit the *host* file (dangerous when run as root). All such writes now go through `rpath`, which resolves links as if the rootfs were `/`.
+- `--bind`: paths longer than 159 bytes were silently ignored by the shim. The limit is now 1023 bytes per path, 50 binds, 16000 bytes in total, and `prx` rejects anything beyond that (and paths containing `:` or `=`) with an error.
+- Shim: `sched_getaffinity` returned success on `EINVAL`/`ESRCH`; real errors are now reported (a seccomp-blocked syscall is still emulated).
+- `wfile` used `printf "$@"` with data from `PRX_DNS`/`resolv.conf`; it now uses `%b`. DNS servers are validated: only IPv4 is accepted, anything else is dropped with a warning.
+- Rootfs with glibc < 2.33 (no `ld.so --argv0`) are detected and started without it (`PRX_NO_ARGV0=1` forces this).
+- `prx login NAME --typo` is now an error instead of running `--typo` as a command.
+- `prx set NAME --hard-mem` alone is now saved (and warns that it needs `-m`).
+- Minor: per-install `tar.err` temp file, `execveat(NULL)` returns `EFAULT`, group file buffer raised to 64 KiB.
 
-```sh
-# Termux
-pkg install qemu-user-x86-64 qemu-user-aarch64 clang
+## Changes from the single-file version
 
-# Debian / Ubuntu
-sudo apt install qemu-user-static clang lld
-```
+- C sources moved out of the script into `src/` (`prx source` / `prx ldsource` still print them).
+- Data dir follows XDG (`~/.local/share/prx`); an existing `~/.prx` is still used.
+- `prx install NAME URL --sha256 HEX` verifies the archive before extracting; a warning is shown without it.
+- Shim is rebuilt when `src/prx.c` changes, not only when the script changes.
+- Added `--version`, manpage, Makefile (PREFIX/DESTDIR), tests.
+- Runtime behaviour of `login`, `set`, `list`, `fixperm`, `remove` is unchanged.
 
-## Quick start
+## Before you publish
 
-```sh
-chmod +x prx
+- Pick a licence: replace `TODO-choose-a-license` in `prx`, add a `COPYING` file.
+- `prx` is no longer a standalone single file: it needs `src/` next to it or in `../share/prx/src`.
 
-# 1. Build the runtime shim and tools (also done automatically on first login)
-./prx build
+## Known limits (by design)
 
-# 2. Install a glibc rootfs archive (local file or URL)
-./prx install ubuntu ubuntu-rootfs.tar.gz
+- Not a security boundary (LD_PRELOAD + loader patching; static/raw-syscall binaries can bypass it).
+- glibc rootfs only; x86_64 / aarch64 only.
+- Guest PAM is `pam_permit` and sudo is `NOPASSWD` because there is no real root to authenticate.
+- Loader patching depends on glibc machine code and may fail on some versions.
+- Bind paths cannot contain `:` or `=` (the shim's `PRX_BIND` format uses them as separators).
+- Only IPv4 DNS servers are supported for the guest.
+- Groups with more than 32 members and `/etc/passwd` files larger than 48 KiB are truncated by the shim's passwd/group emulation.
 
-# 3. Enter the container
-./prx login ubuntu
-```
+## Packages
 
-Run a single command instead of a shell:
+    packaging/build-deb.sh debian    # -> prx_<ver>_all.deb      (prefix /usr)
+    packaging/build-deb.sh termux    # -> prx_<ver>_termux_all.deb
+                                     #    (prefix /data/data/com.termux/files/usr,
+                                     #     shebang rewritten; Termux has no /usr/bin/env)
 
-```sh
-./prx login ubuntu -- apt --version
-```
-
-## Usage
-
-```
-prx build                          Compile the C runtime shim and tools
-prx install NAME FILE|URL          Install a glibc rootfs archive
-prx login NAME [options] [-- cmd]  Run a shell or command inside the rootfs
-prx set NAME [options]             Save default CPU/memory limits for a container
-prx list                           List installed containers
-prx fixperm NAME                   Fix file permissions and clear the library cache
-prx remove NAME                    Remove a container completely
-prx source | prx ldsource          Dump the embedded C sources
-```
-
-### `login` options
-
-| Option | Description |
-| --- | --- |
-| `-b, --bind PATH` | Bind a host path at the identical path in the guest |
-| `-b, --bind HOST:GUEST` | Bind a host path at a custom guest path |
-| `-w, --workdir DIR` | Initial working directory (default: `/root`) |
-| `-e, --env KEY=VAL` | Pass an environment variable |
-| `-c, --cpus N` | Limit the CPU cores the guest sees (`0` = no limit) |
-| `-m, --memory SIZE` | Limit the RAM the guest sees, e.g. `512M`, `2G` (`0` = no limit) |
-| `--hard-mem` | With `--memory`, also enforce a hard cap (`ulimit -v`) |
-| `--no-root-id` | Run as the host user instead of faking root |
-| `--trace` | Enable debug syscall and seccomp tracing |
-
-### Examples
-
-```sh
-# Share a project directory with the guest
-./prx login ubuntu -b ~/project:/work -w /work
-
-# Same path on host and guest
-./prx login ubuntu -b /tmp/shared
-
-# Limit to 2 CPUs and 1 GB RAM, with a hard memory cap
-./prx login ubuntu -c 2 -m 1G --hard-mem
-
-# Save those limits as the defaults for this container
-./prx set ubuntu -c 2 -m 1G --hard-mem
-./prx set ubuntu --show
-```
-
-## Configuration
-
-| Variable | Purpose |
-| --- | --- |
-| `PRX_HOME` | Data directory (default: `~/.prx`) |
-| `PRX_QEMU` | Path to a specific `qemu-user` binary |
-| `QEMU_CPU` | CPU model passed to QEMU, e.g. `max` (other `QEMU_*` variables are passed through) |
-| `CC` | Compiler used to build the shim |
-| `PRX_DNS` | Colon-separated DNS servers to write into the guest |
-| `PRX_KEEP` | Set to `1` to skip killing leftover guest processes on exit |
-
-Containers live in `$PRX_HOME/rootfs/NAME`.
-
-## How it works
-
-`prx login` starts the guest's own dynamic loader and shell with `LD_PRELOAD` pointing at a small freestanding C library (`libprx.so`). The shim intercepts the libc calls that touch the filesystem, credentials, `/proc`, networking and process execution, rewrites paths so that the rootfs appears as `/`, and presents a consistent view of users, CPUs and memory to the guest. On aarch64 the loader and libc are additionally patched so that blocked syscalls fail cleanly.
-
-## Limitations
-
-- **Not a security sandbox.** `prx` runs with your own UID and provides path translation, not isolation.
-- **glibc rootfs only.** musl-based distributions (e.g. Alpine) are not supported.
-- **User-space interception.** Because it relies on `LD_PRELOAD`, programs that bypass libc (such as statically linked binaries) may not be translated.
-- **No real mounts or namespaces.** `mount`, `chroot` and similar calls are emulated or refused, not performed.
-- **Emulation is slow.** Cross-architecture rootfs run under QEMU user-mode emulation.
+Termux install: `apt install ./prx_<ver>_termux_all.deb` (or `dpkg -i`, then `apt -f install`).
