@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build a .deb for Debian/Ubuntu (default) or Termux.
-#   packaging/build-deb.sh [debian|termux] [outdir]
+# packaging/build-deb.sh [debian|termux] [outdir]
 set -eu
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 target="${1:-debian}"; out="${2:-$HERE}"
