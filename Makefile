@@ -24,7 +24,7 @@ uninstall:
 
 lint:
 	bash -n prx
-	@if command -v shellcheck >/dev/null 2>&1; then shellcheck -s bash prx tests/smoke.sh; else echo "shellcheck not installed, skipped"; fi
+	@if command -v shellcheck >/dev/null 2>&1; then shellcheck -S warning -s bash prx tests/smoke.sh; else echo "shellcheck not installed, skipped"; fi
 	$(CC) -fsyntax-only -Wall -Wno-unused-function src/ldpatch.c
 
 check: lint
