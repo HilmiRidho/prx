@@ -1,4 +1,4 @@
-# prx 1.0.1
+# prx
 
 User-space container / path-translation engine (glibc rootfs, no root needed).
 
@@ -43,11 +43,6 @@ The shim is compiled per user on the first `prx login` (needs `gcc` or `clang`).
 - Shim is rebuilt when `src/prx.c` changes, not only when the script changes.
 - Added `--version`, manpage, Makefile (PREFIX/DESTDIR), tests.
 - Runtime behaviour of `login`, `set`, `list`, `fixperm`, `remove` is unchanged.
-
-## Before you publish
-
-- Pick a licence: replace `TODO-choose-a-license` in `prx`, add a `COPYING` file.
-- `prx` is no longer a standalone single file: it needs `src/` next to it or in `../share/prx/src`.
 
 ## Known limits (by design)
 
