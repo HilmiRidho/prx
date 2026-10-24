@@ -62,6 +62,15 @@ grep -q "Unknown option for 'login'" "$T/err" && ok "login rejects unknown optio
 grep -qx 'hard=1' "$HOME/.local/share/prx/conf/t1.conf" && ok "hard=1 stored in conf" || fail "hard=1 stored in conf"
 "$PRX" set t1 --reset >/dev/null
 
+# binfmt_misc: option is known, state is removed together with the container
+"$PRX" login t1 --no-binfmt >/dev/null 2>"$T/err" || true
+grep -q "Unknown option" "$T/err" && fail "login accepts --no-binfmt" || ok "login accepts --no-binfmt"
+mkdir -p "$HOME/.local/share/prx/binfmt/t2/fs"; : > "$HOME/.local/share/prx/binfmt/t2/rules"
+"$PRX" install t6 "$T/fs.tar.gz" >/dev/null 2>&1; mkdir -p "$HOME/.local/share/prx/binfmt/t6/fs"
+"$PRX" remove t6 >/dev/null 2>&1
+[ ! -e "$HOME/.local/share/prx/binfmt/t6" ] && [ -d "$HOME/.local/share/prx/binfmt/t2" ] && ok "remove deletes only that container's binfmt state" || fail "remove deletes only that container's binfmt state"
+rm -rf "$HOME/.local/share/prx/binfmt/t2"
+
 # bind validation: too long / ambiguous ':'
 long="/$(printf 'x%.0s' $(seq 1 1100))"
 if "$PRX" login t1 -b "$T:$long" 2>"$T/err"; then fail "overlong bind accepted"; fi
@@ -97,10 +106,12 @@ awk 'BEGIN {
   for (i = 0; i < 2500; i++) printf "u%d:x:%d:%d:%s:/home/u%d:/bin/sh\n", i, 10000 + i, 10000 + i, g, i
   print "lastuser:x:99999:99999:Last:/home/last:/bin/bash"
 }' > "$T/shimroot/etc/passwd"
-if "${CC:-cc}" -w -o "$T/shim_unit" "$HERE/tests/shim_unit.c" 2>"$T/err" && "$T/shim_unit" "$T/shimroot" >/dev/null; then
+mkdir -p "$T/bfdir/fs"; : > "$T/bfdir/fs/register"; echo enabled > "$T/bfdir/fs/status"
+if "${CC:-cc}" -w -o "$T/shim_unit" "$HERE/tests/shim_unit.c" 2>"$T/err" && "$T/shim_unit" "$T/shimroot" "$T/bfdir" >/dev/null; then
   ok "shim: >32 group members, >48 KiB passwd/group, IPv6 literals"
+  ok "shim: binfmt_misc register/match/enable/disable/remove"
 else
-  cat "$T/err" >&2; fail "shim: >32 group members, >48 KiB passwd/group, IPv6 literals"
+  cat "$T/err" >&2; fail "shim: >32 group members, >48 KiB passwd/group, IPv6 literals, binfmt_misc"
 fi
 
 # rootfs symlinks must not redirect writes to the host

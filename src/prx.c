@@ -249,6 +249,27 @@ static char g_shim[PM];
 static char g_libpath[LPM];
 static char g_loader[PM];
 static char g_qemu[PM];
+/* binfmt_misc emulation (see bf_sync) */
+#define BF_MAXR 32
+#define BF_BUF 256
+#define BF_P 1
+#define BF_O 2
+#define BF_C 4
+#define BF_F 8
+#define BF_PFX "/proc/sys/fs/binfmt_misc"
+struct bfrule {
+    char name[64];
+    char interp[256];
+    u8 magic[BF_BUF];
+    u8 mask[BF_BUF];
+    u32 off, msz, flags;
+    int type, enabled, hasmask;
+};
+static char g_bfdir[PM];
+static struct bfrule g_bfr[BF_MAXR];
+static int g_nbf;
+static int g_bfst = 1;
+static void bf_sync(void);
 #define BENV 16384
 static char g_bindenv[BENV];
 static int g_noargv0;
@@ -417,6 +438,7 @@ static void prx_do_init(char**envp) {
         else if (envmatch(s, "PRX_SHIM")) copyval(g_shim, PM, s+9);
         else if (envmatch(s, "PRX_LOADER")) copyval(g_loader, PM, s+11);
         else if (envmatch(s, "PRX_QEMU")) copyval(g_qemu, PM, s+9);
+        else if (envmatch(s, "PRX_BINFMT")) copyval(g_bfdir, PM, s+11);
         else if (envmatch(s, "PRX_LIBPATH")) copyval(g_libpath, LPM, s+12);
         else if (envmatch(s, "PRX_BIND")) copyval(g_bindenv, sizeof g_bindenv, s+9);
         else if (envmatch(s, "PRX_DNS")) copyval(g_dns, sizeof g_dns, s+8);
@@ -450,6 +472,17 @@ static void prx_do_init(char**envp) {
     addbind("/dev/stdout", 11);
     addbind("/dev/stderr", 11);
     addbind("/dev/tty", 8);
+    if (g_rl && g_bfdir[0]) {
+        static const char pfx[] = BF_PFX "=";
+        size_t hl = strlen(g_bfdir);
+        char bb[BPM+64];
+        if (hl+4 < BPM) {
+            memcpy(bb, pfx, sizeof pfx-1);
+            memcpy(bb+sizeof pfx-1, g_bfdir, hl);
+            memcpy(bb+sizeof pfx-1+hl, "/fs", 4);
+            addbind(bb, sizeof pfx-1+hl+3);
+        }
+    }
     const char*p = g_bindenv;
     while (*p) {
         const char*q = p;
@@ -485,6 +518,13 @@ static int in_bind(const char*g) {
         }
     }
     return best;
+}
+/* 1 when a non-identity bind lives below the guest path res[0..rl) */
+static int nested_bind(const char*res, size_t rl) {
+    for (int i = 0; i<g_nb; i++) {
+        if (!g_bid[i] && g_bindlen[i]>rl && strncmp(g_bind[i], res, rl) == 0 && g_bind[i][rl] == '/') return 1;
+    }
+    return 0;
 }
 static int hasroot(const char*p) {
     return g_rl && strncmp(p, g_root, g_rl) == 0 && (p[g_rl] == 0 || p[g_rl] == '/');
@@ -648,7 +688,7 @@ static int canon(const char*gin, char*res, int follow, int*bind) {
         res[rl] = 0;
         p = e;
         int bi = in_bind(res);
-        if (bi && g_bid[bi-1]) {
+        if (bi && g_bid[bi-1] && !nested_bind(res, rl)) {
             if (has_dotdot(p)) continue;
             size_t tl = strlen(p);
             if (rl+tl >= PM) {
@@ -704,6 +744,7 @@ static int tr(int dfd, const char*in, char*buf, int follow, const char**out) {
     int m = mkabs(dfd, in, g);
     if (m>0) return 0;
     if (m<0) return-1;
+    if (g_bfdir[0] && strncmp(g, BF_PFX, sizeof BF_PFX-1) == 0 && (g[sizeof BF_PFX-1] == 0 || g[sizeof BF_PFX-1] == '/')) bf_sync();
     if (canon(g, res, follow, &bind)<0) return-1;
     size_t rl = strlen(res);
     if (bind) {
@@ -1111,6 +1152,10 @@ static size_t build_mi(char*o, size_t cap, int info) {
             n = mi_app(o, n, cap, " 0 0\n");
         }
     }
+    if (g_bfdir[0]) {
+        if (info) n = mi_app(o, n, cap, "4 2 0:4 / " BF_PFX " rw,relatime - binfmt_misc binfmt_misc rw\n");
+        else n = mi_app(o, n, cap, "binfmt_misc " BF_PFX " binfmt_misc rw,relatime 0 0\n");
+    }
     return n;
 }
 static int do_open(int dfd, const char*p, int fl, int mode) {
@@ -1151,7 +1196,7 @@ static int do_open(int dfd, const char*p, int fl, int mode) {
         }
         if (strcmp(p, "/proc/filesystems") == 0) {
             if ((fl&O_ACCMODE_) != O_RDONLY) return (int) fail(EACCES);
-            const char fs[] = "nodev\tsysfs\nnodev\trootfs\nnodev\tramfs\nnodev\tbdev\nnodev\tproc\nnodev\tdevpts\n\text4\n\ttmpfs\n";
+            const char fs[] = "nodev\tsysfs\nnodev\trootfs\nnodev\tramfs\nnodev\tbdev\nnodev\tproc\nnodev\tdevpts\nnodev\tbinfmt_misc\n\text4\n\ttmpfs\n";
             int mfd = fake_proc_file(fs, sizeof (fs)-1);
             if (mfd >= 0) return mfd;
         }
@@ -3209,7 +3254,7 @@ static char*acat(struct ar*a, const char*k, const char*v) {
     return d;
 }
 static int is_ours(const char*e) {
-    return envmatch(e, "LD_PRELOAD") || envmatch(e, "PRX_ROOTFS") || envmatch(e, "PRX_SHIM") || envmatch(e, "PRX_LIBPATH") || envmatch(e, "PRX_BIND") || envmatch(e, "PRX_FAKEROOT") || envmatch(e, "PRX_DNS") || envmatch(e, "PRX_LOADER") || envmatch(e, "PRX_QEMU") || envmatch(e, "QEMU_SET_ENV") || envmatch(e, "PRX_SELF_EXE") || envmatch(e, "PRX_VUSER") || envmatch(e, "PRX_CRED") || envmatch(e, "PRX_CPUS") || envmatch(e, "PRX_MEM_KB") || envmatch(e, "PRX_NO_ARGV0");
+    return envmatch(e, "LD_PRELOAD") || envmatch(e, "PRX_ROOTFS") || envmatch(e, "PRX_SHIM") || envmatch(e, "PRX_LIBPATH") || envmatch(e, "PRX_BIND") || envmatch(e, "PRX_FAKEROOT") || envmatch(e, "PRX_DNS") || envmatch(e, "PRX_LOADER") || envmatch(e, "PRX_QEMU") || envmatch(e, "PRX_BINFMT") || envmatch(e, "QEMU_SET_ENV") || envmatch(e, "PRX_SELF_EXE") || envmatch(e, "PRX_VUSER") || envmatch(e, "PRX_CRED") || envmatch(e, "PRX_CPUS") || envmatch(e, "PRX_MEM_KB") || envmatch(e, "PRX_NO_ARGV0");
 }
 static int elf_runpath(int fd, const u8*ph, unsigned phes, unsigned phn, char*out, size_t osz) {
     u64 dyn_off = 0, dyn_sz = 0;
@@ -3371,6 +3416,7 @@ static char**mkenv(struct ar*a, char*const envp[], int native, const char*cur_ex
         if (g_loader[0]) ne[k++] = acat(a, "PRX_LOADER=", g_loader);
         if (g_noargv0) ne[k++] = acat(a, "PRX_NO_ARGV0=", "1");
         if (g_qemu[0]) ne[k++] = acat(a, "PRX_QEMU=", g_qemu);
+        if (g_bfdir[0]) ne[k++] = acat(a, "PRX_BINFMT=", g_bfdir);
         int has = 0;
         for (int i = 0; i<n; i++) if (envmatch(envp[i], "GLIBC_TUNABLES")) has = 1;
         if (!has) ne[k++] = acat(a, "GLIBC_TUNABLES=", "glibc.pthread.rseq=0");
@@ -3396,6 +3442,488 @@ static char**mkenv(struct ar*a, char*const envp[], int native, const char*cur_ex
     ne[k] = NULL;
     for (int i = 0; i<k; i++) if (!ne[i]) return NULL;
     return ne;
+}
+/* ---- binfmt_misc emulation ------------------------------------------------
+ * The guest sees a directory /proc/sys/fs/binfmt_misc (a bind of
+ * $PRX_BINFMT/fs) with the usual `register` and `status` files plus one file
+ * per entry. A shim cannot see the write() into `register`, so it is
+ * processed lazily by bf_sync(): whenever the guest path resolves into the
+ * directory (before the open that may truncate `register`) and on every
+ * execve. The authoritative rule list lives in $PRX_BINFMT/rules (outside the
+ * guest-visible directory); the files in fs/ are regenerated from it.
+ * Commands written to an entry or to `status` ("0", "1", "-1") are applied by
+ * the same sync. execve consults the rules before the #! and ELF handling.  */
+#if defined(__aarch64__)
+#define N_flock 32
+#else
+#define N_flock 73
+#endif
+static int bf_isx(int c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+static int bf_xv(int c) {
+    return c <= '9' ? c-'0' : (c|32)-'a'+10;
+}
+/* decode s[0..n) with \xHH escapes into out; length or -1 */
+static long bf_unq(const char*s, size_t n, u8*out, size_t cap) {
+    size_t o = 0, i = 0;
+    while (i<n) {
+        u8 c = (u8) s[i];
+        if (c == '\\' && i+1<n && s[i+1] == 'x') {
+            if (i+3 >= n || !bf_isx(s[i+2]) || !bf_isx(s[i+3])) return -1;
+            c = (u8)(bf_xv(s[i+2])*16+bf_xv(s[i+3]));
+            i += 4;
+        } else {
+            i++;
+        }
+        if (o >= cap) return -1;
+        out[o++] = c;
+    }
+    return (long) o;
+}
+/* index of the next delimiter at or after i (\xHH never contains it), or -1 */
+static long bf_scan(const char*s, size_t n, size_t i, char del) {
+    while (i<n) {
+        if (s[i] == del) return (long) i;
+        if (s[i] == '\\' && i+3<n && s[i+1] == 'x') {
+            i += 4;
+            continue;
+        }
+        i++;
+    }
+    return-1;
+}
+/* register line  :name:type:offset:magic:mask:interpreter:flags  -> rule */
+static int bf_parse(const char*s, size_t n, struct bfrule*r) {
+    size_t f[7][2];
+    size_t i = 1;
+    memset(r, 0, sizeof*r);
+    if (n && s[n-1] == '\n') n--;
+    if (n<8) return-1;
+    char del = s[0];
+    if (del == '\\' || del == '\n') return-1;
+    for (int k = 0; k<6; k++) {
+        long e = bf_scan(s, n, i, del);
+        if (e<0) return-1;
+        f[k][0] = i;
+        f[k][1] = (size_t) e-i;
+        i = (size_t) e+1;
+    }
+    f[6][0] = i;
+    f[6][1] = n-i;
+    /* name */
+    size_t nl = f[0][1];
+    const char*nm = s+f[0][0];
+    if (!nl || nl >= sizeof r->name) return-1;
+    for (size_t k = 0; k<nl; k++) if ((u8) nm[k] <= 0x20 || (u8) nm[k] == 0x7f || nm[k] == '/') return-1;
+    memcpy(r->name, nm, nl);
+    r->name[nl] = 0;
+    if (!strcmp(r->name, ".") || !strcmp(r->name, "..") || !strcmp(r->name, "register") || !strcmp(r->name, "status")) return-1;
+    /* type */
+    if (f[1][1] != 1 || (s[f[1][0]] != 'M' && s[f[1][0]] != 'E')) return-1;
+    r->type = s[f[1][0]];
+    /* offset (M only) */
+    u64 off = 0;
+    if (r->type == 'E') {
+        if (f[2][1] || f[4][1]) return-1;
+    } else {
+        for (size_t k = 0; k<f[2][1]; k++) {
+            char c = s[f[2][0]+k];
+            if (c<'0' || c>'9' || off > BF_BUF) return-1;
+            off = off*10+(u64)(c-'0');
+        }
+        if (off >= BF_BUF) return-1;
+    }
+    r->off = (u32) off;
+    /* magic / extension */
+    long ml = bf_unq(s+f[3][0], f[3][1], r->magic, sizeof r->magic);
+    if (ml <= 0) return-1;
+    r->msz = (u32) ml;
+    if (r->type == 'E') {
+        if (r->msz >= BF_BUF) return-1;
+        for (u32 k = 0; k<r->msz; k++) if (r->magic[k] == '/' || r->magic[k] == 0) return-1;
+    } else {
+        if (r->off+r->msz > BF_BUF) return-1;
+        if (f[4][1]) {
+            long kl = bf_unq(s+f[4][0], f[4][1], r->mask, sizeof r->mask);
+            if (kl != ml) return-1;
+            r->hasmask = 1;
+        } else {
+            memset(r->mask, 0xff, r->msz);
+        }
+    }
+    /* interpreter */
+    size_t il = f[5][1];
+    if (!il || il >= sizeof r->interp) return-1;
+    for (size_t k = 0; k<il; k++) if ((u8) s[f[5][0]+k] <= 0x20 || (u8) s[f[5][0]+k] == 0x7f) return-1;
+    memcpy(r->interp, s+f[5][0], il);
+    r->interp[il] = 0;
+    /* flags */
+    for (size_t k = 0; k<f[6][1]; k++) {
+        switch (s[f[6][0]+k]) {
+        case 'P': r->flags |= BF_P; break;
+        case 'O': r->flags |= BF_O; break;
+        case 'C': r->flags |= BF_C|BF_O; break;
+        case 'F': r->flags |= BF_F; break;
+        default: return-1;
+        }
+    }
+    r->enabled = 1;
+    return 0;
+}
+static size_t bf_app(char*o, size_t n, size_t cap, const char*s) {
+    size_t l = strlen(s);
+    if (n+l+1 > cap) return n;
+    memcpy(o+n, s, l+1);
+    return n+l;
+}
+static size_t bf_apph(char*o, size_t n, size_t cap, const u8*b, size_t len) {
+    static const char hx[] = "0123456789abcdef";
+    for (size_t i = 0; i<len && n+3 <= cap; i++) {
+        o[n++] = hx[b[i]>>4];
+        o[n++] = hx[b[i]&15];
+    }
+    o[n] = 0;
+    return n;
+}
+static size_t bf_appd(char*o, size_t n, size_t cap, u64 v) {
+    char t[24];
+    u64_dec(t, v);
+    return bf_app(o, n, cap, t);
+}
+/* contents of the per-entry file, same layout as the kernel's */
+static size_t bf_fmt(const struct bfrule*r, char*o, size_t cap) {
+    size_t n = 0;
+    o[0] = 0;
+    n = bf_app(o, n, cap, r->enabled ? "enabled\n" : "disabled\n");
+    n = bf_app(o, n, cap, "interpreter ");
+    n = bf_app(o, n, cap, r->interp);
+    n = bf_app(o, n, cap, "\nflags: ");
+    if (r->flags&BF_P) n = bf_app(o, n, cap, "P");
+    if (r->flags&BF_O) n = bf_app(o, n, cap, "O");
+    if (r->flags&BF_C) n = bf_app(o, n, cap, "C");
+    if (r->flags&BF_F) n = bf_app(o, n, cap, "F");
+    n = bf_app(o, n, cap, "\n");
+    if (r->type == 'E') {
+        n = bf_app(o, n, cap, "extension .");
+        if (n+r->msz+2 <= cap) {
+            memcpy(o+n, r->magic, r->msz);
+            n += r->msz;
+            o[n] = 0;
+        }
+        n = bf_app(o, n, cap, "\n");
+    } else {
+        n = bf_app(o, n, cap, "offset ");
+        n = bf_appd(o, n, cap, r->off);
+        n = bf_app(o, n, cap, "\nmagic ");
+        n = bf_apph(o, n, cap, r->magic, r->msz);
+        n = bf_app(o, n, cap, "\n");
+        if (r->hasmask) {
+            n = bf_app(o, n, cap, "mask ");
+            n = bf_apph(o, n, cap, r->mask, r->msz);
+            n = bf_app(o, n, cap, "\n");
+        }
+    }
+    return n;
+}
+/* "0", "1", "-1" (optionally newline-terminated) as written to status/entries;
+   returns 0, 1, 2 (= remove) or -1 if the text is not a command */
+static int bf_cmd(const char*s, long n) {
+    if (n <= 0 || n>3) return-1;
+    if (n == 2 && s[1] != '\n') {
+        if (!(s[0] == '-' && s[1] == '1')) return-1;
+        return 2;
+    }
+    if (s[0] == '0' && (n == 1 || s[1] == '\n')) return 0;
+    if (s[0] == '1' && (n == 1 || s[1] == '\n')) return 1;
+    if (n == 3 && s[0] == '-' && s[1] == '1' && s[2] == '\n') return 2;
+    return-1;
+}
+static int bf_hexdec(const char*s, size_t n, u8*out, size_t cap) {
+    if (n&1 || n/2 > cap) return-1;
+    for (size_t i = 0; i<n; i += 2) {
+        if (!bf_isx(s[i]) || !bf_isx(s[i+1])) return-1;
+        out[i/2] = (u8)(bf_xv(s[i])*16+bf_xv(s[i+1]));
+    }
+    return (int)(n/2);
+}
+static u64 bf_num(const char*s) {
+    return parse_u64(s);
+}
+/* rule list <-> text (the $PRX_BINFMT/rules file) */
+static size_t bf_db_text(char*o, size_t cap) {
+    size_t n = 0;
+    o[0] = 0;
+    n = bf_app(o, n, cap, g_bfst ? "status 1\n" : "status 0\n");
+    for (int i = 0; i<g_nbf; i++) {
+        const struct bfrule*r = &g_bfr[i];
+        char t[2] = {(char) r->type, 0};
+        n = bf_app(o, n, cap, "R ");
+        n = bf_app(o, n, cap, r->name);
+        n = bf_app(o, n, cap, " ");
+        n = bf_app(o, n, cap, t);
+        n = bf_app(o, n, cap, r->enabled ? " 1 " : " 0 ");
+        n = bf_appd(o, n, cap, r->flags);
+        n = bf_app(o, n, cap, " ");
+        n = bf_appd(o, n, cap, r->off);
+        n = bf_app(o, n, cap, " ");
+        n = bf_app(o, n, cap, r->interp);
+        n = bf_app(o, n, cap, " ");
+        n = bf_apph(o, n, cap, r->magic, r->msz);
+        n = bf_app(o, n, cap, " ");
+        if (r->hasmask) n = bf_apph(o, n, cap, r->mask, r->msz);
+        else n = bf_app(o, n, cap, "-");
+        n = bf_app(o, n, cap, "\n");
+    }
+    return n;
+}
+static void bf_db_parse(char*b) {
+    g_nbf = 0;
+    g_bfst = 1;
+    while (*b) {
+        char*t[10];
+        int k = 0;
+        while (*b && *b != '\n') {
+            while (*b == ' ') *b++ = 0;
+            if (*b == '\n' || !*b) break;
+            if (k<10) t[k++] = b;
+            while (*b && *b != ' ' && *b != '\n') b++;
+        }
+        int eol = (*b == '\n');
+        if (eol)*b++ = 0;
+        if (k == 2 && !strcmp(t[0], "status")) {
+            g_bfst = t[1][0] != '0';
+        } else if (k == 9 && !strcmp(t[0], "R") && g_nbf<BF_MAXR && (t[2][0] == 'M' || t[2][0] == 'E')) {
+            struct bfrule*r = &g_bfr[g_nbf];
+            size_t nl = strlen(t[1]), il = strlen(t[6]);
+            if (!nl || nl >= sizeof r->name || !il || il >= sizeof r->interp) continue;
+            memset(r, 0, sizeof*r);
+            memcpy(r->name, t[1], nl+1);
+            memcpy(r->interp, t[6], il+1);
+            r->type = t[2][0];
+            r->enabled = t[3][0] == '1';
+            r->flags = (u32) bf_num(t[4]) & (BF_P|BF_O|BF_C|BF_F);
+            r->off = (u32) bf_num(t[5]);
+            int ml = bf_hexdec(t[7], strlen(t[7]), r->magic, sizeof r->magic);
+            if (ml <= 0 || r->off >= BF_BUF) continue;
+            r->msz = (u32) ml;
+            if (t[8][0] == '-') {
+                memset(r->mask, 0xff, r->msz);
+            } else {
+                if (bf_hexdec(t[8], strlen(t[8]), r->mask, sizeof r->mask) != ml) continue;
+                r->hasmask = 1;
+            }
+            g_nbf++;
+        }
+    }
+}
+/* first enabled rule (newest first, like the kernel) matching the file */
+static const struct bfrule*bf_find(const u8*hd, long hn, const char*gp) {
+    if (!g_bfst || !g_nbf) return NULL;
+    const char*bn = gp, *dot = NULL;
+    for (const char*q = gp; *q; q++) {
+        if (*q == '/') {
+            bn = q+1;
+            dot = NULL;
+        } else if (*q == '.') {
+            dot = q;
+        }
+    }
+    (void) bn;
+    for (int i = g_nbf-1; i >= 0; i--) {
+        const struct bfrule*r = &g_bfr[i];
+        if (!r->enabled || !strcmp(r->interp, gp)) continue;
+        if (r->type == 'E') {
+            if (dot && strlen(dot+1) == r->msz && !memcmp(dot+1, r->magic, r->msz)) return r;
+            continue;
+        }
+        int ok = 1;
+        for (u32 k = 0; k<r->msz && ok; k++) {
+            long pos = (long) r->off+(long) k;
+            u8 c = pos<hn ? hd[pos] : 0;
+            if ((c^r->magic[k])&r->mask[k]) ok = 0;
+        }
+        if (ok) return r;
+    }
+    return NULL;
+}
+static int bf_find_name(const char*nm) {
+    for (int i = 0; i<g_nbf; i++) if (!strcmp(g_bfr[i].name, nm)) return i;
+    return-1;
+}
+/* add every valid line of the `register` text; number of rules added */
+static int bf_register_text(char*b) {
+    int added = 0;
+    while (*b) {
+        char*e = b;
+        while (*e && *e != '\n') e++;
+        size_t len = (size_t)(e-b);
+        if (len) {
+            struct bfrule nr;
+            if (bf_parse(b, len, &nr) == 0 && bf_find_name(nr.name)<0 && g_nbf<BF_MAXR) {
+                g_bfr[g_nbf++] = nr;
+                added++;
+            } else if (g_trace) {
+                static const char m[] = "prx: binfmt_misc: registration rejected\n";
+                sc(N_write, 2, (long) m, (long)(sizeof m-1), 0, 0, 0);
+            }
+        }
+        b = *e ? e+1 : e;
+    }
+    return added;
+}
+static int bf_path(char*o, const char*sub, const char*name) {
+    size_t a = strlen(g_bfdir), b = strlen(sub), c = name ? strlen(name) : 0;
+    if (a+b+c+1 > PM) return-1;
+    memcpy(o, g_bfdir, a);
+    memcpy(o+a, sub, b);
+    if (c) memcpy(o+a+b, name, c);
+    o[a+b+c] = 0;
+    return 0;
+}
+static long bf_slurp(const char*p, char*buf, size_t cap) {
+    long fd = SC4(N_openat, AT_FDCWD, p, O_RDONLY|O_CLOEXEC|O_NOFOLLOW, 0);
+    if (fd<0) return fd;
+    size_t n = 0;
+    long k;
+    while (n+1<cap && (k = SC3(N_read, fd, buf+n, cap-1-n))>0) n += (size_t) k;
+    sc(N_close, fd, 0, 0, 0, 0, 0);
+    buf[n] = 0;
+    return (long) n;
+}
+static int bf_spit(const char*p, const char*d, size_t n) {
+    long fd = SC4(N_openat, AT_FDCWD, p, O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC|O_NOFOLLOW, 0644);
+    if (fd<0) return-1;
+    size_t o = 0;
+    while (o<n) {
+        long k = SC3(N_write, fd, d+o, n-o);
+        if (k <= 0) break;
+        o += (size_t) k;
+    }
+    sc(N_close, fd, 0, 0, 0, 0, 0);
+    return o == n ? 0 : -1;
+}
+/* size of a regular file, -1 if missing/not accessible */
+static long bf_fsize(const char*p) {
+    u64 st[32];
+    if (SC4(N_newfstatat, AT_FDCWD, p, st, AT_SYMLINK_NOFOLLOW)<0) return-1;
+    return (long) st[6];
+}
+static char g_bfio[65536];
+static void bf_db_load(void) {
+    char p[PM];
+    g_nbf = 0;
+    g_bfst = 1;
+    if (bf_path(p, "/rules", NULL)<0) return;
+    if (bf_slurp(p, g_bfio, sizeof g_bfio)>0) bf_db_parse(g_bfio);
+}
+static void bf_db_store(void) {
+    char p[PM], t[PM];
+    if (bf_path(p, "/rules", NULL)<0 || bf_path(t, "/rules.tmp", NULL)<0) return;
+    size_t n = bf_db_text(g_bfio, sizeof g_bfio);
+    if (bf_spit(t, g_bfio, n) == 0) SC4(N_renameat, AT_FDCWD, t, AT_FDCWD, p);
+}
+static void bf_sync(void) {
+    char p[PM];
+    static int busy;
+    if (!g_bfdir[0] || busy) return;
+    busy = 1;
+    bf_db_load();
+    int pend = 0;
+    if (bf_path(p, "/fs/register", NULL) == 0 && bf_fsize(p)>0) pend = 1;
+    long sz;
+    if (bf_path(p, "/fs/status", NULL) == 0 && ((sz = bf_fsize(p))<0 || (sz >= 1 && sz <= 3))) pend = 1;
+    for (int i = 0; i<g_nbf && !pend; i++) {
+        if (bf_path(p, "/fs/", g_bfr[i].name)<0) continue;
+        sz = bf_fsize(p);
+        if (sz<0 || (sz >= 1 && sz <= 3)) pend = 1;
+    }
+    if (!pend) {
+        busy = 0;
+        return;
+    }
+    char lk[PM];
+    long lfd = -1;
+    if (bf_path(lk, "/lock", NULL) == 0) lfd = SC4(N_openat, AT_FDCWD, lk, O_RDWR|O_CREAT|O_CLOEXEC|O_NOFOLLOW, 0600);
+    if (lfd >= 0) sc(N_flock, lfd, 2, 0, 0, 0, 0);
+    bf_db_load();
+    char gone[BF_MAXR][64];
+    int ngone = 0;
+    /* new registrations */
+    if (bf_path(p, "/fs/register", NULL) == 0) {
+        long n = bf_slurp(p, g_bfio, sizeof g_bfio);
+        if (n>0) {
+            bf_register_text(g_bfio);
+            long tf = SC4(N_openat, AT_FDCWD, p, O_WRONLY|O_TRUNC|O_CLOEXEC|O_NOFOLLOW, 0);
+            if (tf >= 0) sc(N_close, tf, 0, 0, 0, 0, 0);
+        }
+    }
+    /* "0" / "1" / "-1" written to status or to an entry */
+    char cb[8];
+    if (bf_path(p, "/fs/status", NULL) == 0) {
+        long n = bf_fsize(p) <= 3 ? bf_slurp(p, cb, sizeof cb) : 0;
+        int c = n>0 ? bf_cmd(cb, n) : -1;
+        if (c == 0 || c == 1) g_bfst = c;
+        if (c == 2) {
+            for (int i = 0; i<g_nbf; i++) {
+                memcpy(gone[ngone++], g_bfr[i].name, sizeof gone[0]);
+            }
+            g_nbf = 0;
+        }
+    }
+    for (int i = 0; i<g_nbf; i++) {
+        if (bf_path(p, "/fs/", g_bfr[i].name)<0) continue;
+        long sz2 = bf_fsize(p);
+        if (sz2<1 || sz2>3) continue;
+        long n = bf_slurp(p, cb, sizeof cb);
+        int c = n>0 ? bf_cmd(cb, n) : -1;
+        if (c == 0 || c == 1) {
+            g_bfr[i].enabled = c;
+        } else if (c == 2) {
+            memcpy(gone[ngone++], g_bfr[i].name, sizeof gone[0]);
+            for (int j = i; j+1<g_nbf; j++) g_bfr[j] = g_bfr[j+1];
+            g_nbf--;
+            i--;
+        }
+    }
+    /* persist and regenerate the guest-visible files */
+    bf_db_store();
+    for (int i = 0; i<ngone; i++) {
+        if (bf_path(p, "/fs/", gone[i]) == 0) SC3(N_unlinkat, AT_FDCWD, p, 0);
+    }
+    char ob[1024];
+    for (int i = 0; i<g_nbf; i++) {
+        if (bf_path(p, "/fs/", g_bfr[i].name) == 0) {
+            size_t n = bf_fmt(&g_bfr[i], ob, sizeof ob);
+            bf_spit(p, ob, n);
+        }
+    }
+    if (bf_path(p, "/fs/status", NULL) == 0) bf_spit(p, g_bfst ? "enabled\n" : "disabled\n", g_bfst ? 8 : 9);
+    if (lfd >= 0) sc(N_close, lfd, 0, 0, 0, 0, 0);
+    busy = 0;
+}
+/* 1 when the host file is an ELF without PT_INTERP: it cannot see the shim,
+   so it must be given host paths */
+static int bf_elf_static(const char*h) {
+    long fd = SC4(N_openat, AT_FDCWD, h, O_RDONLY|O_CLOEXEC, 0);
+    if (fd<0) return 0;
+    u8 eh[64];
+    int st = 0;
+    long n = SC3(N_read, fd, eh, 64);
+    if (n >= 64 && eh[0] == 0x7f && eh[1] == 'E' && eh[2] == 'L' && eh[3] == 'F' && eh[4] == 2) {
+        u64 phoff = *(u64*)(eh+32);
+        unsigned phes = *(u16*)(eh+54), phn = *(u16*)(eh+56);
+        if (phes >= 56 && phes <= 64 && phn && phn <= 40) {
+            u8 ph[64*40];
+            long pn = sc(N_pread64, fd, (long) ph, (long)(phes*phn), (long) phoff, 0, 0);
+            if (pn >= (long)(phes*phn)) {
+                st = 1;
+                for (unsigned i = 0; i<phn; i++) if (*(u32*)(ph+phes*i) == 3) st = 0;
+            }
+        }
+    }
+    sc(N_close, fd, 0, 0, 0, 0, 0);
+    return st;
 }
 static int prep_exec(struct ar*a, const char*path, char*const argv[], char*const envp[], const char**op, char***oa, char***oe) {
     int argc = 0;
@@ -3424,6 +3952,7 @@ static int prep_exec(struct ar*a, const char*path, char*const argv[], char*const
     } else if (gp[0] != '/') {
         if (mkabs(AT_FDCWD, gp, gpath) == 0) gp = gpath;
     }
+    bf_sync();
     for (int depth = 0; depth<6; depth++) {
         char*hb = am(a, PM);
         const char*h;
@@ -3441,6 +3970,31 @@ static int prep_exec(struct ar*a, const char*path, char*const argv[], char*const
         if (fd<0) return (int) ret(fd);
         u8 hd[512];
         long hn = SC3(N_read, fd, hd, sizeof hd);
+        const struct bfrule*br = bf_find(hd, hn>0 ? hn : 0, gp);
+        if (br) {
+            sc(N_close, fd, 0, 0, 0, 0, 0);
+            size_t il = strlen(br->interp);
+            char*ip = am(a, il+1);
+            char*ib = am(a, PM);
+            char**nv = am(a, (size_t)(argc+8)*sizeof (char*));
+            if (!ip || !ib || !nv) return (int) fail(ENOMEM);
+            memcpy(ip, br->interp, il+1);
+            unsigned bfl = br->flags;
+            const char*ih;
+            const char*farg = gp;
+            /* a static interpreter cannot translate paths itself */
+            if (tr(AT_FDCWD, ip, ib, 1, &ih) == 0 && bf_elf_static(ih)) farg = h;
+            int k = 0;
+            nv[k++] = ip;
+            nv[k++] = (char*) farg;
+            if (bfl&BF_P) nv[k++] = av[0];
+            for (int j = 1; j<argc; j++) nv[k++] = av[j];
+            nv[k] = NULL;
+            av = nv;
+            argc = k;
+            gp = ip;
+            continue;
+        }
         if (hn<4) {
             sc(N_close, fd, 0, 0, 0, 0, 0);
             return (int) fail(ENOEXEC);
