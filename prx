@@ -101,7 +101,8 @@ need_src
 mkdir -p "$PRX_HOME/lib"
 local extra="-Wl,-z,max-page-size=65536"
 if "$cc" --version 2>/dev/null | grep -qi clang; then
-extra="$extra -Wl,--pack-dyn-relocs=none"
+# --pack-dyn-relocs is an lld-only option: use lld when present, else skip it
+if command -v ld.lld >/dev/null 2>&1; then extra="$extra -fuse-ld=lld -Wl,--pack-dyn-relocs=none"; fi
 [ "$ARCH" = aarch64 ] && extra="$extra -mbranch-protection=none"
 fi
 "$cc" -O2 -fPIC -shared -nostdlib -ffreestanding -fno-stack-protector \
