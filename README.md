@@ -92,7 +92,6 @@ See `man prx` or `prx help` for all commands and options.
 - Guest PAM is `pam_permit` and sudo is `NOPASSWD` because there is no real root to authenticate. Do not treat the guest as a sandbox for untrusted code.
 - Loader patching depends on glibc machine code and may fail on some versions.
 - Bind paths cannot contain `:` or `=` (the shim's `PRX_BIND` format uses them as separators).
-- There are no CPU or RAM limits: the guest sees the host's real CPUs and memory.
 
 ## Changelog
 
