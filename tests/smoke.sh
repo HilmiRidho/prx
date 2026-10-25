@@ -141,6 +141,32 @@ echo "$out" | grep -q 'buf 1 byte: r=-1 errno=22' && ok "sched_getaffinity repor
 bd="$T/lb"; while [ "${#bd}" -lt 400 ]; do bd="$bd/$(printf 'b%.0s' $(seq 1 60))"; done
 mkdir -p "$bd"; echo bound > "$bd/f"
 [ "$(env -i PRX_ROOTFS="$T/fs" PRX_SHIM="$SHIMSO" LD_PRELOAD="$SHIMSO" PRX_BIND="$bd" "$(command -v cat)" "$bd/f" 2>/dev/null)" = bound ] && ok "bind path > 159 bytes works" || fail "bind path > 159 bytes works"
+# passwd lookups follow rootfs symlinks inside the rootfs, never out of it
+cat > "$T/pw.c" <<'CEOF'
+#include <pwd.h>
+#include <stdio.h>
+int main(int c, char **v) {
+    struct passwd *p = c > 1 ? getpwnam(v[1]) : 0;
+    puts(p ? p->pw_name : "(null)");
+    return 0;
+}
+CEOF
+"$CCB" -o "$T/pw" "$T/pw.c"
+mkdir -p "$T/fsl/etc" "$T/fsl2/etc" "$T/fsl2/data"
+echo 'hostonly:x:4242:4242::/h:/bin/sh' > "$T/hostpw"
+ln -s "$T/hostpw" "$T/fsl/etc/passwd"
+echo 'insider:x:4343:4343::/h:/bin/sh' > "$T/fsl2/data/pw"
+ln -s ../data/pw "$T/fsl2/etc/passwd"
+[ "$(env -i PRX_ROOTFS="$T/fsl" PRX_SHIM="$SHIMSO" LD_PRELOAD="$SHIMSO" "$T/pw" hostonly)" = "(null)" ] && ok "absolute /etc/passwd symlink cannot reach host files" || fail "absolute /etc/passwd symlink cannot reach host files"
+[ "$(env -i PRX_ROOTFS="$T/fsl2" PRX_SHIM="$SHIMSO" LD_PRELOAD="$SHIMSO" "$T/pw" insider)" = "insider" ] && ok "relative /etc/passwd symlink inside the rootfs works" || fail "relative /etc/passwd symlink inside the rootfs works"
+fi
+# ldpatch writes atomically: no temp file is left behind, also on failure
+LDP="$HOME/.local/share/prx/lib/ldpatch"
+if [ -x "$LDP" ]; then
+cp "$(command -v cat)" "$T/ldin"
+"$LDP" "$T/ldin" "$T/ldout" >/dev/null && [ -x "$T/ldout" ] && cmp -s "$T/ldin" "$T/ldout" && ok "ldpatch output written and executable" || fail "ldpatch output written and executable"
+if "$LDP" "$T/ldin" "$T/nodir/out" 2>/dev/null; then fail "ldpatch ignored a write error"; fi
+ls "$T"/ldout.tmp.* "$T"/nodir 2>/dev/null | grep -q . && fail "ldpatch left a temp file" || ok "ldpatch leaves no temp file behind"
 fi
 # ------------------------------------------------------------------------
 

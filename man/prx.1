@@ -38,7 +38,7 @@ or
 at most 50 binds can be given. Invalid binds are rejected with an error.
 .TP
 \fB\-w\fR, \fB\-\-workdir\fR \fIDIR\fR
-Initial working directory (default /root).
+Initial working directory inside the guest, as an absolute path (default /root).
 .TP
 \fB\-e\fR, \fB\-\-env\fR \fIKEY=VAL\fR
 Pass an environment variable.
@@ -98,6 +98,11 @@ semicolons or blanks (a legacy colon-separated list of IPv4 addresses is still
 accepted). Invalid entries and scoped addresses such as
 .I fe80::1%eth0
 are ignored with a warning.
+.TP
+.B PRX_KEEP
+Set to 1 to leave guest processes running after
+.B prx login
+exits. By default they are terminated.
 .TP
 .B PRX_NO_ARGV0
 Set to 1 to never pass

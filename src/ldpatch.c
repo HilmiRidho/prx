@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 int main(int argc, char**argv) {
     if (argc != 3) {
         fprintf(stderr, "usage: ldpatch INPUT_ELF OUTPUT_ELF\n");
@@ -47,16 +48,29 @@ int main(int argc, char**argv) {
             if ((o&0x7C000000u) == 0x14000000u || o == 0xD65F03C0u) break;
         }
     }
-    f = fopen(argv[2], "wb");
-    if (!f || fwrite(buf, 1, (size_t) sz, f) != (size_t) sz) {
-        if (f) fclose(f);
+    /* Write to a temporary file and rename it into place, so that a second
+       "prx login" running at the same time never executes a half-written
+       loader and a failed write never leaves a truncated output behind. */
+    char*tmp = (char*) malloc(strlen(argv[2])+32);
+    if (!tmp) {
+        free(buf);
+        fprintf(stderr, "ldpatch: out of memory\n");
+        return 1;
+    }
+    sprintf(tmp, "%s.tmp.%ld", argv[2], (long) getpid());
+    f = fopen(tmp, "wb");
+    int bad = !f || fwrite(buf, 1, (size_t) sz, f) != (size_t) sz;
+    if (f && fclose(f) != 0) bad = 1;
+    if (!bad && (chmod(tmp, 0755) != 0 || rename(tmp, argv[2]) != 0)) bad = 1;
+    if (bad) {
+        remove(tmp);
+        free(tmp);
         free(buf);
         fprintf(stderr, "ldpatch: failed writing to %s\n", argv[2]);
         return 1;
     }
-    fclose(f);
+    free(tmp);
     free(buf);
-    chmod(argv[2], 0755);
     printf("%d\n", patched);
     return 0;
 }

@@ -3046,14 +3046,20 @@ static u32 atou(const char*s) {
 #define READ_ALL_MAX (64L*1024*1024)
 static char*read_rel_all(const char*rel, long*lenp) {
     char p[PM];
-    size_t rl = strlen(rel);
+    const char*h;
     if (lenp)*lenp = 0;
-    if (!g_rl || g_rl+rl+1 >= PM) return NULL;
-    memcpy(p, g_root, g_rl);
-    memcpy(p+g_rl, rel, rl+1);
-    long fd = SC4(N_openat, AT_FDCWD, p, O_RDONLY|O_CLOEXEC, 0);
+    if (!g_rl) return NULL;
+    /* Resolve symlinks as the guest would (absolute links stay inside the
+       rootfs); a plain root+rel open would follow e.g. /etc/passwd -> /host/x
+       out of the rootfs. */
+    int sv = geterr();
+    if (tr(AT_FDCWD, rel, p, 1, &h)<0) {
+        *__errno_location() = sv;
+        return NULL;
+    }
+    long fd = SC4(N_openat, AT_FDCWD, h, O_RDONLY|O_CLOEXEC, 0);
     if (fd<0) return NULL;
-    size_t cap = 65536, len = 0;
+    size_t cap = 16384, len = 0;
     char*b = malloc(cap);
     if (!b) {
         sc(N_close, fd, 0, 0, 0, 0, 0);

@@ -87,7 +87,7 @@ need_src() { SRCDIR="$(prx_srcdir)" || die "C sources not found (set PRX_SRCDIR,
 shim_stale() {
 [ -f "$1" ] || return 0
 need_src
-[ "$SELF" -nt "$1" ] || [ "$SRCDIR/prx.c" -nt "$1" ]
+[ "$SELF" -nt "$1" ] || [ "$SRCDIR/prx.c" -nt "$1" ] || [ "$SRCDIR/ldpatch.c" -nt "$1" ]
 }
 cmd_source()   { need_src; cat "$SRCDIR/prx.c"; }
 cmd_ldsource() { need_src; cat "$SRCDIR/ldpatch.c"; }
@@ -203,27 +203,33 @@ fi
 info "SHA-256 verified"
 }
 rootdir() { echo "$PRX_HOME/rootfs/$1"; }
+# prx_session PID: set PRX_SESS to the PRX_SESSION value of a process ("-" if it
+# has none). Pure bash, no fork per process (this runs for every entry of /proc).
+prx_session() {
+local e
+PRX_SESS="-"
+{ while IFS= read -r -d '' e; do
+case "$e" in PRX_SESSION=*) PRX_SESS="${e#PRX_SESSION=}"; break ;; esac
+done < "/proc/$1/environ"; } 2>/dev/null || true
+}
 prx_reap() {
 [ "${PRX_KEEP:-0}" = 1 ] && return 0
 local tok="${1:-}" rdir="${2:-}"
-local p pid target_pids=""
+local p pid exe_link target_pids="" PRX_SESS="-"
 trap '' TERM HUP INT
 kill -TERM -$$ 2>/dev/null || true
 for p in /proc/[0-9]*; do
 pid="${p#/proc/}"
 [ "$pid" = "$$" ] && continue
-local match=0
-if [ -n "$tok" ] && tr '\0' '\n' 2>/dev/null < "$p/environ" | grep -qxF "PRX_SESSION=$tok"; then
-match=1
-fi
-if [ "$match" = 0 ] && [ -n "$rdir" ] && ! tr '\0' '\n' 2>/dev/null < "$p/environ" | grep -q '^PRX_SESSION='; then
-local exe_link; exe_link="$(readlink -f "$p/exe" 2>/dev/null || true)"
-case "$exe_link" in
-"$rdir"|"$rdir"/*) match=1 ;;
-esac
-fi
-if [ "$match" = 1 ]; then
+[ -r "$p/environ" ] || continue
+prx_session "$pid"
+if [ -n "$tok" ] && [ "$PRX_SESS" = "$tok" ]; then
 target_pids="$target_pids $pid"
+elif [ "$PRX_SESS" = "-" ] && [ -n "$rdir" ]; then
+exe_link="$(readlink -f "$p/exe" 2>/dev/null || true)"
+case "$exe_link" in
+"$rdir"|"$rdir"/*) target_pids="$target_pids $pid" ;;
+esac
 fi
 done
 [ -z "$target_pids" ] && return 0
@@ -418,7 +424,9 @@ dest="$(rootdir "$name")"
 mkdir -p "$PRX_HOME/dl"
 case "$src" in
 http://*|https://*)
-file="$PRX_HOME/dl/$(basename "${src%%\?*}")"
+local base="${src%%\?*}"; base="${base%%#*}"; base="${base%/}"; base="${base##*/}"
+case "$base" in ""|.|..) base="rootfs-$name.tar" ;; esac
+file="$PRX_HOME/dl/$base"
 command -v curl >/dev/null || die "curl not found"
 info "Downloading $src ..."
 curl -fL --retry 3 -o "$file" "$src" || die "Download failed"
@@ -882,13 +890,23 @@ for d in \
 LP="${LP:+$LP:}$d"
 done
 [ -n "${PLCD:-}" ] && LP="$PLCD:$LP"
-local cf cache="$PRX_HOME/lib/libpath-$name" dpkgstat="$R/var/lib/dpkg/status" stale=0
+local cf cache="$PRX_HOME/lib/libpath-$name" stale=0 dbf pkgdb=0
 if [ ! -s "$cache" ]; then
 stale=1
-elif [ -f "$dpkgstat" ]; then
-[ "$dpkgstat" -nt "$cache" ] && stale=1
 else
-[ "$R/usr" -nt "$cache" ] && stale=1
+# the package database changes whenever libraries are installed or removed
+for dbf in "$R/var/lib/dpkg/status" "$R/var/lib/rpm" "$R/var/lib/pacman/local" "$R/lib/apk/db/installed"; do
+if [ -e "$dbf" ]; then
+pkgdb=1
+[ "$dbf" -nt "$cache" ] && stale=1
+fi
+done
+# no known package manager: fall back to the library directories themselves
+if [ "$pkgdb" = 0 ]; then
+for dbf in "$R/usr" "$R/usr/lib" "$R/usr/lib64" "$R/lib" "$R/lib64" "$R/usr/local/lib"; do
+[ -d "$dbf" ] && [ "$dbf" -nt "$cache" ] && stale=1
+done
+fi
 fi
 if [ "$stale" = 1 ]; then
 local -a scan=()
@@ -914,7 +932,8 @@ done
 local SH; SH="$(find_shell "$R")" || die "No suitable shell (bash/sh) found in rootfs"
 local gshell=/bin/bash
 case "$SH" in */sh) gshell=/bin/sh ;; esac
-local startdir="$R$wd"; [ -d "$startdir" ] || { startdir="$R"; wd=/; }
+local startdir; startdir="$(rpath "$R" "$wd")" || startdir=""
+[ -n "$startdir" ] && [ -d "$startdir" ] || { startdir="$R"; wd=/; }
 local -a prog
 if [ $# -eq 0 ]; then
 prog=("$SH" -l)
@@ -989,7 +1008,7 @@ if [ -d "$PRX_HOME/rootfs" ]; then
 local found=0
 for d in "$PRX_HOME/rootfs"/*; do
 [ -d "$d" ] || continue
-echo "$(basename "$d")"
+echo "${d##*/}"
 found=1
 done
 [ "$found" = 1 ] || echo "(no rootfs installed yet)"
