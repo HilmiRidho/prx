@@ -19,3 +19,6 @@ sleep 2
 
 # 7. Login to the container with shared temporary directories
 prx login debian --no-root-id --cpus 2 --memory 2G -b $PREFIX/tmp/.X11-unix:/tmp/.X11-unix -b /vendor:/vendor -b /system:/system -b /odm:/odm -b /apex:/apex -b /dev/mali0:/dev/mali0 -b /dev/dri:/dev/dri -b /sdcard:/sdcard -b $PREFIX/tmp/.virgl_test:/tmp/.virgl_test
+
+# 6. Guest .bashrc
+# printf "\nexport DISPLAY=:0\nexport GALLIUM_DRIVER=virpipe\nexport MESA_GL_VERSION_OVERRIDE=4.6\nexport PULSE_SERVER=127.0.0.1\n" >> ~/.bashrc
