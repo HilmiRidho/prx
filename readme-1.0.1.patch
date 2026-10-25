@@ -1,0 +1,74 @@
+diff -ruN a/README.md b/README.md
+--- a/README.md	2026-10-25 20:22:37.843307081 +0000
++++ b/README.md	2026-10-25 20:22:37.845324489 +0000
+@@ -79,7 +79,7 @@
+     src/prx.c      LD_PRELOAD path-translation shim
+     src/ldpatch.c  glibc loader/libc patcher
+     man/prx.1      manual page
+-    tests/         smoke.sh (offline smoke tests), shim_unit.c (shim unit test)
++    tests/         smoke.sh (offline smoke tests), shim_unit.c and shim_i386.c (shim tests)
+     packaging/     build-deb.sh [debian|termux]
+     examples/      debian: example Termux launcher script (PulseAudio + Termux:X11 + `prx login debian`)
+     Makefile       install / uninstall / lint / check
+@@ -88,37 +88,39 @@
+ ## Known limits (by design)
+ 
+ - Not a security boundary (LD_PRELOAD + loader patching; static/raw-syscall binaries can bypass it). This cannot be fixed within an LD_PRELOAD design; it would need a ptrace / seccomp-unotify supervisor or user namespaces.
+-- glibc rootfs only (no musl); x86_64 / aarch64 hosts only. A rootfs of the other architecture runs through qemu-user. An i386 (32-bit x86) rootfs is supported on both host types but only through `qemu-i386`: there is no native i386 mode, not even on x86_64. Programs built with 64-bit `time_t` on i386 (`_TIME_BITS=64`) are covered too: `__stat64_time64`, `__lstat64_time64`, `__fstat64_time64`, `__fstatat64_time64` and `__utimensat64` are hooked and use `statx`, so timestamps past 2038 are preserved.
++- glibc rootfs only (no musl), on x86_64 or aarch64 hosts. A rootfs of the other architecture runs through `qemu-user`. An i386 (32-bit) rootfs is supported too, but only through `qemu-i386`; there is no native i386 mode.
+ - Guest PAM is `pam_permit` and sudo is `NOPASSWD` because there is no real root to authenticate. Do not treat the guest as a sandbox for untrusted code.
+ - Loader patching depends on glibc machine code and may fail on some versions.
+ - Bind paths cannot contain `:` or `=` (the shim's `PRX_BIND` format uses them as separators).
++- There are no CPU or RAM limits: the guest sees the host's real CPUs and memory.
+ 
+ ## Changelog
+ 
+-### Unreleased
++### 1.0.1
+ 
+-- Removed the CPU / RAM limit feature: `prx login -c/--cpus`, `-m/--memory`, `--hard-mem`, the `prx set` command, the `PRX_CPUS` / `PRX_MEM_KB` shim variables and the fake `/proc/cpuinfo`, `/proc/meminfo`, `sysinfo`, `sysconf` and `get_nprocs` views. The guest now sees the host's real CPUs and RAM. Leftover `conf/NAME.conf` files are ignored (and deleted by `prx remove`).
++**Safer**
+ 
+-### 1.0.1
++- Writing into a rootfs (`install`, `login`) no longer follows symlinks out of it, so a link like `/var/lib/dbus/machine-id -> /etc/machine-id` can't make prx touch a file on your host. The same fix covers user, group and hosts lookups, and `login -w DIR`.
++- The patched loader is written to a temporary file and renamed, so two logins at the same time can't run a half-written one.
++
++**Fixed**
++
++- `--bind` silently ignored paths longer than 159 bytes. It now accepts up to 1023 bytes per path and 50 binds, and rejects anything invalid with a clear error.
++- A mistyped option such as `prx login NAME --typo` is now an error instead of being run as a command.
++- Rootfs with glibc older than 2.33 now start correctly (set `PRX_NO_ARGV0=1` to force this mode).
++- `sched_getaffinity` reports real errors instead of always succeeding.
++- `prx install` from a URL copes with `#fragments` and URLs that have no file name.
++- The library cache refreshes after the guest installs or removes packages, and the shim is rebuilt when only `src/ldpatch.c` changes.
++- `/etc/passwd`, `/etc/group` and `/etc/hosts` are read in full, and groups can have any number of members.
++- DNS: IPv6 nameservers now work and can be mixed with IPv4 in `PRX_DNS`; invalid entries are dropped with a warning.
++
++**Faster**
++
++- Cleaning up guest processes when `prx login` exits is about 5x faster on a busy host, and `prx list` is quicker too.
++
++**Removed**
+ 
+-- Writes into a rootfs (`login`, `install`) no longer follow symlinks out of it: an absolute link such as `/var/lib/dbus/machine-id -> /etc/machine-id` used to make `cp`/`>` hit the *host* file (dangerous when run as root). All such writes now go through `rpath`, which resolves links as if the rootfs were `/`.
+-- `--bind`: paths longer than 159 bytes were silently ignored by the shim. The limit is now 1023 bytes per path, 50 binds, 16000 bytes in total, and `prx` rejects anything beyond that (and paths containing `:` or `=`) with an error.
+-- Shim: `sched_getaffinity` returned success on `EINVAL`/`ESRCH`; real errors are now reported (a seccomp-blocked syscall is still emulated).
+-- `wfile` used `printf "$@"` with data from `PRX_DNS`/`resolv.conf`; it now uses `%b`. DNS servers are validated: invalid entries are dropped with a warning
+-- Rootfs with glibc < 2.33 (no `ld.so --argv0`) are detected and started without it (`PRX_NO_ARGV0=1` forces this).
+-- `prx login NAME --typo` is now an error instead of running `--typo` as a command.
+-- `prx set NAME --hard-mem` alone is now saved (and warns that it needs `-m`).
+-- Minor: per-install `tar.err` temp file, `execveat(NULL)` returns `EFAULT`, group file buffer raised to 64 KiB.
+-- Performance: cleaning up guest processes when `prx login` exits no longer forks `tr`/`grep` for every process in `/proc`; the check is pure bash and several times faster on busy hosts (about 5x with a few hundred processes).
+-- Performance: `prx list` no longer forks once per container, and the shim reads `/etc/passwd`, `/etc/group` and `/etc/hosts` with a smaller initial buffer.
+-- Fix: the shim's `getpw*`, `getgr*` and `/etc/hosts` lookups followed rootfs symlinks out of the rootfs (an absolute `/etc/passwd` link read the *host* file). They now resolve links as if the rootfs were `/`.
+-- Fix: `prx login -w DIR` resolves `DIR` inside the rootfs, so a symlink cannot start the session in a host directory.
+-- Fix: `ldpatch` writes the patched loader to a temporary file and renames it, so two concurrent logins cannot run a half-written loader and a failed write leaves nothing behind.
+-- Fix: the shim is also rebuilt when only `src/ldpatch.c` changed, and the library-path cache is refreshed when the guest's package database (dpkg, rpm, pacman, apk) or, without one, its library directories change.
+-- Fix: `prx install` from a URL strips a `#fragment` from the download file name and falls back to a default name when the URL has none.
+-- DNS: the shim now queries IPv6 nameservers as well. `PRX_DNS` and the guest `resolv.conf` may mix IPv4 and IPv6 (the list is comma-separated; a legacy colon-separated IPv4 list still works). Scoped addresses (`fe80::1%eth0`) are not supported and are dropped with a warning. Host-detected servers are ordered IPv4 first.
+-- passwd/group emulation: `/etc/passwd`, `/etc/group` and `/etc/hosts` are read completely (no 48 KiB / 16 KiB cut-off), groups may have any number of members, and the buffers behind `getpwnam`/`getgrnam`-style calls grow on demand. The virtual supplementary-group limit is raised from 64 to 256.
+-- Docs: README reorganised; `PRX_KEEP` documented.
++- CPU and RAM limits (`-c`, `-m`, `--hard-mem` and `prx set`).
+ 
+ ## License
+ 
