@@ -9,7 +9,7 @@ User-space container / path-translation engine (glibc rootfs, no root needed).
 - A host running Linux on x86_64 or aarch64 (including Termux on Android).
 - `bash` 4.3 or newer, plus `coreutils`, `tar`, `findutils`, `sed` and `grep`.
 - `gcc` or `clang`, used to compile the shim.
-- Optional: `curl` (installing from a URL), and `qemu-user` (plus `lld` for cross-building the shim) to run a rootfs of the other architecture (or an i386 rootfs, which is qemu-only).
+- Optional: `curl` (installing from a URL) and `qemu-user` (plus `lld` for cross-building the shim) to run a rootfs of the other architecture (or an i386 rootfs, which is qemu-only).
 
 ## Install
 

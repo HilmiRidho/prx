@@ -1,0 +1,22 @@
+diff -ruN a/README.md b/README.md
+--- a/README.md	2026-10-25 20:26:56.013367851 +0000
++++ b/README.md	2026-10-25 20:26:56.015251221 +0000
+@@ -9,7 +9,7 @@
+ - A host running Linux on x86_64 or aarch64 (including Termux on Android).
+ - `bash` 4.3 or newer, plus `coreutils`, `tar`, `findutils`, `sed` and `grep`.
+ - `gcc` or `clang`, used to compile the shim.
+-- Optional: `curl` (installing from a URL), and `qemu-user` (plus `lld` for cross-building the shim) to run a rootfs of the other architecture (or an i386 rootfs, which is qemu-only).
++- Optional: `curl` (installing from a URL) and `qemu-user` (plus `lld` for cross-building the shim) to run a rootfs of the other architecture (or an i386 rootfs, which is qemu-only).
+ 
+ ## Install
+ 
+diff -ruN a/man/prx.1 b/man/prx.1
+--- a/man/prx.1	2026-10-25 20:26:56.012176057 +0000
++++ b/man/prx.1	2026-10-25 20:26:56.015456035 +0000
+@@ -114,6 +114,3 @@
+ .TP
+ .I $PRX_HOME/lib
+ Per-user built shim and patched loaders.
+-.TP
+-.I $PRX_HOME/conf/NAME.conf
+-Saved resource limits.
