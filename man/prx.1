@@ -55,9 +55,6 @@ With \-\-memory, also enforce a hard cap via ulimit \-v.
 .B \-\-no\-root\-id
 Run as the host user instead of fake root.
 .TP
-.B \-\-no\-binfmt
-Do not provide /proc/sys/fs/binfmt_misc to the guest (see BINFMT_MISC).
-.TP
 .B \-\-trace
 Debug syscall and seccomp tracing.
 .RE
@@ -108,43 +105,6 @@ to the glibc loader. Normally this is detected automatically, because
 .B \-\-argv0
 exists only in glibc 2.33 and later; with an older rootfs the guest shell sees
 its full path as argv[0].
-.SH BINFMT_MISC
-The guest sees a directory
-.I /proc/sys/fs/binfmt_misc
-with the usual
-.IR register ,
-.I status
-and one file per entry, so tools such as update-binfmts or qemu-binfmt-conf.sh
-work. Rules use the kernel syntax
-.RI ( :name:type:offset:magic:mask:interpreter:flags
-with
-.B \\xHH
-escapes, type
-.B M
-or
-.BR E )
-and are honoured by every execve made by guest programs, before #! and ELF
-handling; the newest matching enabled rule wins. Writing
-.BR 0 ,
-.B 1
-or
-.B \-1
-to an entry disables, enables or removes it, and to
-.I status
-does so for all entries. Rules persist per container.
-.PP
-Flags \fBP\fR (preserve argv[0]), \fBO\fR, \fBC\fR and \fBF\fR
-are accepted; the binary is always passed to the interpreter by path (there is no
-AT_EXECFD), and the interpreter is looked up when the program is run, not when it is
-registered. An interpreter that is a static executable cannot translate paths, so it
-receives the host path of the program.
-.PP
-Registrations are processed the next time the guest opens a path below the
-directory or runs a program, so an invalid or duplicate line is silently ignored
-instead of failing the
-.BR write (2).
-Programs that bypass the shim (static binaries, raw syscalls) are not affected by
-the rules when they call execve themselves.
 .SH SECURITY NOTES
 Inside the guest, PAM is configured to always succeed and sudo is configured
 with NOPASSWD, because there is no real root to authenticate against. Do not
@@ -163,6 +123,3 @@ Per-user built shim and patched loaders.
 .TP
 .I $PRX_HOME/conf/NAME.conf
 Saved resource limits.
-.TP
-.I $PRX_HOME/binfmt/NAME
-binfmt_misc state: the rule list (rules) and the files shown to the guest (fs/).

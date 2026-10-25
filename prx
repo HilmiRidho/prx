@@ -40,7 +40,6 @@ Usage:
         -m, --memory SIZE            Limit RAM seen by the guest, e.g. 512M, 2G (0 = no limit)
         --hard-mem                   With --memory: also enforce a hard cap (ulimit -v)
         --no-root-id                 Run as the host user (host name/UID/GID); sudo/su still work
-        --no-binfmt                  Do not provide /proc/sys/fs/binfmt_misc to the guest
         --trace                      Enable debug syscall & seccomp tracing
   prx set NAME [options]             Save default CPU/memory limits for a container
         -c, --cpus N                 Default CPU cores (0 = clear)
@@ -59,10 +58,6 @@ Environment:
   PRX_SRCDIR=DIR    Directory holding prx.c and ldpatch.c
   PRX_DNS=LIST      IPv4/IPv6 DNS servers for the guest (separated by ',', ';' or blanks)
   PRX_NO_ARGV0=1    Never pass --argv0 to the loader (auto-detected; glibc < 2.33 lacks it)
-
-The guest gets a /proc/sys/fs/binfmt_misc directory (register, status, one file per
-entry), so tools such as update-binfmts or qemu-binfmt-conf.sh work. Registered rules
-are honoured by execve and persist per container; use --no-binfmt to disable.
   CC=PROGRAM        C compiler used to build the shim
 
 Cross-arch rootfs is detected automatically and run through qemu-user, in both
@@ -688,7 +683,7 @@ if [ "${#binds}" -ge 16000 ]; then die "--bind list too long (limit 16000 bytes 
 cmd_login() {
 [ $# -ge 1 ] || { usage; exit 1; }
 local name="$1"; shift
-local R binds="" nbinds=0 wd=/root wdset=0 fake=1 bh bg trace=0 nobf=0
+local R binds="" nbinds=0 wd=/root wdset=0 fake=1 bh bg trace=0
 local cpus="" mem_kb="" hard=0
 local -a extra_envs=() pin=()
 chk "$name"
@@ -763,7 +758,6 @@ shift 2 ;;
 -e|--env)     [ $# -ge 2 ] || die "-e requires KEY=VALUE"; extra_envs+=("$2"); shift 2 ;;
 --no-root-id) fake=0; shift ;;
 --trace)      trace=1; shift ;;
---no-binfmt)  nobf=1; shift ;;
 -c|--cpus)    [ $# -ge 2 ] || die "-c/--cpus requires a number"
 case "$2" in 0|default|none) cpus="" ;; *) chk_cpus "$2"; cpus=$((10#$2)) ;; esac
 shift 2 ;;
@@ -941,17 +935,6 @@ local cur_dns; cur_dns="$(detect_dns)"
 if [ -n "$mem_kb" ] && [ "$hard" = 1 ]; then
 ulimit -v "$mem_kb" 2>/dev/null || warn "Could not apply hard memory cap (ulimit -v)"
 fi
-local bfdir=""
-if [ "$nobf" = 0 ]; then
-bfdir="$PRX_HOME/binfmt/$name"
-if mkdir -p "$bfdir/fs" 2>/dev/null; then
-[ -e "$bfdir/fs/register" ] || : > "$bfdir/fs/register" 2>/dev/null || true
-[ -e "$bfdir/fs/status" ] || printf 'enabled\n' > "$bfdir/fs/status" 2>/dev/null || true
-else
-warn "Cannot create $bfdir: binfmt_misc is not available in the guest"
-bfdir=""
-fi
-fi
 local -a ldenv=() runner=() argv0opt=()
 [ "$NOARGV0" = 1 ] || argv0opt=(--argv0 "$(basename "$gshell")")
 if [ -n "$QEMU" ]; then
@@ -973,7 +956,7 @@ PRX_ROOTFS="$R" PRX_SHIM="$SHIM" PRX_LIBPATH="$LP" PRX_BIND="$binds" \
 PRX_SESSION="$tok" PRX_SELF_EXE="$gshell" \
 PRX_DNS="$cur_dns" PRX_FAKEROOT="$fake" PRX_VUSER="$vuser" \
 PRX_TRACE="$trace" PRX_LOADER="$PL" PRX_NO_ARGV0="$NOARGV0" \
-PRX_CPUS="${cpus:-0}" PRX_MEM_KB="${mem_kb:-0}" PRX_BINFMT="$bfdir" \
+PRX_CPUS="${cpus:-0}" PRX_MEM_KB="${mem_kb:-0}" \
 GLIBC_TUNABLES="${GLIBC_TUNABLES:-glibc.pthread.rseq=0}" \
 ${ldenv[@]+"${ldenv[@]}"} \
 ${term_envs[@]+"${term_envs[@]}"} \
@@ -1012,7 +995,7 @@ local name="$1" d; chk "$name"; d="$(rootdir "$name")"; [ -d "$d" ] || die "Root
 chmod -R u+rwX "$d" 2>/dev/null || true
 rm -rf "$d"
 rm -f "$PRX_HOME/lib/ld-$name.so" "$PRX_HOME/lib/ld-$name.so.stamp" "$PRX_HOME/lib/libpath-$name"
-rm -rf "$PRX_HOME/lib/libc-$name" "$PRX_HOME/binfmt/$name"
+rm -rf "$PRX_HOME/lib/libc-$name"
 rm -f "$PRX_HOME/conf/$name.conf"
 info "Removed container '$name' and associated patches."
 }

@@ -43,8 +43,6 @@ See `man prx` or `prx help` for all commands and options.
 
 ## Unreleased
 
-- binfmt_misc for the guest: `/proc/sys/fs/binfmt_misc` (`register`, `status`, one file per entry) is provided to every container, so `update-binfmts`, `qemu-binfmt-conf.sh` and plain `echo ':name:M::magic::/interp:OCF' > /proc/sys/fs/binfmt_misc/register` work. Rules (magic/mask or extension, flags `P`, `O`, `C`, `F`) are applied by the shim on every `execve`, before `#!` and ELF handling, the newest matching rule first; `echo 0|1|-1` to an entry or to `status` disables, enables or removes. Rules persist in `$PRX_HOME/binfmt/NAME` and `prx remove` deletes them. `prx login NAME --no-binfmt` turns the feature off. Limits: registrations are processed lazily (the next path lookup below the directory or the next `execve`), so a bad or duplicate line is ignored rather than reported as an error from `write`; the binary is passed by path (no `AT_EXECFD`), flags `O`/`C`/`F` are accepted but have no further effect; a static interpreter is given the host path of the program because it cannot see the path translation.
-
 - DNS: the shim now queries IPv6 nameservers as well. `PRX_DNS` and the guest `resolv.conf` may mix IPv4 and IPv6 (the list is comma-separated; a legacy colon-separated IPv4 list still works). Scoped addresses (`fe80::1%eth0`) are not supported and are dropped with a warning. Host-detected servers are ordered IPv4 first.
 - passwd/group emulation: `/etc/passwd`, `/etc/group` and `/etc/hosts` are read completely (no 48 KiB / 16 KiB cut-off), groups may have any number of members, and the buffers behind `getpwnam`/`getgrnam`-style calls grow on demand. The virtual supplementary-group limit is raised from 64 to 256.
 
