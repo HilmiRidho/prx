@@ -1,0 +1,787 @@
+diff -ruN prx-prev/README.md prx-base/README.md
+--- prx-prev/README.md	2026-10-25 15:03:18.171368879 +0000
++++ prx-base/README.md	2026-10-25 15:03:56.157273565 +0000
+@@ -23,7 +23,7 @@
+ 
+     prx install debian rootfs.tar.gz --sha256 <HEX>   # or a URL instead of a file
+     prx login debian                                  # shell as fake root
+-    prx login debian -c 2 -m 2G -- uname -a           # limited CPUs/RAM, run one command
++    prx login debian -- uname -a                      # run one command
+     prx list                                          # installed containers
+ 
+ See `man prx` or `prx help` for all commands and options.
+@@ -43,6 +43,7 @@
+ 
+ ## Unreleased
+ 
++- Removed the CPU/memory limit feature: `prx login -c/--cpus`, `-m/--memory`, `--hard-mem`, the `prx set` command, saved `conf/NAME.conf` limits and the shim's emulation of `/proc/cpuinfo`, `/proc/meminfo`, `/proc/stat` (limit variant), `/sys/devices/system/cpu/*`, `sysinfo`, `sysconf` (CPU/RAM) and `get_nprocs*`. The guest now sees the real host CPU count and RAM.
+ - Removed the spoofed kernel identity and canned `/proc` data: `uname` no longer overrides sysname/release/version (guest sees the host kernel), and `/proc/version`, `/proc/sys/kernel/osrelease`, `/proc/uptime`, `/proc/loadavg`, `/proc/filesystems` and the hard-coded `/proc/stat` fallback are no longer faked. Values derived from options the user sets (`-c`, `-m`, binds, `/proc/mounts`) are still emulated.
+ - DNS: the shim now queries IPv6 nameservers as well. `PRX_DNS` and the guest `resolv.conf` may mix IPv4 and IPv6 (the list is comma-separated; a legacy colon-separated IPv4 list still works). Scoped addresses (`fe80::1%eth0`) are not supported and are dropped with a warning. Host-detected servers are ordered IPv4 first.
+ - passwd/group emulation: `/etc/passwd`, `/etc/group` and `/etc/hosts` are read completely (no 48 KiB / 16 KiB cut-off), groups may have any number of members, and the buffers behind `getpwnam`/`getgrnam`-style calls grow on demand. The virtual supplementary-group limit is raised from 64 to 256.
+diff -ruN prx-prev/examples/debian prx-base/examples/debian
+--- prx-prev/examples/debian	2026-10-25 15:03:18.171433530 +0000
++++ prx-base/examples/debian	2026-10-25 15:03:51.081764045 +0000
+@@ -18,4 +18,4 @@
+ sleep 2
+ 
+ # 7. Login to PRoot with shared temporary directories
+-prx login debian --no-root-id --cpus 2 --memory 2G -b $PREFIX/tmp/.X11-unix:/tmp/.X11-unix -b /vendor:/vendor -b /system:/system -b /odm:/odm -b /apex:/apex -b /dev/mali0:/dev/mali0 -b /dev/dri:/dev/dri -b /sdcard:/sdcard -b $PREFIX/tmp/.virgl_test:/tmp/.virgl_test --trace
++prx login debian --no-root-id -b $PREFIX/tmp/.X11-unix:/tmp/.X11-unix -b /vendor:/vendor -b /system:/system -b /odm:/odm -b /apex:/apex -b /dev/mali0:/dev/mali0 -b /dev/dri:/dev/dri -b /sdcard:/sdcard -b $PREFIX/tmp/.virgl_test:/tmp/.virgl_test --trace
+diff -ruN prx-prev/man/prx.1 prx-base/man/prx.1
+--- prx-prev/man/prx.1	2026-10-25 15:03:18.171552472 +0000
++++ prx-base/man/prx.1	2026-10-25 15:03:59.676910168 +0000
+@@ -43,15 +43,6 @@
+ \fB\-e\fR, \fB\-\-env\fR \fIKEY=VAL\fR
+ Pass an environment variable.
+ .TP
+-\fB\-c\fR, \fB\-\-cpus\fR \fIN\fR
+-CPU cores seen by the guest (0 = no limit).
+-.TP
+-\fB\-m\fR, \fB\-\-memory\fR \fISIZE\fR
+-RAM seen by the guest, e.g. 512M or 2G (0 = no limit).
+-.TP
+-.B \-\-hard\-mem
+-With \-\-memory, also enforce a hard cap via ulimit \-v.
+-.TP
+ .B \-\-no\-root\-id
+ Run as the host user instead of fake root.
+ .TP
+@@ -59,9 +50,6 @@
+ Debug syscall and seccomp tracing.
+ .RE
+ .TP
+-\fBset\fR \fINAME\fR [\fB\-c\fR \fIN\fR] [\fB\-m\fR \fISIZE\fR] [\fB\-\-hard\-mem\fR|\fB\-\-no\-hard\-mem\fR] [\fB\-\-reset\fR] [\fB\-\-show\fR]
+-Save default limits for a container.
+-.TP
+ .B list
+ List installed containers.
+ .TP
+@@ -120,6 +108,3 @@
+ .TP
+ .I $PRX_HOME/lib
+ Per-user built shim and patched loaders.
+-.TP
+-.I $PRX_HOME/conf/NAME.conf
+-Saved resource limits.
+diff -ruN prx-prev/prx prx-base/prx
+--- prx-prev/prx	2026-10-25 15:03:18.171827511 +0000
++++ prx-base/prx	2026-10-25 15:03:51.081198509 +0000
+@@ -36,17 +36,8 @@
+                                      (paths < 1024 bytes, no ':' or '=' inside, max 50 binds)
+         -w, --workdir DIR            Initial working directory (default: /root)
+         -e, --env KEY=VAL            Pass custom environment variable
+-        -c, --cpus N                 Limit CPU cores seen by the guest to N (0 = no limit)
+-        -m, --memory SIZE            Limit RAM seen by the guest, e.g. 512M, 2G (0 = no limit)
+-        --hard-mem                   With --memory: also enforce a hard cap (ulimit -v)
+         --no-root-id                 Run as the host user (host name/UID/GID); sudo/su still work
+         --trace                      Enable debug syscall & seccomp tracing
+-  prx set NAME [options]             Save default CPU/memory limits for a container
+-        -c, --cpus N                 Default CPU cores (0 = clear)
+-        -m, --memory SIZE            Default memory (0 = clear)
+-        --hard-mem | --no-hard-mem   Enable/disable hard memory cap by default
+-        --reset                      Clear all saved limits
+-        --show                       Show saved limits (default when no option given)
+   prx list                           List all installed rootfs containers
+   prx fixperm NAME                   Fix file permissions & clear cache
+   prx remove NAME                    Completely remove a container
+@@ -555,121 +546,6 @@
+ if [ -f "$fh" ] && [ ! -L "$fh" ]; then chmod u+s "$fh" 2>/dev/null || true; fi
+ done
+ }
+-host_cpus() {
+-local n=""
+-n="$(nproc 2>/dev/null)" || n=""
+-case "$n" in ""|*[!0-9]*|0) n="$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)" || n="" ;; esac
+-case "$n" in ""|*[!0-9]*|0) n=1 ;; esac
+-echo "$n"
+-}
+-host_mem_kb() {
+-local m=""
+-m="$(sed -n 's/^MemTotal:[[:space:]]*\([0-9]*\).*/\1/p' /proc/meminfo 2>/dev/null | head -n1)" || m=""
+-echo "${m:-0}"
+-}
+-chk_cpus() {
+-case "$1" in ""|*[!0-9]*) die "--cpus requires a positive integer (got '$1')" ;; esac
+-[ "${#1}" -le 5 ] && [ "$((10#$1))" -ge 1 ] && [ "$((10#$1))" -le 4096 ] || die "--cpus must be between 1 and 4096 (got '$1')"
+-}
+-parse_mem_kb() {
+-local s="$1" num unit kb
+-case "$s" in ""|*[!0-9A-Za-z]*) return 1 ;; esac
+-num="${s%%[!0-9]*}"
+-unit="${s#"$num"}"
+-[ -n "$num" ] && [ "${#num}" -le 12 ] || return 1
+-num=$((10#$num))
+-case "$unit" in
+-[kK]|[kK][bB]|[kK][iI][bB]) kb=$num ;;
+-""|[mM]|[mM][bB]|[mM][iI][bB]) kb=$((num*1024)) ;;
+-[gG]|[gG][bB]|[gG][iI][bB]) kb=$((num*1048576)) ;;
+-*) return 1 ;;
+-esac
+-[ "$kb" -ge 16384 ] || return 1
+-echo "$kb"
+-}
+-cpu_pick() {
+-local n="$1" allowed="" out="" cnt=0 part a b i
+-if [ -r /proc/self/status ]; then
+-allowed="$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status 2>/dev/null | head -n1)" || allowed=""
+-fi
+-[ -n "$allowed" ] || allowed="0-$(( $(host_cpus) - 1 ))"
+-local IFS=,
+-for part in $allowed; do
+-case "$part" in
+-*-*) a="${part%-*}"; b="${part#*-}" ;;
+-*) a="$part"; b="$part" ;;
+-esac
+-case "$a$b" in ""|*[!0-9]*) continue ;; esac
+-i=$a
+-while [ "$i" -le "$b" ] && [ "$cnt" -lt "$n" ]; do
+-out="${out:+$out,}$i"; cnt=$((cnt+1)); i=$((i+1))
+-done
+-[ "$cnt" -lt "$n" ] || break
+-done
+-echo "$out"
+-}
+-CFG_CPUS=""; CFG_MEM_KB=""; CFG_HARD=0
+-load_conf() {
+-CFG_CPUS=""; CFG_MEM_KB=""; CFG_HARD=0
+-local cf="$PRX_HOME/conf/$1.conf" k v
+-[ -f "$cf" ] || return 0
+-while IFS='=' read -r k v || [ -n "$k" ]; do
+-case "$v" in ""|*[!0-9]*) continue ;; esac
+-case "$k" in
+-cpus) CFG_CPUS="$v" ;;
+-mem_kb) CFG_MEM_KB="$v" ;;
+-hard) CFG_HARD="$v" ;;
+-esac
+-done < "$cf"
+-return 0
+-}
+-save_conf() {
+-local cf="$PRX_HOME/conf/$1.conf"
+-if [ -z "$CFG_CPUS" ] && [ -z "$CFG_MEM_KB" ] && [ "$CFG_HARD" != 1 ]; then rm -f "$cf"; return 0; fi
+-mkdir -p "$PRX_HOME/conf"
+-{
+-[ -z "$CFG_CPUS" ] || echo "cpus=$CFG_CPUS"
+-[ -z "$CFG_MEM_KB" ] || echo "mem_kb=$CFG_MEM_KB"
+-echo "hard=$CFG_HARD"
+-} > "$cf"
+-}
+-show_conf() {
+-local c="unlimited" m="unlimited"
+-[ -z "$CFG_CPUS" ] || c="$CFG_CPUS"
+-if [ -n "$CFG_MEM_KB" ]; then
+-m="$((CFG_MEM_KB/1024)) MiB"
+-if [ "$CFG_HARD" = 1 ]; then m="$m (hard cap)"; fi
+-elif [ "$CFG_HARD" = 1 ]; then
+-m="unlimited (hard cap enabled, applies once a limit is set)"
+-fi
+-echo "$1: cpus=$c memory=$m"
+-}
+-cmd_set() {
+-[ $# -ge 1 ] || { usage; exit 1; }
+-local name="$1"; shift
+-chk "$name"
+-[ -d "$(rootdir "$name")" ] || die "Rootfs '$name' does not exist. Use: prx install $name ARCHIVE"
+-load_conf "$name"
+-local changed=0
+-while [ $# -gt 0 ]; do
+-case "$1" in
+--c|--cpus) [ $# -ge 2 ] || die "-c/--cpus requires a number"
+-case "$2" in 0|default|none) CFG_CPUS="" ;; *) chk_cpus "$2"; CFG_CPUS=$((10#$2)) ;; esac
+-changed=1; shift 2 ;;
+--m|--memory) [ $# -ge 2 ] || die "-m/--memory requires a size (e.g. 512M, 2G)"
+-case "$2" in 0|default|none) CFG_MEM_KB="" ;; *) CFG_MEM_KB="$(parse_mem_kb "$2")" || die "Invalid memory size '$2' (examples: 512M, 2G; minimum 16M)" ;; esac
+-changed=1; shift 2 ;;
+---hard-mem) CFG_HARD=1; changed=1; shift ;;
+---no-hard-mem) CFG_HARD=0; changed=1; shift ;;
+---reset) CFG_CPUS=""; CFG_MEM_KB=""; CFG_HARD=0; changed=1; shift ;;
+---show) shift ;;
+-*) die "Unknown option for 'set': $1" ;;
+-esac
+-done
+-[ "$changed" = 0 ] || save_conf "$name"
+-if [ "$CFG_HARD" = 1 ] && [ -z "$CFG_MEM_KB" ]; then warn "--hard-mem has no effect until a memory limit is set (-m)"; fi
+-show_conf "$name"
+-}
+ # The shim keeps at most 64 binds (14 are built in), each path < 1024 bytes,
+ # and reads them from one PRX_BIND variable of < 16384 bytes. Refuse anything
+ # larger instead of letting the shim drop it silently.
+@@ -684,13 +560,10 @@
+ [ $# -ge 1 ] || { usage; exit 1; }
+ local name="$1"; shift
+ local R binds="" nbinds=0 wd=/root wdset=0 fake=1 bh bg trace=0
+-local cpus="" mem_kb="" hard=0
+-local -a extra_envs=() pin=()
++local -a extra_envs=()
+ chk "$name"
+ R="$(rootdir "$name")"
+ [ -d "$R" ] || die "Rootfs '$name' does not exist. Use: prx install $name ARCHIVE"
+-load_conf "$name"
+-cpus="$CFG_CPUS"; mem_kb="$CFG_MEM_KB"; hard="$CFG_HARD"
+ mkdir -p "$(rpath "$R" /etc/pam.d)" "$(rpath "$R" /etc/sudoers.d)"
+ for pam_svc in sudo su chfn chsh login other sshd; do
+ rwfile "$R" "/etc/pam.d/$pam_svc" 'auth sufficient pam_permit.so\naccount sufficient pam_permit.so\nsession sufficient pam_permit.so\npassword sufficient pam_permit.so\n'
+@@ -758,38 +631,11 @@
+ -e|--env)     [ $# -ge 2 ] || die "-e requires KEY=VALUE"; extra_envs+=("$2"); shift 2 ;;
+ --no-root-id) fake=0; shift ;;
+ --trace)      trace=1; shift ;;
+--c|--cpus)    [ $# -ge 2 ] || die "-c/--cpus requires a number"
+-case "$2" in 0|default|none) cpus="" ;; *) chk_cpus "$2"; cpus=$((10#$2)) ;; esac
+-shift 2 ;;
+--m|--memory)  [ $# -ge 2 ] || die "-m/--memory requires a size (e.g. 512M, 2G)"
+-case "$2" in 0|default|none) mem_kb="" ;; *) mem_kb="$(parse_mem_kb "$2")" || die "Invalid memory size '$2' (examples: 512M, 2G; minimum 16M)" ;; esac
+-shift 2 ;;
+---hard-mem)   hard=1; shift ;;
+ --) shift; break ;;
+ -*) die "Unknown option for 'login': $1 (put '--' before the command if it starts with '-')" ;;
+ *) break ;;
+ esac
+ done
+-if [ -n "$cpus" ]; then
+-local hc; hc="$(host_cpus)"
+-if [ "$cpus" -gt "$hc" ]; then
+-warn "Requested $cpus CPUs but the host exposes only $hc; using $hc"
+-cpus="$hc"
+-fi
+-local clist; clist="$(cpu_pick "$cpus")"
+-if [ -n "$clist" ] && command -v taskset >/dev/null 2>&1 && taskset -c "$clist" true >/dev/null 2>&1; then
+-pin=(taskset -c "$clist")
+-else
+-warn "taskset is unavailable here: CPU limit is virtual only (guest view), not pinned on the host"
+-fi
+-fi
+-if [ -n "$mem_kb" ]; then
+-local hm; hm="$(host_mem_kb)"
+-if [ "$hm" -gt 0 ] && [ "$mem_kb" -gt "$hm" ]; then
+-warn "Requested memory exceeds host RAM; using $((hm/1024)) MiB"
+-mem_kb="$hm"
+-fi
+-fi
+ local vuser="" vhome="/root"
+ if [ "$fake" = 0 ]; then
+ local huid hgid hu
+@@ -932,9 +778,6 @@
+ home_val="$vhome"
+ fi
+ local cur_dns; cur_dns="$(detect_dns)"
+-if [ -n "$mem_kb" ] && [ "$hard" = 1 ]; then
+-ulimit -v "$mem_kb" 2>/dev/null || warn "Could not apply hard memory cap (ulimit -v)"
+-fi
+ local -a ldenv=() runner=() argv0opt=()
+ [ "$NOARGV0" = 1 ] || argv0opt=(--argv0 "$(basename "$gshell")")
+ if [ -n "$QEMU" ]; then
+@@ -947,7 +790,7 @@
+ else
+ ldenv=(LD_LIBRARY_PATH="$LP" LD_PRELOAD="$SHIM")
+ fi
+-${pin[@]+"${pin[@]}"} env -i \
++env -i \
+ HOME="$home_val" USER="$user_val" LOGNAME="$user_val" SHELL="$gshell" \
+ TERM="${TERM:-xterm-256color}" LANG="$LANGV" \
+ LOCPATH="$R/usr/lib/locale" GCONV_PATH="$GCONV" \
+@@ -956,7 +799,6 @@
+ PRX_SESSION="$tok" PRX_SELF_EXE="$gshell" \
+ PRX_DNS="$cur_dns" PRX_FAKEROOT="$fake" PRX_VUSER="$vuser" \
+ PRX_TRACE="$trace" PRX_LOADER="$PL" PRX_NO_ARGV0="$NOARGV0" \
+-PRX_CPUS="${cpus:-0}" PRX_MEM_KB="${mem_kb:-0}" \
+ GLIBC_TUNABLES="${GLIBC_TUNABLES:-glibc.pthread.rseq=0}" \
+ ${ldenv[@]+"${ldenv[@]}"} \
+ ${term_envs[@]+"${term_envs[@]}"} \
+@@ -996,14 +838,12 @@
+ rm -rf "$d"
+ rm -f "$PRX_HOME/lib/ld-$name.so" "$PRX_HOME/lib/ld-$name.so.stamp" "$PRX_HOME/lib/libpath-$name"
+ rm -rf "$PRX_HOME/lib/libc-$name"
+-rm -f "$PRX_HOME/conf/$name.conf"
+ info "Removed container '$name' and associated patches."
+ }
+ case "${1:-}" in
+ build) shift; cmd_build "$@" ;;
+ install) shift; cmd_install "$@" ;;
+ login) shift; cmd_login "$@" ;;
+-set) shift; cmd_set "$@" ;;
+ list) cmd_list ;;
+ fixperm) shift; cmd_fixperm "$@" ;;
+ remove) shift; cmd_remove "$@" ;;
+diff -ruN prx-prev/src/prx.c prx-base/src/prx.c
+--- prx-prev/src/prx.c	2026-10-25 15:03:18.172092801 +0000
++++ prx-base/src/prx.c	2026-10-25 15:03:51.080400108 +0000
+@@ -257,8 +257,6 @@
+ static char g_self_exe[PM];
+ static int g_fake;
+ static int g_trace;
+-static int g_ncpu;
+-static u64 g_memkb;
+ static u32 g_ruid, g_rgid;
+ /* virtual credentials for --no-root-id (host user, setuid/sudo emulation) */
+ static int g_user;
+@@ -354,29 +352,11 @@
+            papered over with a synthetic mask so nproc & co. keep working. */
+         int blocked = r == -ENOSYS || ((r == -EPERM || r == -EACCES) && pid == 0);
+         if (!blocked || !mask || cpusetsize == 0) return (int) ret(r);
+-        if (g_ncpu > 0) {
+-            memset(m, 0, cpusetsize);
+-            for (int i = 0; i<g_ncpu && (size_t)(i/8)<cpusetsize; i++) m[i/8] |= (u8)(1u<<(i%8));
+-        } else {
+-            memset(m, 0xff, cpusetsize);
+-        }
++        memset(m, 0xff, cpusetsize);
+         return 0;
+     }
+     size_t got = (size_t) r < cpusetsize ? (size_t) r : cpusetsize;
+     if (got<cpusetsize) memset(m+got, 0, cpusetsize-got);
+-    if (g_ncpu>0) {
+-        int left = g_ncpu;
+-        for (size_t b = 0; b<got*8; b++) {
+-            if (m[b/8]&(1u<<(b%8))) {
+-                if (left>0) left--;
+-                else m[b/8] &= (u8)~(1u<<(b%8));
+-            }
+-        }
+-        if (left == g_ncpu) {
+-            memset(m, 0, cpusetsize);
+-            for (int i = 0; i<g_ncpu && (size_t)(i/8)<cpusetsize; i++) m[i/8] |= (u8)(1u<<(i%8));
+-        }
+-    }
+     return 0;
+ }
+ static void sys_handler(int sig, void*info, void*uc) {
+@@ -424,11 +404,6 @@
+         else if (envmatch(s, "PRX_NO_ARGV0")) g_noargv0 = (s[13] == '1');
+         else if (envmatch(s, "PRX_TRACE")) g_trace = (s[10] == '1');
+         else if (envmatch(s, "PRX_FAKEROOT")) g_fake = (s[13] == '1');
+-        else if (envmatch(s, "PRX_CPUS")) {
+-            u64 v = parse_u64(s+9);
+-            g_ncpu = v>4096 ? 4096 : (int) v;
+-        }
+-        else if (envmatch(s, "PRX_MEM_KB")) g_memkb = parse_u64(s+11);
+         else if (envmatch(s, "PRX_VUSER")) copyval(g_vuser, sizeof g_vuser, s+10);
+         else if (envmatch(s, "PRX_CRED")) copyval(g_credbuf, sizeof g_credbuf, s+9);
+     }
+@@ -736,263 +711,6 @@
+     sc(N_lseek, fd, 0, 0, 0, 0, 0);
+     return (int) fd;
+ }
+-struct fb {
+-    int fd;
+-    size_t n;
+-    char b[4096];
+-};
+-static void fb_flush(struct fb*f) {
+-    size_t o = 0;
+-    while (o<f->n) {
+-        long k = sc(N_write, f->fd, (long)(f->b+o), (long)(f->n-o), 0, 0, 0);
+-        if (k <= 0) break;
+-        o += (size_t) k;
+-    }
+-    f->n = 0;
+-}
+-static void fb_put(struct fb*f, const char*s, size_t n) {
+-    while (n) {
+-        size_t room = sizeof f->b-f->n;
+-        size_t k = n<room ? n : room;
+-        memcpy(f->b+f->n, s, k);
+-        f->n += k;
+-        s += k;
+-        n -= k;
+-        if (f->n == sizeof f->b) fb_flush(f);
+-    }
+-}
+-static void fb_str(struct fb*f, const char*s) {
+-    fb_put(f, s, strlen(s));
+-}
+-static size_t u64_dec(char*o, u64 v) {
+-    char t[24];
+-    size_t k = 0, n = 0;
+-    do {
+-        t[k++] = (char)('0'+v%10);
+-        v /= 10;
+-    } while (v);
+-    while (k) o[n++] = t[--k];
+-    o[n] = 0;
+-    return n;
+-}
+-static void fb_num(struct fb*f, u64 v) {
+-    char t[24];
+-    size_t n = u64_dec(t, v);
+-    fb_put(f, t, n);
+-}
+-static void fb_pad(struct fb*f, size_t n) {
+-    while (n--) fb_put(f, " ", 1);
+-}
+-static int fake_begin(struct fb*f) {
+-    long fd = sc(N_memfd_create, (long) "fake_proc", 1, 0, 0, 0, 0);
+-    if (fd<0) return -1;
+-    f->fd = (int) fd;
+-    f->n = 0;
+-    return 0;
+-}
+-static int fake_end(struct fb*f) {
+-    fb_flush(f);
+-    sc(N_lseek, f->fd, 0, 0, 0, 0, 0);
+-    return f->fd;
+-}
+-struct lr {
+-    int fd;
+-    size_t pos, len;
+-    char b[4096];
+-};
+-static int lr_line(struct lr*r, char*o, size_t cap) {
+-    size_t n = 0;
+-    int got = 0;
+-    for (;;) {
+-        if (r->pos >= r->len) {
+-            long k = sc(N_read, r->fd, (long) r->b, (long) sizeof r->b, 0, 0, 0);
+-            if (k <= 0) break;
+-            r->len = (size_t) k;
+-            r->pos = 0;
+-        }
+-        got = 1;
+-        char c = r->b[r->pos++];
+-        if (c == '\n') {
+-            o[n] = 0;
+-            return (int) n;
+-        }
+-        if (n+1<cap) o[n++] = c;
+-    }
+-    if (!got) return-1;
+-    o[n] = 0;
+-    return (int) n;
+-}
+-static u64 line_val(const char*s) {
+-    while (*s && *s != ':') s++;
+-    if (*s == ':') s++;
+-    while (*s == ' ' || *s == '\t') s++;
+-    return parse_u64(s);
+-}
+-static u64 umin(u64 a, u64 b) {
+-    return a<b ? a : b;
+-}
+-static int fake_cpurange(void) {
+-    struct fb f;
+-    if (fake_begin(&f)<0) return-1;
+-    if (g_ncpu>1) {
+-        fb_str(&f, "0-");
+-        fb_num(&f, (u64)(g_ncpu-1));
+-    } else fb_str(&f, "0");
+-    fb_str(&f, "\n");
+-    return fake_end(&f);
+-}
+-static int fake_stat(void) {
+-    static const u64 v[10] = {21200, 450, 12300, 954000, 3200, 120, 80, 0, 0, 0};
+-    struct fb f;
+-    if (fake_begin(&f)<0) return-1;
+-    fb_str(&f, "cpu ");
+-    for (int k = 0; k<10; k++) {
+-        fb_str(&f, " ");
+-        fb_num(&f, v[k]);
+-    }
+-    fb_str(&f, "\n");
+-    for (int i = 0; i<g_ncpu; i++) {
+-        fb_str(&f, "cpu");
+-        fb_num(&f, (u64) i);
+-        for (int k = 0; k<10; k++) {
+-            fb_str(&f, " ");
+-            fb_num(&f, v[k]/(u64) g_ncpu);
+-        }
+-        fb_str(&f, "\n");
+-    }
+-    fb_str(&f, "intr 1234567 10 20 0 0 0\nctxt 5678901\nbtime 1680000000\nprocesses 25000\nprocs_running 1\nprocs_blocked 0\n");
+-    return fake_end(&f);
+-}
+-static int fake_cpuinfo(void) {
+-    struct fb f;
+-    if (fake_begin(&f)<0) return-1;
+-    int n = g_ncpu, blk = -1, inb = 0;
+-    long hfd = sc(N_openat, AT_FDCWD, (long) "/proc/cpuinfo", O_RDONLY|O_CLOEXEC, 0, 0, 0);
+-    if (hfd >= 0) {
+-        struct lr r;
+-        char ln[8192];
+-        int len;
+-        r.fd = (int) hfd;
+-        r.pos = r.len = 0;
+-        while ((len = lr_line(&r, ln, sizeof ln)) >= 0) {
+-            if (len >= 9 && strncmp(ln, "processor", 9) == 0 && (ln[9] == ' ' || ln[9] == '\t' || ln[9] == ':')) {
+-                blk++;
+-                inb = 1;
+-            } else if (len == 0 && inb) {
+-                inb = 0;
+-                if (blk<n) fb_str(&f, "\n");
+-                continue;
+-            }
+-            if (inb && blk >= n) continue;
+-            if (inb) {
+-                const char*col = ln;
+-                while (*col && *col != ':') col++;
+-                if (*col == ':') {
+-                    size_t kl = (size_t)(col-ln), tk = kl;
+-                    u64 val = 0;
+-                    int fix = 0;
+-                    while (tk>0 && (ln[tk-1] == ' ' || ln[tk-1] == '\t')) tk--;
+-                    if (tk == 9 && strncmp(ln, "processor", 9) == 0) { val = (u64) blk; fix = 1; }
+-                    else if (tk == 7 && strncmp(ln, "core id", 7) == 0) { val = (u64) blk; fix = 1; }
+-                    else if (tk == 8 && strncmp(ln, "siblings", 8) == 0) { val = (u64) n; fix = 1; }
+-                    else if (tk == 9 && strncmp(ln, "cpu cores", 9) == 0) { val = (u64) n; fix = 1; }
+-                    if (fix) {
+-                        fb_put(&f, ln, kl+1);
+-                        fb_str(&f, " ");
+-                        fb_num(&f, val);
+-                        fb_str(&f, "\n");
+-                        continue;
+-                    }
+-                }
+-            }
+-            fb_put(&f, ln, (size_t) len);
+-            fb_str(&f, "\n");
+-        }
+-        sc(N_close, hfd, 0, 0, 0, 0, 0);
+-    }
+-    for (int i = blk+1; i<n; i++) {
+-        fb_str(&f, "processor\t: ");
+-        fb_num(&f, (u64) i);
+-        fb_str(&f, "\nmodel name\t: Virtual CPU\n\n");
+-    }
+-    return fake_end(&f);
+-}
+-static int fake_meminfo(void) {
+-    char hb[16384];
+-    size_t hn = 0;
+-    long hfd = sc(N_openat, AT_FDCWD, (long) "/proc/meminfo", O_RDONLY|O_CLOEXEC, 0, 0, 0);
+-    if (hfd<0) return-1;
+-    for (;;) {
+-        long k = sc(N_read, hfd, (long)(hb+hn), (long)(sizeof hb-1-hn), 0, 0, 0);
+-        if (k <= 0) break;
+-        hn += (size_t) k;
+-        if (hn >= sizeof hb-1) break;
+-    }
+-    sc(N_close, hfd, 0, 0, 0, 0, 0);
+-    hb[hn] = 0;
+-    if (!hn) return-1;
+-    u64 L = g_memkb, hfree = 0, havail = 0, hbuf = 0, hcache = 0, hsrec = 0;
+-    int have_avail = 0;
+-    for (char*p = hb; *p;) {
+-        char*e = p;
+-        while (*e && *e != '\n') e++;
+-        char sv = *e;
+-        *e = 0;
+-        if (strncmp(p, "MemFree:", 8) == 0) hfree = line_val(p);
+-        else if (strncmp(p, "MemAvailable:", 13) == 0) {
+-            havail = line_val(p);
+-            have_avail = 1;
+-        } else if (strncmp(p, "Buffers:", 8) == 0) hbuf = line_val(p);
+-        else if (strncmp(p, "Cached:", 7) == 0) hcache = line_val(p);
+-        else if (strncmp(p, "SReclaimable:", 13) == 0) hsrec = line_val(p);
+-        *e = sv;
+-        p = sv ? e+1 : e;
+-    }
+-    if (!have_avail) havail = hfree+hbuf+hcache;
+-    u64 avail = umin(havail, L), fre = umin(hfree, avail);
+-    u64 buf = umin(hbuf, avail-fre), cache = umin(hcache, avail-fre-buf), srec;
+-    srec = umin(hsrec, avail-fre-buf-cache);
+-    struct fb f;
+-    if (fake_begin(&f)<0) return-1;
+-    for (char*p = hb; *p;) {
+-        char*e = p;
+-        while (*e && *e != '\n') e++;
+-        char sv = *e;
+-        *e = 0;
+-        size_t ll = (size_t)(e-p);
+-        const char*col = p;
+-        while (*col && *col != ':') col++;
+-        if (*col == ':' && ll>=3 && strcmp(e-3, " kB") == 0) {
+-            size_t kl = (size_t)(col-p)+1;
+-            u64 val = line_val(p);
+-            int skip = strncmp(p, "Swap", 4) == 0 || strncmp(p, "Commit", 6) == 0 || strncmp(p, "Vmalloc", 7) == 0 || strncmp(p, "Huge", 4) == 0 || strncmp(p, "DirectMap", 9) == 0;
+-            if (strncmp(p, "MemTotal:", 9) == 0) val = L;
+-            else if (strncmp(p, "MemFree:", 8) == 0) val = fre;
+-            else if (strncmp(p, "MemAvailable:", 13) == 0) val = avail;
+-            else if (strncmp(p, "Buffers:", 8) == 0) val = buf;
+-            else if (strncmp(p, "Cached:", 7) == 0) val = cache;
+-            else if (strncmp(p, "SReclaimable:", 13) == 0) val = srec;
+-            else if (!skip) val = umin(val, L);
+-            if (skip) {
+-                fb_put(&f, p, ll);
+-            } else {
+-                char nb[24];
+-                size_t nl = u64_dec(nb, val);
+-                fb_put(&f, p, kl);
+-                fb_pad(&f, kl<16 ? 16-kl : 1);
+-                fb_pad(&f, nl<8 ? 8-nl : 0);
+-                fb_put(&f, nb, nl);
+-                fb_str(&f, " kB");
+-            }
+-        } else {
+-            fb_put(&f, p, ll);
+-        }
+-        fb_str(&f, "\n");
+-        *e = sv;
+-        p = sv ? e+1 : e;
+-    }
+-    return fake_end(&f);
+-}
+ struct mi {
+     char maj[24], opts[256], fst[64], src[256], sup[256];
+     int ok;
+@@ -1115,27 +833,6 @@
+ }
+ static int do_open(int dfd, const char*p, int fl, int mode) {
+     if (p) {
+-        if (g_memkb && strcmp(p, "/proc/meminfo") == 0) {
+-            if ((fl&O_ACCMODE_) != O_RDONLY) return (int) fail(EACCES);
+-            int mfd = fake_meminfo();
+-            if (mfd >= 0) return mfd;
+-        }
+-        if (g_ncpu>0) {
+-            if (strcmp(p, "/proc/cpuinfo") == 0) {
+-                if ((fl&O_ACCMODE_) != O_RDONLY) return (int) fail(EACCES);
+-                int mfd = fake_cpuinfo();
+-                if (mfd >= 0) return mfd;
+-            } else if (strncmp(p, "/sys/devices/system/cpu/", 24) == 0 && (strcmp(p+24, "online") == 0 || strcmp(p+24, "possible") == 0 || strcmp(p+24, "present") == 0)) {
+-                if ((fl&O_ACCMODE_) != O_RDONLY) return (int) fail(EACCES);
+-                int mfd = fake_cpurange();
+-                if (mfd >= 0) return mfd;
+-            }
+-        }
+-        if (g_ncpu>0 && strcmp(p, "/proc/stat") == 0) {
+-            if ((fl&O_ACCMODE_) != O_RDONLY) return (int) fail(EACCES);
+-            int sfd = fake_stat();
+-            if (sfd >= 0) return sfd;
+-        }
+         if (strcmp(p, "/proc/mounts") == 0 || strcmp(p, "/proc/self/mounts") == 0 || strcmp(p, "/proc/self/mountinfo") == 0 || strcmp(p, "/proc/mountinfo") == 0) {
+             if ((fl&O_ACCMODE_) != O_RDONLY) return (int) fail(EACCES);
+             char mb[8192];
+@@ -2466,85 +2163,6 @@
+     if (!f) f = nextsym("setfsgid");
+     return f(g);
+ }
+-struct sysinfo_data {
+-    long uptime;
+-    unsigned long loads[3];
+-    unsigned long totalram;
+-    unsigned long freeram;
+-    unsigned long sharedram;
+-    unsigned long bufferram;
+-    unsigned long totalswap;
+-    unsigned long freeswap;
+-    unsigned short procs;
+-    unsigned short pad;
+-    unsigned long totalhigh;
+-    unsigned long freehigh;
+-    unsigned int mem_unit;
+-    char _f[20-2*sizeof (long)-sizeof (int)];
+-};
+-static void sysinfo_limit(struct sysinfo_data*i, int synth) {
+-    u64 total = g_memkb*1024;
+-    if (synth) {
+-        i->mem_unit = 1;
+-        i->totalram = total;
+-        i->freeram = total/2;
+-        i->sharedram = 0;
+-        i->bufferram = 0;
+-        i->totalswap = 0;
+-        i->freeswap = 0;
+-        i->totalhigh = 0;
+-        i->freehigh = 0;
+-        return;
+-    }
+-    u64 unit = i->mem_unit ? i->mem_unit : 1;
+-    u64 t = total/unit;
+-    if (i->totalram>t) i->totalram = t;
+-    if (i->freeram>i->totalram) i->freeram = i->totalram;
+-    if (i->sharedram>i->totalram) i->sharedram = i->totalram;
+-    if (i->bufferram>i->totalram-i->freeram) i->bufferram = i->totalram-i->freeram;
+-}
+-EXP int sysinfo(struct sysinfo_data*info) {
+-    static int(*real_sysinfo)(struct sysinfo_data*);
+-    if (!real_sysinfo) real_sysinfo = nextsym("sysinfo");
+-    int res = -1;
+-    if (real_sysinfo) res = real_sysinfo(info);
+-    if (info && (res != 0 || info->uptime <= 0)) {
+-        info->uptime = 43200;
+-        info->loads[0] = 32768;
+-        info->loads[1] = 49152;
+-        info->loads[2] = 52428;
+-        info->procs = 25;
+-        if (g_memkb) sysinfo_limit(info, res != 0);
+-        return 0;
+-    }
+-    if (res == 0 && info && g_memkb) sysinfo_limit(info, 0);
+-    return res;
+-}
+-EXP long sysconf(int name) {
+-    static long(*f)(int);
+-    if (!f) f = nextsym("sysconf");
+-    if (g_ncpu>0 && (name == 83 || name == 84)) return g_ncpu;
+-    long r = f ? f(name) : -1;
+-    if (g_memkb && (name == 85 || name == 86)) {
+-        long ps = f ? f(30) : 4096;
+-        if (ps <= 0) ps = 4096;
+-        long maxp = (long)(g_memkb*1024/(u64) ps);
+-        if (name == 85 || r<0 || r>maxp) r = maxp;
+-    }
+-    return r;
+-}
+-EXP int get_nprocs(void) {
+-    static int(*f)(void);
+-    if (g_ncpu>0) return g_ncpu;
+-    if (!f) f = nextsym("get_nprocs");
+-    return f ? f() : 1;
+-}
+-EXP int get_nprocs_conf(void) {
+-    static int(*f)(void);
+-    if (g_ncpu>0) return g_ncpu;
+-    if (!f) f = nextsym("get_nprocs_conf");
+-    return f ? f() : 1;
+-}
+ #define IDFN0(name,ty,rn,ix) EXP ty name(void){static ty(*f)(void);if(g_fake)return 0;if(g_user)return g_cr[ix];if(!f)f=nextsym(rn);return f();}
+ IDFN0(getuid, u32, "getuid", C_RU) IDFN0(geteuid, u32, "geteuid", C_EU) IDFN0(getgid, u32, "getgid", C_RG) IDFN0(getegid, u32, "getegid", C_EG)
+ static int cr_setres(int b, u32 r, u32 e, u32 s) {
+@@ -3155,7 +2773,7 @@
+     return d;
+ }
+ static int is_ours(const char*e) {
+-    return envmatch(e, "LD_PRELOAD") || envmatch(e, "PRX_ROOTFS") || envmatch(e, "PRX_SHIM") || envmatch(e, "PRX_LIBPATH") || envmatch(e, "PRX_BIND") || envmatch(e, "PRX_FAKEROOT") || envmatch(e, "PRX_DNS") || envmatch(e, "PRX_LOADER") || envmatch(e, "PRX_QEMU") || envmatch(e, "QEMU_SET_ENV") || envmatch(e, "PRX_SELF_EXE") || envmatch(e, "PRX_VUSER") || envmatch(e, "PRX_CRED") || envmatch(e, "PRX_CPUS") || envmatch(e, "PRX_MEM_KB") || envmatch(e, "PRX_NO_ARGV0");
++    return envmatch(e, "LD_PRELOAD") || envmatch(e, "PRX_ROOTFS") || envmatch(e, "PRX_SHIM") || envmatch(e, "PRX_LIBPATH") || envmatch(e, "PRX_BIND") || envmatch(e, "PRX_FAKEROOT") || envmatch(e, "PRX_DNS") || envmatch(e, "PRX_LOADER") || envmatch(e, "PRX_QEMU") || envmatch(e, "QEMU_SET_ENV") || envmatch(e, "PRX_SELF_EXE") || envmatch(e, "PRX_VUSER") || envmatch(e, "PRX_CRED") || envmatch(e, "PRX_NO_ARGV0");
+ }
+ static int elf_runpath(int fd, const u8*ph, unsigned phes, unsigned phn, char*out, size_t osz) {
+     u64 dyn_off = 0, dyn_sz = 0;
+@@ -3297,16 +2915,6 @@
+         ne[k++] = acat(a, "PRX_BIND=", g_bindenv);
+         ne[k++] = acat(a, "PRX_DNS=", g_dns);
+         ne[k++] = acat(a, "PRX_FAKEROOT=", g_fake ? "1" : "0");
+-        if (g_ncpu>0) {
+-            char nb[24];
+-            u64_dec(nb, (u64) g_ncpu);
+-            ne[k++] = acat(a, "PRX_CPUS=", nb);
+-        }
+-        if (g_memkb) {
+-            char nb[24];
+-            u64_dec(nb, g_memkb);
+-            ne[k++] = acat(a, "PRX_MEM_KB=", nb);
+-        }
+         if (g_user) {
+             char cb[4096];
+             cr_encode(g_pcr_ok ? g_pcr : g_cr, cb);
+diff -ruN prx-prev/tests/smoke.sh prx-base/tests/smoke.sh
+--- prx-prev/tests/smoke.sh	2026-10-25 15:03:18.172305410 +0000
++++ prx-base/tests/smoke.sh	2026-10-25 15:03:51.081531410 +0000
+@@ -48,20 +48,10 @@
+ "$PRX" install t2 "$T/fs.tar.gz" 2>&1 | grep -q 'not verified' && ok "warns when no checksum given"
+ "$PRX" list | grep -qx t1 && ok "list"
+ 
+-# limits
+-"$PRX" set t1 -c 1 -m 512M | grep -q 'memory=512 MiB' && ok "set -m 512M"
+-"$PRX" set t1 -m 1X 2>/dev/null && fail "bad memory size accepted"
+-ok "rejects bad memory size"
+ # ---- 1.0.1 regression tests -------------------------------------------
+ # unknown option must not be run as a command
+ if "$PRX" login t1 --bogus 2>"$T/err"; then fail "unknown login option accepted"; fi
+ grep -q "Unknown option for 'login'" "$T/err" && ok "login rejects unknown option" || fail "login rejects unknown option"
+-# --hard-mem alone is persisted
+-"$PRX" set t1 --reset >/dev/null
+-"$PRX" set t1 --hard-mem 2>/dev/null | grep -q 'hard cap enabled' && ok "set --hard-mem alone is kept" || fail "set --hard-mem alone is kept"
+-grep -qx 'hard=1' "$HOME/.local/share/prx/conf/t1.conf" && ok "hard=1 stored in conf" || fail "hard=1 stored in conf"
+-"$PRX" set t1 --reset >/dev/null
+-
+ # bind validation: too long / ambiguous ':'
+ long="/$(printf 'x%.0s' $(seq 1 1100))"
+ if "$PRX" login t1 -b "$T:$long" 2>"$T/err"; then fail "overlong bind accepted"; fi
