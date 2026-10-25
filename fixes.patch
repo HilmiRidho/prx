@@ -1,0 +1,423 @@
+diff --git a/README.md b/README.md
+index 866a5a2..2e83ddd 100644
+--- a/README.md
++++ b/README.md
+@@ -9,25 +9,74 @@ User-space container / path-translation engine (glibc rootfs, no root needed).
+ - A host running Linux on x86_64 or aarch64 (including Termux on Android).
+ - `bash` 4.3 or newer, plus `coreutils`, `tar`, `findutils`, `sed` and `grep`.
+ - `gcc` or `clang`, used to compile the shim.
+-- Optional: `curl` (installing from a URL), and `qemu-user` (plus `lld` for cross-building the shim) to run a rootfs of the other architecture (or an i386 rootfs, which is qemu-only).
++- Optional: `curl` (installing from a URL), `taskset` (pins `--cpus` to host CPUs), and `qemu-user` (plus `lld` for cross-building the shim) to run a rootfs of the other architecture (or an i386 rootfs, which is qemu-only).
+ 
+ ## Install
+ 
+-    make install                    # PREFIX=/usr/local by default
++    make install                               # PREFIX=/usr/local by default
+     make install PREFIX=/usr DESTDIR=pkgroot   # for packagers
+-    make check                      # lint + smoke tests (needs a C compiler)
++    make check                                 # lint + smoke tests (needs a C compiler)
+ 
+-The shim is compiled per user on the first `prx login` (or explicitly with `prx build`).
++The shim is compiled per user on the first `prx login` (or explicitly with `prx build`). It is rebuilt automatically when `prx`, `src/prx.c` or `src/ldpatch.c` change.
++
++Prebuilt packages:
++
++    packaging/build-deb.sh debian    # -> prx_<ver>_all.deb      (prefix /usr)
++    packaging/build-deb.sh termux    # -> prx_<ver>_termux_all.deb
++                                     #    (prefix /data/data/com.termux/files/usr,
++                                     #     shebang rewritten; Termux has no /usr/bin/env)
++
++Termux install: `apt install ./prx_<ver>_termux_all.deb` (or `dpkg -i`, then `apt -f install`).
+ 
+ ## Quick start
+ 
+     prx install debian rootfs.tar.gz --sha256 <HEX>   # or a URL instead of a file
+     prx login debian                                  # shell as fake root
+     prx login debian -c 2 -m 2G -- uname -a           # limited CPUs/RAM, run one command
++    prx login debian --no-root-id -b /sdcard          # run as the host user, bind a host path
+     prx list                                          # installed containers
+ 
+ See `man prx` or `prx help` for all commands and options.
+ 
++## Commands
++
++| Command | Purpose |
++| --- | --- |
++| `prx build` | Compile the shim and the loader patcher. |
++| `prx install NAME FILE\|URL [--sha256 HEX]` | Extract a rootfs archive as container `NAME`; the checksum is verified before extraction. |
++| `prx login NAME [options] [-- cmd]` | Start a shell, or run one command, inside the container. |
++| `prx set NAME [options]` | Save default CPU / memory limits for a container. |
++| `prx list` | List installed containers. |
++| `prx fixperm NAME` | Repair permissions and flush the library-path cache. |
++| `prx remove NAME` | Delete a container and its derived files. |
++| `prx source`, `prx ldsource` | Print the C sources of the shim / loader patcher. |
++| `prx --version` | Print the version. |
++
++`prx login` options:
++
++| Option | Meaning |
++| --- | --- |
++| `-b, --bind PATH` / `HOST:GUEST` | Bind a host path into the guest (max 50 binds, each path < 1024 bytes, no `:` or `=`). |
++| `-w, --workdir DIR` | Initial working directory inside the guest (default `/root`). |
++| `-e, --env KEY=VAL` | Pass an environment variable. |
++| `-c, --cpus N` | CPU cores seen by the guest (`0` = no limit); pinned with `taskset` when available. |
++| `-m, --memory SIZE` | RAM seen by the guest, e.g. `512M`, `2G` (`0` = no limit, minimum 16M). |
++| `--hard-mem` | With `--memory`, also enforce a hard cap with `ulimit -v`. |
++| `--no-root-id` | Run as the host user instead of fake root; `sudo` and `su` still work. |
++| `--trace` | Debug syscall and seccomp tracing. |
++
++## Environment
++
++| Variable | Meaning |
++| --- | --- |
++| `PRX_HOME` | Data directory. Default: `~/.prx` if it exists, otherwise `$XDG_DATA_HOME/prx` (`~/.local/share/prx`). |
++| `PRX_SRCDIR` | Directory holding `prx.c` and `ldpatch.c`. |
++| `PRX_DNS` | IPv4 / IPv6 nameservers for the guest, separated by `,`, `;` or blanks. |
++| `PRX_QEMU` | Path to a specific `qemu-user` binary for cross-architecture rootfs. |
++| `PRX_NO_ARGV0` | Set to `1` to never pass `--argv0` to the loader (detected automatically; glibc < 2.33 lacks it). |
++| `PRX_KEEP` | Set to `1` to leave guest processes running after `prx login` exits (by default they are cleaned up). |
++| `CC` | C compiler used to build the shim. |
++
+ ## Layout
+ 
+     prx            shell front-end (pure bash, passes `bash -n` / shellcheck)
+@@ -36,16 +85,34 @@ See `man prx` or `prx help` for all commands and options.
+     man/prx.1      manual page
+     tests/         smoke.sh (offline smoke tests), shim_unit.c (shim unit test)
+     packaging/     build-deb.sh [debian|termux]
++    examples/      debian: example Termux launcher script (PulseAudio + Termux:X11 + `prx login debian`)
+     Makefile       install / uninstall / lint / check
+-    debian         example Termux launcher script (PulseAudio + Termux:X11 + `prx login debian`)
+     LICENSE        Apache License 2.0
+ 
+-## Unreleased
++## Known limits (by design)
++
++- Not a security boundary (LD_PRELOAD + loader patching; static/raw-syscall binaries can bypass it). This cannot be fixed within an LD_PRELOAD design; it would need a ptrace / seccomp-unotify supervisor or user namespaces.
++- glibc rootfs only (no musl); x86_64 / aarch64 hosts only. A rootfs of the other architecture runs through qemu-user. An i386 (32-bit x86) rootfs is supported on both host types but only through `qemu-i386`: there is no native i386 mode, not even on x86_64. Programs built with 64-bit `time_t` on i386 (`_TIME_BITS=64`) are covered too: `__stat64_time64`, `__lstat64_time64`, `__fstat64_time64`, `__fstatat64_time64` and `__utimensat64` are hooked and use `statx`, so timestamps past 2038 are preserved.
++- Guest PAM is `pam_permit` and sudo is `NOPASSWD` because there is no real root to authenticate. Do not treat the guest as a sandbox for untrusted code.
++- Loader patching depends on glibc machine code and may fail on some versions.
++- Bind paths cannot contain `:` or `=` (the shim's `PRX_BIND` format uses them as separators).
++
++## Changelog
++
++### Unreleased
+ 
++- Performance: cleaning up guest processes when `prx login` exits no longer forks `tr`/`grep` for every process in `/proc`; the check is pure bash and several times faster on busy hosts (about 5x with a few hundred processes).
++- Performance: `prx list` no longer forks once per container, and the shim reads `/etc/passwd`, `/etc/group` and `/etc/hosts` with a smaller initial buffer.
++- Fix: the shim's `getpw*`, `getgr*` and `/etc/hosts` lookups followed rootfs symlinks out of the rootfs (an absolute `/etc/passwd` link read the *host* file). They now resolve links as if the rootfs were `/`.
++- Fix: `prx login -w DIR` resolves `DIR` inside the rootfs, so a symlink cannot start the session in a host directory.
++- Fix: `ldpatch` writes the patched loader to a temporary file and renames it, so two concurrent logins cannot run a half-written loader and a failed write leaves nothing behind.
++- Fix: the shim is also rebuilt when only `src/ldpatch.c` changed, and the library-path cache is refreshed when the guest's package database (dpkg, rpm, pacman, apk) or, without one, its library directories change.
++- Fix: `prx install` from a URL strips a `#fragment` from the download file name and falls back to a default name when the URL has none.
+ - DNS: the shim now queries IPv6 nameservers as well. `PRX_DNS` and the guest `resolv.conf` may mix IPv4 and IPv6 (the list is comma-separated; a legacy colon-separated IPv4 list still works). Scoped addresses (`fe80::1%eth0`) are not supported and are dropped with a warning. Host-detected servers are ordered IPv4 first.
+ - passwd/group emulation: `/etc/passwd`, `/etc/group` and `/etc/hosts` are read completely (no 48 KiB / 16 KiB cut-off), groups may have any number of members, and the buffers behind `getpwnam`/`getgrnam`-style calls grow on demand. The virtual supplementary-group limit is raised from 64 to 256.
++- Docs: README reorganised; `PRX_KEEP` documented.
+ 
+-## Changes in 1.0.1
++### 1.0.1
+ 
+ - Writes into a rootfs (`login`, `install`) no longer follow symlinks out of it: an absolute link such as `/var/lib/dbus/machine-id -> /etc/machine-id` used to make `cp`/`>` hit the *host* file (dangerous when run as root). All such writes now go through `rpath`, which resolves links as if the rootfs were `/`.
+ - `--bind`: paths longer than 159 bytes were silently ignored by the shim. The limit is now 1023 bytes per path, 50 binds, 16000 bytes in total, and `prx` rejects anything beyond that (and paths containing `:` or `=`) with an error.
+@@ -56,32 +123,6 @@ See `man prx` or `prx help` for all commands and options.
+ - `prx set NAME --hard-mem` alone is now saved (and warns that it needs `-m`).
+ - Minor: per-install `tar.err` temp file, `execveat(NULL)` returns `EFAULT`, group file buffer raised to 64 KiB.
+ 
+-## Changes from the single-file version
+-
+-- C sources moved out of the script into `src/` (`prx source` / `prx ldsource` still print them).
+-- Data dir follows XDG (`~/.local/share/prx`); an existing `~/.prx` is still used.
+-- `prx install NAME URL --sha256 HEX` verifies the archive before extracting; a warning is shown without it.
+-- Shim is rebuilt when `src/prx.c` changes, not only when the script changes.
+-- Added `--version`, manpage, Makefile (PREFIX/DESTDIR), tests.
+-- Runtime behaviour of `login`, `set`, `list`, `fixperm`, `remove` is unchanged.
+-
+-## Known limits (by design)
+-
+-- Not a security boundary (LD_PRELOAD + loader patching; static/raw-syscall binaries can bypass it). This cannot be fixed within an LD_PRELOAD design; it would need a ptrace / seccomp-unotify supervisor or user namespaces.
+-- glibc rootfs only (no musl); x86_64 / aarch64 hosts only. A rootfs of the other architecture runs through qemu-user. An i386 (32-bit x86) rootfs is supported on both host types but only through `qemu-i386`: there is no native i386 mode, not even on x86_64. Programs built with 64-bit `time_t` on i386 (`_TIME_BITS=64`) are covered too: `__stat64_time64`, `__lstat64_time64`, `__fstat64_time64`, `__fstatat64_time64` and `__utimensat64` are hooked and use `statx`, so timestamps past 2038 are preserved.
+-- Guest PAM is `pam_permit` and sudo is `NOPASSWD` because there is no real root to authenticate. Do not treat the guest as a sandbox for untrusted code.
+-- Loader patching depends on glibc machine code and may fail on some versions.
+-- Bind paths cannot contain `:` or `=` (the shim's `PRX_BIND` format uses them as separators).
+-
+-## Packages
+-
+-    packaging/build-deb.sh debian    # -> prx_<ver>_all.deb      (prefix /usr)
+-    packaging/build-deb.sh termux    # -> prx_<ver>_termux_all.deb
+-                                     #    (prefix /data/data/com.termux/files/usr,
+-                                     #     shebang rewritten; Termux has no /usr/bin/env)
+-
+-Termux install: `apt install ./prx_<ver>_termux_all.deb` (or `dpkg -i`, then `apt -f install`).
+-
+ ## License
+ 
+ Apache License 2.0, see [LICENSE](LICENSE).
+diff --git a/examples/debian b/examples/debian
+index 7cb34f3..0498767 100644
+--- a/examples/debian
++++ b/examples/debian
+@@ -17,5 +17,5 @@ virgl_test_server_android &
+ # 5. Wait briefly for servers to initialize
+ sleep 2
+ 
+-# 7. Login to PRoot with shared temporary directories
+-prx login debian --no-root-id --cpus 2 --memory 2G -b $PREFIX/tmp/.X11-unix:/tmp/.X11-unix -b /vendor:/vendor -b /system:/system -b /odm:/odm -b /apex:/apex -b /dev/mali0:/dev/mali0 -b /dev/dri:/dev/dri -b /sdcard:/sdcard -b $PREFIX/tmp/.virgl_test:/tmp/.virgl_test --trace
++# 7. Login to the container with shared temporary directories
++prx login debian --no-root-id --cpus 2 --memory 2G -b $PREFIX/tmp/.X11-unix:/tmp/.X11-unix -b /vendor:/vendor -b /system:/system -b /odm:/odm -b /apex:/apex -b /dev/mali0:/dev/mali0 -b /dev/dri:/dev/dri -b /sdcard:/sdcard -b $PREFIX/tmp/.virgl_test:/tmp/.virgl_test
+diff --git a/man/prx.1 b/man/prx.1
+index e2a6cb2..b316698 100644
+--- a/man/prx.1
++++ b/man/prx.1
+@@ -38,7 +38,7 @@ or
+ at most 50 binds can be given. Invalid binds are rejected with an error.
+ .TP
+ \fB\-w\fR, \fB\-\-workdir\fR \fIDIR\fR
+-Initial working directory (default /root).
++Initial working directory inside the guest, as an absolute path (default /root).
+ .TP
+ \fB\-e\fR, \fB\-\-env\fR \fIKEY=VAL\fR
+ Pass an environment variable.
+@@ -99,6 +99,11 @@ accepted). Invalid entries and scoped addresses such as
+ .I fe80::1%eth0
+ are ignored with a warning.
+ .TP
++.B PRX_KEEP
++Set to 1 to leave guest processes running after
++.B prx login
++exits. By default they are terminated.
++.TP
+ .B PRX_NO_ARGV0
+ Set to 1 to never pass
+ .B \-\-argv0
+diff --git a/prx b/prx
+index a23a0d0..a21bed0 100644
+--- a/prx
++++ b/prx
+@@ -87,7 +87,7 @@ need_src() { SRCDIR="$(prx_srcdir)" || die "C sources not found (set PRX_SRCDIR,
+ shim_stale() {
+ [ -f "$1" ] || return 0
+ need_src
+-[ "$SELF" -nt "$1" ] || [ "$SRCDIR/prx.c" -nt "$1" ]
++[ "$SELF" -nt "$1" ] || [ "$SRCDIR/prx.c" -nt "$1" ] || [ "$SRCDIR/ldpatch.c" -nt "$1" ]
+ }
+ cmd_source()   { need_src; cat "$SRCDIR/prx.c"; }
+ cmd_ldsource() { need_src; cat "$SRCDIR/ldpatch.c"; }
+@@ -203,28 +203,34 @@ fi
+ info "SHA-256 verified"
+ }
+ rootdir() { echo "$PRX_HOME/rootfs/$1"; }
++# prx_session PID: set PRX_SESS to the PRX_SESSION value of a process ("-" if it
++# has none). Pure bash, no fork per process (this runs for every entry of /proc).
++prx_session() {
++local e
++PRX_SESS="-"
++{ while IFS= read -r -d '' e; do
++case "$e" in PRX_SESSION=*) PRX_SESS="${e#PRX_SESSION=}"; break ;; esac
++done < "/proc/$1/environ"; } 2>/dev/null || true
++}
+ prx_reap() {
+ [ "${PRX_KEEP:-0}" = 1 ] && return 0
+ local tok="${1:-}" rdir="${2:-}"
+-local p pid target_pids=""
++local p pid exe_link target_pids="" PRX_SESS="-"
+ trap '' TERM HUP INT
+ kill -TERM -$$ 2>/dev/null || true
+ for p in /proc/[0-9]*; do
+ pid="${p#/proc/}"
+ [ "$pid" = "$$" ] && continue
+-local match=0
+-if [ -n "$tok" ] && tr '\0' '\n' 2>/dev/null < "$p/environ" | grep -qxF "PRX_SESSION=$tok"; then
+-match=1
+-fi
+-if [ "$match" = 0 ] && [ -n "$rdir" ] && ! tr '\0' '\n' 2>/dev/null < "$p/environ" | grep -q '^PRX_SESSION='; then
+-local exe_link; exe_link="$(readlink -f "$p/exe" 2>/dev/null || true)"
++[ -r "$p/environ" ] || continue
++prx_session "$pid"
++if [ -n "$tok" ] && [ "$PRX_SESS" = "$tok" ]; then
++target_pids="$target_pids $pid"
++elif [ "$PRX_SESS" = "-" ] && [ -n "$rdir" ]; then
++exe_link="$(readlink -f "$p/exe" 2>/dev/null || true)"
+ case "$exe_link" in
+-"$rdir"|"$rdir"/*) match=1 ;;
++"$rdir"|"$rdir"/*) target_pids="$target_pids $pid" ;;
+ esac
+ fi
+-if [ "$match" = 1 ]; then
+-target_pids="$target_pids $pid"
+-fi
+ done
+ [ -z "$target_pids" ] && return 0
+ kill -TERM $target_pids 2>/dev/null || true
+@@ -418,7 +424,9 @@ dest="$(rootdir "$name")"
+ mkdir -p "$PRX_HOME/dl"
+ case "$src" in
+ http://*|https://*)
+-file="$PRX_HOME/dl/$(basename "${src%%\?*}")"
++local base="${src%%\?*}"; base="${base%%#*}"; base="${base%/}"; base="${base##*/}"
++case "$base" in ""|.|..) base="rootfs-$name.tar" ;; esac
++file="$PRX_HOME/dl/$base"
+ command -v curl >/dev/null || die "curl not found"
+ info "Downloading $src ..."
+ curl -fL --retry 3 -o "$file" "$src" || die "Download failed"
+@@ -882,13 +890,23 @@ for d in \
+ LP="${LP:+$LP:}$d"
+ done
+ [ -n "${PLCD:-}" ] && LP="$PLCD:$LP"
+-local cf cache="$PRX_HOME/lib/libpath-$name" dpkgstat="$R/var/lib/dpkg/status" stale=0
++local cf cache="$PRX_HOME/lib/libpath-$name" stale=0 dbf pkgdb=0
+ if [ ! -s "$cache" ]; then
+ stale=1
+-elif [ -f "$dpkgstat" ]; then
+-[ "$dpkgstat" -nt "$cache" ] && stale=1
+ else
+-[ "$R/usr" -nt "$cache" ] && stale=1
++# the package database changes whenever libraries are installed or removed
++for dbf in "$R/var/lib/dpkg/status" "$R/var/lib/rpm" "$R/var/lib/pacman/local" "$R/lib/apk/db/installed"; do
++if [ -e "$dbf" ]; then
++pkgdb=1
++[ "$dbf" -nt "$cache" ] && stale=1
++fi
++done
++# no known package manager: fall back to the library directories themselves
++if [ "$pkgdb" = 0 ]; then
++for dbf in "$R/usr" "$R/usr/lib" "$R/usr/lib64" "$R/lib" "$R/lib64" "$R/usr/local/lib"; do
++[ -d "$dbf" ] && [ "$dbf" -nt "$cache" ] && stale=1
++done
++fi
+ fi
+ if [ "$stale" = 1 ]; then
+ local -a scan=()
+@@ -914,7 +932,8 @@ done
+ local SH; SH="$(find_shell "$R")" || die "No suitable shell (bash/sh) found in rootfs"
+ local gshell=/bin/bash
+ case "$SH" in */sh) gshell=/bin/sh ;; esac
+-local startdir="$R$wd"; [ -d "$startdir" ] || { startdir="$R"; wd=/; }
++local startdir; startdir="$(rpath "$R" "$wd")" || startdir=""
++[ -n "$startdir" ] && [ -d "$startdir" ] || { startdir="$R"; wd=/; }
+ local -a prog
+ if [ $# -eq 0 ]; then
+ prog=("$SH" -l)
+@@ -989,7 +1008,7 @@ if [ -d "$PRX_HOME/rootfs" ]; then
+ local found=0
+ for d in "$PRX_HOME/rootfs"/*; do
+ [ -d "$d" ] || continue
+-echo "$(basename "$d")"
++echo "${d##*/}"
+ found=1
+ done
+ [ "$found" = 1 ] || echo "(no rootfs installed yet)"
+diff --git a/src/ldpatch.c b/src/ldpatch.c
+index c972e97..1b274aa 100644
+--- a/src/ldpatch.c
++++ b/src/ldpatch.c
+@@ -3,6 +3,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/stat.h>
++#include <unistd.h>
+ int main(int argc, char**argv) {
+     if (argc != 3) {
+         fprintf(stderr, "usage: ldpatch INPUT_ELF OUTPUT_ELF\n");
+@@ -47,16 +48,29 @@ int main(int argc, char**argv) {
+             if ((o&0x7C000000u) == 0x14000000u || o == 0xD65F03C0u) break;
+         }
+     }
+-    f = fopen(argv[2], "wb");
+-    if (!f || fwrite(buf, 1, (size_t) sz, f) != (size_t) sz) {
+-        if (f) fclose(f);
++    /* Write to a temporary file and rename it into place, so that a second
++       "prx login" running at the same time never executes a half-written
++       loader and a failed write never leaves a truncated output behind. */
++    char*tmp = (char*) malloc(strlen(argv[2])+32);
++    if (!tmp) {
++        free(buf);
++        fprintf(stderr, "ldpatch: out of memory\n");
++        return 1;
++    }
++    sprintf(tmp, "%s.tmp.%ld", argv[2], (long) getpid());
++    f = fopen(tmp, "wb");
++    int bad = !f || fwrite(buf, 1, (size_t) sz, f) != (size_t) sz;
++    if (f && fclose(f) != 0) bad = 1;
++    if (!bad && (chmod(tmp, 0755) != 0 || rename(tmp, argv[2]) != 0)) bad = 1;
++    if (bad) {
++        remove(tmp);
++        free(tmp);
+         free(buf);
+         fprintf(stderr, "ldpatch: failed writing to %s\n", argv[2]);
+         return 1;
+     }
+-    fclose(f);
++    free(tmp);
+     free(buf);
+-    chmod(argv[2], 0755);
+     printf("%d\n", patched);
+     return 0;
+ }
+diff --git a/src/prx.c b/src/prx.c
+index 6eddd6e..0e996a2 100644
+--- a/src/prx.c
++++ b/src/prx.c
+@@ -3046,14 +3046,20 @@ static u32 atou(const char*s) {
+ #define READ_ALL_MAX (64L*1024*1024)
+ static char*read_rel_all(const char*rel, long*lenp) {
+     char p[PM];
+-    size_t rl = strlen(rel);
++    const char*h;
+     if (lenp)*lenp = 0;
+-    if (!g_rl || g_rl+rl+1 >= PM) return NULL;
+-    memcpy(p, g_root, g_rl);
+-    memcpy(p+g_rl, rel, rl+1);
+-    long fd = SC4(N_openat, AT_FDCWD, p, O_RDONLY|O_CLOEXEC, 0);
++    if (!g_rl) return NULL;
++    /* Resolve symlinks as the guest would (absolute links stay inside the
++       rootfs); a plain root+rel open would follow e.g. /etc/passwd -> /host/x
++       out of the rootfs. */
++    int sv = geterr();
++    if (tr(AT_FDCWD, rel, p, 1, &h)<0) {
++        *__errno_location() = sv;
++        return NULL;
++    }
++    long fd = SC4(N_openat, AT_FDCWD, h, O_RDONLY|O_CLOEXEC, 0);
+     if (fd<0) return NULL;
+-    size_t cap = 65536, len = 0;
++    size_t cap = 16384, len = 0;
+     char*b = malloc(cap);
+     if (!b) {
+         sc(N_close, fd, 0, 0, 0, 0, 0);
+diff --git a/tests/smoke.sh b/tests/smoke.sh
+index dae575f..476d306 100644
+--- a/tests/smoke.sh
++++ b/tests/smoke.sh
+@@ -141,6 +141,32 @@ echo "$out" | grep -q 'buf 1 byte: r=-1 errno=22' && ok "sched_getaffinity repor
+ bd="$T/lb"; while [ "${#bd}" -lt 400 ]; do bd="$bd/$(printf 'b%.0s' $(seq 1 60))"; done
+ mkdir -p "$bd"; echo bound > "$bd/f"
+ [ "$(env -i PRX_ROOTFS="$T/fs" PRX_SHIM="$SHIMSO" LD_PRELOAD="$SHIMSO" PRX_BIND="$bd" "$(command -v cat)" "$bd/f" 2>/dev/null)" = bound ] && ok "bind path > 159 bytes works" || fail "bind path > 159 bytes works"
++# passwd lookups follow rootfs symlinks inside the rootfs, never out of it
++cat > "$T/pw.c" <<'CEOF'
++#include <pwd.h>
++#include <stdio.h>
++int main(int c, char **v) {
++    struct passwd *p = c > 1 ? getpwnam(v[1]) : 0;
++    puts(p ? p->pw_name : "(null)");
++    return 0;
++}
++CEOF
++"$CCB" -o "$T/pw" "$T/pw.c"
++mkdir -p "$T/fsl/etc" "$T/fsl2/etc" "$T/fsl2/data"
++echo 'hostonly:x:4242:4242::/h:/bin/sh' > "$T/hostpw"
++ln -s "$T/hostpw" "$T/fsl/etc/passwd"
++echo 'insider:x:4343:4343::/h:/bin/sh' > "$T/fsl2/data/pw"
++ln -s ../data/pw "$T/fsl2/etc/passwd"
++[ "$(env -i PRX_ROOTFS="$T/fsl" PRX_SHIM="$SHIMSO" LD_PRELOAD="$SHIMSO" "$T/pw" hostonly)" = "(null)" ] && ok "absolute /etc/passwd symlink cannot reach host files" || fail "absolute /etc/passwd symlink cannot reach host files"
++[ "$(env -i PRX_ROOTFS="$T/fsl2" PRX_SHIM="$SHIMSO" LD_PRELOAD="$SHIMSO" "$T/pw" insider)" = "insider" ] && ok "relative /etc/passwd symlink inside the rootfs works" || fail "relative /etc/passwd symlink inside the rootfs works"
++fi
++# ldpatch writes atomically: no temp file is left behind, also on failure
++LDP="$HOME/.local/share/prx/lib/ldpatch"
++if [ -x "$LDP" ]; then
++cp "$(command -v cat)" "$T/ldin"
++"$LDP" "$T/ldin" "$T/ldout" >/dev/null && [ -x "$T/ldout" ] && cmp -s "$T/ldin" "$T/ldout" && ok "ldpatch output written and executable" || fail "ldpatch output written and executable"
++if "$LDP" "$T/ldin" "$T/nodir/out" 2>/dev/null; then fail "ldpatch ignored a write error"; fi
++ls "$T"/ldout.tmp.* "$T"/nodir 2>/dev/null | grep -q . && fail "ldpatch left a temp file" || ok "ldpatch leaves no temp file behind"
+ fi
+ # ------------------------------------------------------------------------
+ 
