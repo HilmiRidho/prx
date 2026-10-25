@@ -43,24 +43,12 @@ Initial working directory (default /root).
 \fB\-e\fR, \fB\-\-env\fR \fIKEY=VAL\fR
 Pass an environment variable.
 .TP
-\fB\-c\fR, \fB\-\-cpus\fR \fIN\fR
-CPU cores seen by the guest (0 = no limit).
-.TP
-\fB\-m\fR, \fB\-\-memory\fR \fISIZE\fR
-RAM seen by the guest, e.g. 512M or 2G (0 = no limit).
-.TP
-.B \-\-hard\-mem
-With \-\-memory, also enforce a hard cap via ulimit \-v.
-.TP
 .B \-\-no\-root\-id
 Run as the host user instead of fake root.
 .TP
 .B \-\-trace
 Debug syscall and seccomp tracing.
 .RE
-.TP
-\fBset\fR \fINAME\fR [\fB\-c\fR \fIN\fR] [\fB\-m\fR \fISIZE\fR] [\fB\-\-hard\-mem\fR|\fB\-\-no\-hard\-mem\fR] [\fB\-\-reset\fR] [\fB\-\-show\fR]
-Save default limits for a container.
 .TP
 .B list
 List installed containers.
@@ -120,6 +108,3 @@ Container root filesystems.
 .TP
 .I $PRX_HOME/lib
 Per-user built shim and patched loaders.
-.TP
-.I $PRX_HOME/conf/NAME.conf
-Saved resource limits.

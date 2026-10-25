@@ -23,7 +23,7 @@ The shim is compiled per user on the first `prx login` (or explicitly with `prx 
 
     prx install debian rootfs.tar.gz --sha256 <HEX>   # or a URL instead of a file
     prx login debian                                  # shell as fake root
-    prx login debian -c 2 -m 2G -- uname -a           # limited CPUs/RAM, run one command
+    prx login debian -- uname -a                      # run one command
     prx list                                          # installed containers
 
 See `man prx` or `prx help` for all commands and options.
@@ -43,6 +43,8 @@ See `man prx` or `prx help` for all commands and options.
 
 ## Unreleased
 
+- Removed the CPU/memory limit feature: `prx login -c/--cpus`, `-m/--memory`, `--hard-mem`, the `prx set` command, saved `conf/NAME.conf` limits and the shim's emulation of `/proc/cpuinfo`, `/proc/meminfo`, `/proc/stat` (limit variant), `/sys/devices/system/cpu/*`, `sysinfo`, `sysconf` (CPU/RAM) and `get_nprocs*`. The guest now sees the real host CPU count and RAM.
+- Removed the spoofed kernel identity and canned `/proc` data: `uname` no longer overrides sysname/release/version (guest sees the host kernel), and `/proc/version`, `/proc/sys/kernel/osrelease`, `/proc/uptime`, `/proc/loadavg`, `/proc/filesystems` and the hard-coded `/proc/stat` fallback are no longer faked. Values derived from options the user sets (`-c`, `-m`, binds, `/proc/mounts`) are still emulated.
 - DNS: the shim now queries IPv6 nameservers as well. `PRX_DNS` and the guest `resolv.conf` may mix IPv4 and IPv6 (the list is comma-separated; a legacy colon-separated IPv4 list still works). Scoped addresses (`fe80::1%eth0`) are not supported and are dropped with a warning. Host-detected servers are ordered IPv4 first.
 - passwd/group emulation: `/etc/passwd`, `/etc/group` and `/etc/hosts` are read completely (no 48 KiB / 16 KiB cut-off), groups may have any number of members, and the buffers behind `getpwnam`/`getgrnam`-style calls grow on demand. The virtual supplementary-group limit is raised from 64 to 256.
 

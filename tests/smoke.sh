@@ -48,20 +48,10 @@ grep -q 'mismatch' "$T/err" && ok "wrong --sha256 is rejected"
 "$PRX" install t2 "$T/fs.tar.gz" 2>&1 | grep -q 'not verified' && ok "warns when no checksum given"
 "$PRX" list | grep -qx t1 && ok "list"
 
-# limits
-"$PRX" set t1 -c 1 -m 512M | grep -q 'memory=512 MiB' && ok "set -m 512M"
-"$PRX" set t1 -m 1X 2>/dev/null && fail "bad memory size accepted"
-ok "rejects bad memory size"
 # ---- 1.0.1 regression tests -------------------------------------------
 # unknown option must not be run as a command
 if "$PRX" login t1 --bogus 2>"$T/err"; then fail "unknown login option accepted"; fi
 grep -q "Unknown option for 'login'" "$T/err" && ok "login rejects unknown option" || fail "login rejects unknown option"
-# --hard-mem alone is persisted
-"$PRX" set t1 --reset >/dev/null
-"$PRX" set t1 --hard-mem 2>/dev/null | grep -q 'hard cap enabled' && ok "set --hard-mem alone is kept" || fail "set --hard-mem alone is kept"
-grep -qx 'hard=1' "$HOME/.local/share/prx/conf/t1.conf" && ok "hard=1 stored in conf" || fail "hard=1 stored in conf"
-"$PRX" set t1 --reset >/dev/null
-
 # bind validation: too long / ambiguous ':'
 long="/$(printf 'x%.0s' $(seq 1 1100))"
 if "$PRX" login t1 -b "$T:$long" 2>"$T/err"; then fail "overlong bind accepted"; fi

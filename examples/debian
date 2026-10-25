@@ -18,4 +18,4 @@ virgl_test_server_android &
 sleep 2
 
 # 7. Login to PRoot with shared temporary directories
-prx login debian --no-root-id --cpus 2 --memory 2G -b $PREFIX/tmp/.X11-unix:/tmp/.X11-unix -b /vendor:/vendor -b /system:/system -b /odm:/odm -b /apex:/apex -b /dev/mali0:/dev/mali0 -b /dev/dri:/dev/dri -b /sdcard:/sdcard -b $PREFIX/tmp/.virgl_test:/tmp/.virgl_test --trace
+prx login debian --no-root-id -b $PREFIX/tmp/.X11-unix:/tmp/.X11-unix -b /vendor:/vendor -b /system:/system -b /odm:/odm -b /apex:/apex -b /dev/mali0:/dev/mali0 -b /dev/dri:/dev/dri -b /sdcard:/sdcard -b $PREFIX/tmp/.virgl_test:/tmp/.virgl_test --trace
