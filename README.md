@@ -38,7 +38,6 @@ See `man prx` or `prx help` for all commands and options.
     packaging/     build-deb.sh [debian|termux]
     Makefile       install / uninstall / lint / check
     debian         example Termux launcher script (PulseAudio + Termux:X11 + `prx login debian`)
-    prx-1.0.1-fixes.patch   patch that produced 1.0.1 from 1.0.0
     LICENSE        Apache License 2.0
 
 ## Unreleased
