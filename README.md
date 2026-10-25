@@ -9,7 +9,7 @@ User-space container / path-translation engine (glibc rootfs, no root needed).
 - A host running Linux on x86_64 or aarch64 (including Termux on Android).
 - `bash` 4.3 or newer, plus `coreutils`, `tar`, `findutils`, `sed` and `grep`.
 - `gcc` or `clang`, used to compile the shim.
-- Optional: `curl` (installing from a URL), `taskset` (pins `--cpus` to host CPUs), and `qemu-user` (plus `lld` for cross-building the shim) to run a rootfs of the other architecture (or an i386 rootfs, which is qemu-only).
+- Optional: `curl` (installing from a URL), and `qemu-user` (plus `lld` for cross-building the shim) to run a rootfs of the other architecture (or an i386 rootfs, which is qemu-only).
 
 ## Install
 
@@ -32,7 +32,7 @@ Termux install: `apt install ./prx_<ver>_termux_all.deb` (or `dpkg -i`, then `ap
 
     prx install debian rootfs.tar.gz --sha256 <HEX>   # or a URL instead of a file
     prx login debian                                  # shell as fake root
-    prx login debian -c 2 -m 2G -- uname -a           # limited CPUs/RAM, run one command
+    prx login debian -- uname -a                      # run one command
     prx login debian --no-root-id -b /sdcard          # run as the host user, bind a host path
     prx list                                          # installed containers
 
@@ -45,7 +45,6 @@ See `man prx` or `prx help` for all commands and options.
 | `prx build` | Compile the shim and the loader patcher. |
 | `prx install NAME FILE\|URL [--sha256 HEX]` | Extract a rootfs archive as container `NAME`; the checksum is verified before extraction. |
 | `prx login NAME [options] [-- cmd]` | Start a shell, or run one command, inside the container. |
-| `prx set NAME [options]` | Save default CPU / memory limits for a container. |
 | `prx list` | List installed containers. |
 | `prx fixperm NAME` | Repair permissions and flush the library-path cache. |
 | `prx remove NAME` | Delete a container and its derived files. |
@@ -59,9 +58,6 @@ See `man prx` or `prx help` for all commands and options.
 | `-b, --bind PATH` / `HOST:GUEST` | Bind a host path into the guest (max 50 binds, each path < 1024 bytes, no `:` or `=`). |
 | `-w, --workdir DIR` | Initial working directory inside the guest (default `/root`). |
 | `-e, --env KEY=VAL` | Pass an environment variable. |
-| `-c, --cpus N` | CPU cores seen by the guest (`0` = no limit); pinned with `taskset` when available. |
-| `-m, --memory SIZE` | RAM seen by the guest, e.g. `512M`, `2G` (`0` = no limit, minimum 16M). |
-| `--hard-mem` | With `--memory`, also enforce a hard cap with `ulimit -v`. |
 | `--no-root-id` | Run as the host user instead of fake root; `sudo` and `su` still work. |
 | `--trace` | Debug syscall and seccomp tracing. |
 
@@ -98,6 +94,10 @@ See `man prx` or `prx help` for all commands and options.
 - Bind paths cannot contain `:` or `=` (the shim's `PRX_BIND` format uses them as separators).
 
 ## Changelog
+
+### Unreleased
+
+- Removed the CPU / RAM limit feature: `prx login -c/--cpus`, `-m/--memory`, `--hard-mem`, the `prx set` command, the `PRX_CPUS` / `PRX_MEM_KB` shim variables and the fake `/proc/cpuinfo`, `/proc/meminfo`, `sysinfo`, `sysconf` and `get_nprocs` views. The guest now sees the host's real CPUs and RAM. Leftover `conf/NAME.conf` files are ignored (and deleted by `prx remove`).
 
 ### 1.0.1
 

@@ -36,17 +36,8 @@ Usage:
                                      (paths < 1024 bytes, no ':' or '=' inside, max 50 binds)
         -w, --workdir DIR            Initial working directory (default: /root)
         -e, --env KEY=VAL            Pass custom environment variable
-        -c, --cpus N                 Limit CPU cores seen by the guest to N (0 = no limit)
-        -m, --memory SIZE            Limit RAM seen by the guest, e.g. 512M, 2G (0 = no limit)
-        --hard-mem                   With --memory: also enforce a hard cap (ulimit -v)
         --no-root-id                 Run as the host user (host name/UID/GID); sudo/su still work
         --trace                      Enable debug syscall & seccomp tracing
-  prx set NAME [options]             Save default CPU/memory limits for a container
-        -c, --cpus N                 Default CPU cores (0 = clear)
-        -m, --memory SIZE            Default memory (0 = clear)
-        --hard-mem | --no-hard-mem   Enable/disable hard memory cap by default
-        --reset                      Clear all saved limits
-        --show                       Show saved limits (default when no option given)
   prx list                           List all installed rootfs containers
   prx fixperm NAME                   Fix file permissions & clear cache
   prx remove NAME                    Completely remove a container
@@ -571,121 +562,6 @@ fh="$(rpath "$R" "/$f" nofollow)"
 if [ -f "$fh" ] && [ ! -L "$fh" ]; then chmod u+s "$fh" 2>/dev/null || true; fi
 done
 }
-host_cpus() {
-local n=""
-n="$(nproc 2>/dev/null)" || n=""
-case "$n" in ""|*[!0-9]*|0) n="$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)" || n="" ;; esac
-case "$n" in ""|*[!0-9]*|0) n=1 ;; esac
-echo "$n"
-}
-host_mem_kb() {
-local m=""
-m="$(sed -n 's/^MemTotal:[[:space:]]*\([0-9]*\).*/\1/p' /proc/meminfo 2>/dev/null | head -n1)" || m=""
-echo "${m:-0}"
-}
-chk_cpus() {
-case "$1" in ""|*[!0-9]*) die "--cpus requires a positive integer (got '$1')" ;; esac
-[ "${#1}" -le 5 ] && [ "$((10#$1))" -ge 1 ] && [ "$((10#$1))" -le 4096 ] || die "--cpus must be between 1 and 4096 (got '$1')"
-}
-parse_mem_kb() {
-local s="$1" num unit kb
-case "$s" in ""|*[!0-9A-Za-z]*) return 1 ;; esac
-num="${s%%[!0-9]*}"
-unit="${s#"$num"}"
-[ -n "$num" ] && [ "${#num}" -le 12 ] || return 1
-num=$((10#$num))
-case "$unit" in
-[kK]|[kK][bB]|[kK][iI][bB]) kb=$num ;;
-""|[mM]|[mM][bB]|[mM][iI][bB]) kb=$((num*1024)) ;;
-[gG]|[gG][bB]|[gG][iI][bB]) kb=$((num*1048576)) ;;
-*) return 1 ;;
-esac
-[ "$kb" -ge 16384 ] || return 1
-echo "$kb"
-}
-cpu_pick() {
-local n="$1" allowed="" out="" cnt=0 part a b i
-if [ -r /proc/self/status ]; then
-allowed="$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status 2>/dev/null | head -n1)" || allowed=""
-fi
-[ -n "$allowed" ] || allowed="0-$(( $(host_cpus) - 1 ))"
-local IFS=,
-for part in $allowed; do
-case "$part" in
-*-*) a="${part%-*}"; b="${part#*-}" ;;
-*) a="$part"; b="$part" ;;
-esac
-case "$a$b" in ""|*[!0-9]*) continue ;; esac
-i=$a
-while [ "$i" -le "$b" ] && [ "$cnt" -lt "$n" ]; do
-out="${out:+$out,}$i"; cnt=$((cnt+1)); i=$((i+1))
-done
-[ "$cnt" -lt "$n" ] || break
-done
-echo "$out"
-}
-CFG_CPUS=""; CFG_MEM_KB=""; CFG_HARD=0
-load_conf() {
-CFG_CPUS=""; CFG_MEM_KB=""; CFG_HARD=0
-local cf="$PRX_HOME/conf/$1.conf" k v
-[ -f "$cf" ] || return 0
-while IFS='=' read -r k v || [ -n "$k" ]; do
-case "$v" in ""|*[!0-9]*) continue ;; esac
-case "$k" in
-cpus) CFG_CPUS="$v" ;;
-mem_kb) CFG_MEM_KB="$v" ;;
-hard) CFG_HARD="$v" ;;
-esac
-done < "$cf"
-return 0
-}
-save_conf() {
-local cf="$PRX_HOME/conf/$1.conf"
-if [ -z "$CFG_CPUS" ] && [ -z "$CFG_MEM_KB" ] && [ "$CFG_HARD" != 1 ]; then rm -f "$cf"; return 0; fi
-mkdir -p "$PRX_HOME/conf"
-{
-[ -z "$CFG_CPUS" ] || echo "cpus=$CFG_CPUS"
-[ -z "$CFG_MEM_KB" ] || echo "mem_kb=$CFG_MEM_KB"
-echo "hard=$CFG_HARD"
-} > "$cf"
-}
-show_conf() {
-local c="unlimited" m="unlimited"
-[ -z "$CFG_CPUS" ] || c="$CFG_CPUS"
-if [ -n "$CFG_MEM_KB" ]; then
-m="$((CFG_MEM_KB/1024)) MiB"
-if [ "$CFG_HARD" = 1 ]; then m="$m (hard cap)"; fi
-elif [ "$CFG_HARD" = 1 ]; then
-m="unlimited (hard cap enabled, applies once a limit is set)"
-fi
-echo "$1: cpus=$c memory=$m"
-}
-cmd_set() {
-[ $# -ge 1 ] || { usage; exit 1; }
-local name="$1"; shift
-chk "$name"
-[ -d "$(rootdir "$name")" ] || die "Rootfs '$name' does not exist. Use: prx install $name ARCHIVE"
-load_conf "$name"
-local changed=0
-while [ $# -gt 0 ]; do
-case "$1" in
--c|--cpus) [ $# -ge 2 ] || die "-c/--cpus requires a number"
-case "$2" in 0|default|none) CFG_CPUS="" ;; *) chk_cpus "$2"; CFG_CPUS=$((10#$2)) ;; esac
-changed=1; shift 2 ;;
--m|--memory) [ $# -ge 2 ] || die "-m/--memory requires a size (e.g. 512M, 2G)"
-case "$2" in 0|default|none) CFG_MEM_KB="" ;; *) CFG_MEM_KB="$(parse_mem_kb "$2")" || die "Invalid memory size '$2' (examples: 512M, 2G; minimum 16M)" ;; esac
-changed=1; shift 2 ;;
---hard-mem) CFG_HARD=1; changed=1; shift ;;
---no-hard-mem) CFG_HARD=0; changed=1; shift ;;
---reset) CFG_CPUS=""; CFG_MEM_KB=""; CFG_HARD=0; changed=1; shift ;;
---show) shift ;;
-*) die "Unknown option for 'set': $1" ;;
-esac
-done
-[ "$changed" = 0 ] || save_conf "$name"
-if [ "$CFG_HARD" = 1 ] && [ -z "$CFG_MEM_KB" ]; then warn "--hard-mem has no effect until a memory limit is set (-m)"; fi
-show_conf "$name"
-}
 # The shim keeps at most 64 binds (14 are built in), each path < 1024 bytes,
 # and reads them from one PRX_BIND variable of < 16384 bytes. Refuse anything
 # larger instead of letting the shim drop it silently.
@@ -700,13 +576,10 @@ cmd_login() {
 [ $# -ge 1 ] || { usage; exit 1; }
 local name="$1"; shift
 local R binds="" nbinds=0 wd=/root wdset=0 fake=1 bh bg trace=0
-local cpus="" mem_kb="" hard=0
-local -a extra_envs=() pin=()
+local -a extra_envs=()
 chk "$name"
 R="$(rootdir "$name")"
 [ -d "$R" ] || die "Rootfs '$name' does not exist. Use: prx install $name ARCHIVE"
-load_conf "$name"
-cpus="$CFG_CPUS"; mem_kb="$CFG_MEM_KB"; hard="$CFG_HARD"
 mkdir -p "$(rpath "$R" /etc/pam.d)" "$(rpath "$R" /etc/sudoers.d)"
 for pam_svc in sudo su chfn chsh login other sshd; do
 rwfile "$R" "/etc/pam.d/$pam_svc" 'auth sufficient pam_permit.so\naccount sufficient pam_permit.so\nsession sufficient pam_permit.so\npassword sufficient pam_permit.so\n'
@@ -774,38 +647,11 @@ shift 2 ;;
 -e|--env)     [ $# -ge 2 ] || die "-e requires KEY=VALUE"; extra_envs+=("$2"); shift 2 ;;
 --no-root-id) fake=0; shift ;;
 --trace)      trace=1; shift ;;
--c|--cpus)    [ $# -ge 2 ] || die "-c/--cpus requires a number"
-case "$2" in 0|default|none) cpus="" ;; *) chk_cpus "$2"; cpus=$((10#$2)) ;; esac
-shift 2 ;;
--m|--memory)  [ $# -ge 2 ] || die "-m/--memory requires a size (e.g. 512M, 2G)"
-case "$2" in 0|default|none) mem_kb="" ;; *) mem_kb="$(parse_mem_kb "$2")" || die "Invalid memory size '$2' (examples: 512M, 2G; minimum 16M)" ;; esac
-shift 2 ;;
---hard-mem)   hard=1; shift ;;
 --) shift; break ;;
 -*) die "Unknown option for 'login': $1 (put '--' before the command if it starts with '-')" ;;
 *) break ;;
 esac
 done
-if [ -n "$cpus" ]; then
-local hc; hc="$(host_cpus)"
-if [ "$cpus" -gt "$hc" ]; then
-warn "Requested $cpus CPUs but the host exposes only $hc; using $hc"
-cpus="$hc"
-fi
-local clist; clist="$(cpu_pick "$cpus")"
-if [ -n "$clist" ] && command -v taskset >/dev/null 2>&1 && taskset -c "$clist" true >/dev/null 2>&1; then
-pin=(taskset -c "$clist")
-else
-warn "taskset is unavailable here: CPU limit is virtual only (guest view), not pinned on the host"
-fi
-fi
-if [ -n "$mem_kb" ]; then
-local hm; hm="$(host_mem_kb)"
-if [ "$hm" -gt 0 ] && [ "$mem_kb" -gt "$hm" ]; then
-warn "Requested memory exceeds host RAM; using $((hm/1024)) MiB"
-mem_kb="$hm"
-fi
-fi
 local vuser="" vhome="/root"
 if [ "$fake" = 0 ]; then
 local huid hgid hu
@@ -959,9 +805,6 @@ user_val="$vuser"
 home_val="$vhome"
 fi
 local cur_dns; cur_dns="$(detect_dns)"
-if [ -n "$mem_kb" ] && [ "$hard" = 1 ]; then
-ulimit -v "$mem_kb" 2>/dev/null || warn "Could not apply hard memory cap (ulimit -v)"
-fi
 local -a ldenv=() runner=() argv0opt=()
 [ "$NOARGV0" = 1 ] || argv0opt=(--argv0 "$(basename "$gshell")")
 if [ -n "$QEMU" ]; then
@@ -974,7 +817,7 @@ runner=("$QEMU")
 else
 ldenv=(LD_LIBRARY_PATH="$LP" LD_PRELOAD="$SHIM")
 fi
-${pin[@]+"${pin[@]}"} env -i \
+env -i \
 HOME="$home_val" USER="$user_val" LOGNAME="$user_val" SHELL="$gshell" \
 TERM="${TERM:-xterm-256color}" LANG="$LANGV" \
 LOCPATH="$R/usr/lib/locale" GCONV_PATH="$GCONV" \
@@ -983,7 +826,6 @@ PRX_ROOTFS="$R" PRX_SHIM="$SHIM" PRX_LIBPATH="$LP" PRX_BIND="$binds" \
 PRX_SESSION="$tok" PRX_SELF_EXE="$gshell" \
 PRX_DNS="$cur_dns" PRX_FAKEROOT="$fake" PRX_VUSER="$vuser" \
 PRX_TRACE="$trace" PRX_LOADER="$PL" PRX_NO_ARGV0="$NOARGV0" \
-PRX_CPUS="${cpus:-0}" PRX_MEM_KB="${mem_kb:-0}" \
 GLIBC_TUNABLES="${GLIBC_TUNABLES:-glibc.pthread.rseq=0}" \
 ${ldenv[@]+"${ldenv[@]}"} \
 ${term_envs[@]+"${term_envs[@]}"} \
@@ -1030,7 +872,6 @@ case "${1:-}" in
 build) shift; cmd_build "$@" ;;
 install) shift; cmd_install "$@" ;;
 login) shift; cmd_login "$@" ;;
-set) shift; cmd_set "$@" ;;
 list) cmd_list ;;
 fixperm) shift; cmd_fixperm "$@" ;;
 remove) shift; cmd_remove "$@" ;;

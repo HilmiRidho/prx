@@ -383,8 +383,6 @@ static char g_dns[512] = "8.8.8.8,1.1.1.1";
 static char g_self_exe[PM];
 static int g_fake;
 static int g_trace;
-static int g_ncpu;
-static u64 g_memkb;
 static u32 g_ruid, g_rgid;
 /* virtual credentials for --no-root-id (host user, setuid/sudo emulation) */
 static int g_user;
@@ -491,29 +489,11 @@ EXP int sched_getaffinity(int pid, size_t cpusetsize, void*mask) {
            papered over with a synthetic mask so nproc & co. keep working. */
         int blocked = r == -ENOSYS || ((r == -EPERM || r == -EACCES) && pid == 0);
         if (!blocked || !mask || cpusetsize == 0) return (int) ret(r);
-        if (g_ncpu > 0) {
-            memset(m, 0, cpusetsize);
-            for (int i = 0; i<g_ncpu && (size_t)(i/8)<cpusetsize; i++) m[i/8] |= (u8)(1u<<(i%8));
-        } else {
-            memset(m, 0xff, cpusetsize);
-        }
+        memset(m, 0xff, cpusetsize);
         return 0;
     }
     size_t got = (size_t) r < cpusetsize ? (size_t) r : cpusetsize;
     if (got<cpusetsize) memset(m+got, 0, cpusetsize-got);
-    if (g_ncpu>0) {
-        int left = g_ncpu;
-        for (size_t b = 0; b<got*8; b++) {
-            if (m[b/8]&(1u<<(b%8))) {
-                if (left>0) left--;
-                else m[b/8] &= (u8)~(1u<<(b%8));
-            }
-        }
-        if (left == g_ncpu) {
-            memset(m, 0, cpusetsize);
-            for (int i = 0; i<g_ncpu && (size_t)(i/8)<cpusetsize; i++) m[i/8] |= (u8)(1u<<(i%8));
-        }
-    }
     return 0;
 }
 static void sys_handler(int sig, void*info, void*uc) {
@@ -567,11 +547,6 @@ static void prx_do_init(char**envp) {
         else if (envmatch(s, "PRX_NO_ARGV0")) g_noargv0 = (s[13] == '1');
         else if (envmatch(s, "PRX_TRACE")) g_trace = (s[10] == '1');
         else if (envmatch(s, "PRX_FAKEROOT")) g_fake = (s[13] == '1');
-        else if (envmatch(s, "PRX_CPUS")) {
-            u64 v = parse_u64(s+9);
-            g_ncpu = v>4096 ? 4096 : (int) v;
-        }
-        else if (envmatch(s, "PRX_MEM_KB")) g_memkb = parse_u64(s+11);
         else if (envmatch(s, "PRX_VUSER")) copyval(g_vuser, sizeof g_vuser, s+10);
         else if (envmatch(s, "PRX_CRED")) copyval(g_credbuf, sizeof g_credbuf, s+9);
     }
@@ -965,177 +940,6 @@ static int lr_line(struct lr*r, char*o, size_t cap) {
     o[n] = 0;
     return (int) n;
 }
-static u64 line_val(const char*s) {
-    while (*s && *s != ':') s++;
-    if (*s == ':') s++;
-    while (*s == ' ' || *s == '\t') s++;
-    return parse_u64(s);
-}
-static u64 umin(u64 a, u64 b) {
-    return a<b ? a : b;
-}
-static int fake_cpurange(void) {
-    struct fb f;
-    if (fake_begin(&f)<0) return-1;
-    if (g_ncpu>1) {
-        fb_str(&f, "0-");
-        fb_num(&f, (u64)(g_ncpu-1));
-    } else fb_str(&f, "0");
-    fb_str(&f, "\n");
-    return fake_end(&f);
-}
-static int fake_stat(void) {
-    static const u64 v[10] = {21200, 450, 12300, 954000, 3200, 120, 80, 0, 0, 0};
-    struct fb f;
-    if (fake_begin(&f)<0) return-1;
-    fb_str(&f, "cpu ");
-    for (int k = 0; k<10; k++) {
-        fb_str(&f, " ");
-        fb_num(&f, v[k]);
-    }
-    fb_str(&f, "\n");
-    for (int i = 0; i<g_ncpu; i++) {
-        fb_str(&f, "cpu");
-        fb_num(&f, (u64) i);
-        for (int k = 0; k<10; k++) {
-            fb_str(&f, " ");
-            fb_num(&f, v[k]/(u64) g_ncpu);
-        }
-        fb_str(&f, "\n");
-    }
-    fb_str(&f, "intr 1234567 10 20 0 0 0\nctxt 5678901\nbtime 1680000000\nprocesses 25000\nprocs_running 1\nprocs_blocked 0\n");
-    return fake_end(&f);
-}
-static int fake_cpuinfo(void) {
-    struct fb f;
-    if (fake_begin(&f)<0) return-1;
-    int n = g_ncpu, blk = -1, inb = 0;
-    long hfd = sc(N_openat, AT_FDCWD, (long) "/proc/cpuinfo", O_RDONLY|O_CLOEXEC, 0, 0, 0);
-    if (hfd >= 0) {
-        struct lr r;
-        char ln[8192];
-        int len;
-        r.fd = (int) hfd;
-        r.pos = r.len = 0;
-        while ((len = lr_line(&r, ln, sizeof ln)) >= 0) {
-            if (len >= 9 && strncmp(ln, "processor", 9) == 0 && (ln[9] == ' ' || ln[9] == '\t' || ln[9] == ':')) {
-                blk++;
-                inb = 1;
-            } else if (len == 0 && inb) {
-                inb = 0;
-                if (blk<n) fb_str(&f, "\n");
-                continue;
-            }
-            if (inb && blk >= n) continue;
-            if (inb) {
-                const char*col = ln;
-                while (*col && *col != ':') col++;
-                if (*col == ':') {
-                    size_t kl = (size_t)(col-ln), tk = kl;
-                    u64 val = 0;
-                    int fix = 0;
-                    while (tk>0 && (ln[tk-1] == ' ' || ln[tk-1] == '\t')) tk--;
-                    if (tk == 9 && strncmp(ln, "processor", 9) == 0) { val = (u64) blk; fix = 1; }
-                    else if (tk == 7 && strncmp(ln, "core id", 7) == 0) { val = (u64) blk; fix = 1; }
-                    else if (tk == 8 && strncmp(ln, "siblings", 8) == 0) { val = (u64) n; fix = 1; }
-                    else if (tk == 9 && strncmp(ln, "cpu cores", 9) == 0) { val = (u64) n; fix = 1; }
-                    if (fix) {
-                        fb_put(&f, ln, kl+1);
-                        fb_str(&f, " ");
-                        fb_num(&f, val);
-                        fb_str(&f, "\n");
-                        continue;
-                    }
-                }
-            }
-            fb_put(&f, ln, (size_t) len);
-            fb_str(&f, "\n");
-        }
-        sc(N_close, hfd, 0, 0, 0, 0, 0);
-    }
-    for (int i = blk+1; i<n; i++) {
-        fb_str(&f, "processor\t: ");
-        fb_num(&f, (u64) i);
-        fb_str(&f, "\nmodel name\t: Virtual CPU\n\n");
-    }
-    return fake_end(&f);
-}
-static int fake_meminfo(void) {
-    char hb[16384];
-    size_t hn = 0;
-    long hfd = sc(N_openat, AT_FDCWD, (long) "/proc/meminfo", O_RDONLY|O_CLOEXEC, 0, 0, 0);
-    if (hfd<0) return-1;
-    for (;;) {
-        long k = sc(N_read, hfd, (long)(hb+hn), (long)(sizeof hb-1-hn), 0, 0, 0);
-        if (k <= 0) break;
-        hn += (size_t) k;
-        if (hn >= sizeof hb-1) break;
-    }
-    sc(N_close, hfd, 0, 0, 0, 0, 0);
-    hb[hn] = 0;
-    if (!hn) return-1;
-    u64 L = g_memkb, hfree = 0, havail = 0, hbuf = 0, hcache = 0, hsrec = 0;
-    int have_avail = 0;
-    for (char*p = hb; *p;) {
-        char*e = p;
-        while (*e && *e != '\n') e++;
-        char sv = *e;
-        *e = 0;
-        if (strncmp(p, "MemFree:", 8) == 0) hfree = line_val(p);
-        else if (strncmp(p, "MemAvailable:", 13) == 0) {
-            havail = line_val(p);
-            have_avail = 1;
-        } else if (strncmp(p, "Buffers:", 8) == 0) hbuf = line_val(p);
-        else if (strncmp(p, "Cached:", 7) == 0) hcache = line_val(p);
-        else if (strncmp(p, "SReclaimable:", 13) == 0) hsrec = line_val(p);
-        *e = sv;
-        p = sv ? e+1 : e;
-    }
-    if (!have_avail) havail = hfree+hbuf+hcache;
-    u64 avail = umin(havail, L), fre = umin(hfree, avail);
-    u64 buf = umin(hbuf, avail-fre), cache = umin(hcache, avail-fre-buf), srec;
-    srec = umin(hsrec, avail-fre-buf-cache);
-    struct fb f;
-    if (fake_begin(&f)<0) return-1;
-    for (char*p = hb; *p;) {
-        char*e = p;
-        while (*e && *e != '\n') e++;
-        char sv = *e;
-        *e = 0;
-        size_t ll = (size_t)(e-p);
-        const char*col = p;
-        while (*col && *col != ':') col++;
-        if (*col == ':' && ll>=3 && strcmp(e-3, " kB") == 0) {
-            size_t kl = (size_t)(col-p)+1;
-            u64 val = line_val(p);
-            int skip = strncmp(p, "Swap", 4) == 0 || strncmp(p, "Commit", 6) == 0 || strncmp(p, "Vmalloc", 7) == 0 || strncmp(p, "Huge", 4) == 0 || strncmp(p, "DirectMap", 9) == 0;
-            if (strncmp(p, "MemTotal:", 9) == 0) val = L;
-            else if (strncmp(p, "MemFree:", 8) == 0) val = fre;
-            else if (strncmp(p, "MemAvailable:", 13) == 0) val = avail;
-            else if (strncmp(p, "Buffers:", 8) == 0) val = buf;
-            else if (strncmp(p, "Cached:", 7) == 0) val = cache;
-            else if (strncmp(p, "SReclaimable:", 13) == 0) val = srec;
-            else if (!skip) val = umin(val, L);
-            if (skip) {
-                fb_put(&f, p, ll);
-            } else {
-                char nb[24];
-                size_t nl = u64_dec(nb, val);
-                fb_put(&f, p, kl);
-                fb_pad(&f, kl<16 ? 16-kl : 1);
-                fb_pad(&f, nl<8 ? 8-nl : 0);
-                fb_put(&f, nb, nl);
-                fb_str(&f, " kB");
-            }
-        } else {
-            fb_put(&f, p, ll);
-        }
-        fb_str(&f, "\n");
-        *e = sv;
-        p = sv ? e+1 : e;
-    }
-    return fake_end(&f);
-}
 struct mi {
     char maj[24], opts[256], fst[64], src[256], sup[256];
     int ok;
@@ -1258,22 +1062,6 @@ static size_t build_mi(char*o, size_t cap, int info) {
 }
 static int do_open(int dfd, const char*p, int fl, int mode) {
     if (p) {
-        if (g_memkb && strcmp(p, "/proc/meminfo") == 0) {
-            if ((fl&O_ACCMODE_) != O_RDONLY) return (int) fail(EACCES);
-            int mfd = fake_meminfo();
-            if (mfd >= 0) return mfd;
-        }
-        if (g_ncpu>0) {
-            if (strcmp(p, "/proc/cpuinfo") == 0) {
-                if ((fl&O_ACCMODE_) != O_RDONLY) return (int) fail(EACCES);
-                int mfd = fake_cpuinfo();
-                if (mfd >= 0) return mfd;
-            } else if (strncmp(p, "/sys/devices/system/cpu/", 24) == 0 && (strcmp(p+24, "online") == 0 || strcmp(p+24, "possible") == 0 || strcmp(p+24, "present") == 0)) {
-                if ((fl&O_ACCMODE_) != O_RDONLY) return (int) fail(EACCES);
-                int mfd = fake_cpurange();
-                if (mfd >= 0) return mfd;
-            }
-        }
         if (strcmp(p, "/proc/uptime") == 0) {
             if ((fl&O_ACCMODE_) != O_RDONLY) return (int) fail(EACCES);
             const char up[] = "43200.00 42000.00\n";
@@ -1300,10 +1088,6 @@ static int do_open(int dfd, const char*p, int fl, int mode) {
         }
         if (strcmp(p, "/proc/stat") == 0) {
             if ((fl&O_ACCMODE_) != O_RDONLY) return (int) fail(EACCES);
-            if (g_ncpu>0) {
-                int sfd = fake_stat();
-                if (sfd >= 0) return sfd;
-            }
             const char st[] = "cpu  21200 450 12300 954000 3200 120 80 0 0 0\n""intr 1234567 10 20 0 0 0\nctxt 5678901\nbtime 1680000000\nprocesses 25000\nprocs_running 1\nprocs_blocked 0\n";
             int mfd = fake_proc_file(st, sizeof (st)-1);
             if (mfd >= 0) return mfd;
@@ -2776,29 +2560,6 @@ struct sysinfo_data {
     unsigned int mem_unit;
     char _f[20-2*sizeof (long)-sizeof (int)];
 };
-static void sysinfo_limit(struct sysinfo_data*i, int synth) {
-    u64 total = g_memkb*1024;
-    if (synth) {
-        u64 su = 1;
-        while (total/su>(u64)(unsigned long)-1) su <<= 1;
-        i->mem_unit = (unsigned int) su;
-        i->totalram = (unsigned long)(total/su);
-        i->freeram = (unsigned long)(total/su/2);
-        i->sharedram = 0;
-        i->bufferram = 0;
-        i->totalswap = 0;
-        i->freeswap = 0;
-        i->totalhigh = 0;
-        i->freehigh = 0;
-        return;
-    }
-    u64 unit = i->mem_unit ? i->mem_unit : 1;
-    u64 t = total/unit;
-    if (i->totalram>t) i->totalram = t;
-    if (i->freeram>i->totalram) i->freeram = i->totalram;
-    if (i->sharedram>i->totalram) i->sharedram = i->totalram;
-    if (i->bufferram>i->totalram-i->freeram) i->bufferram = i->totalram-i->freeram;
-}
 EXP int sysinfo(struct sysinfo_data*info) {
     static int(*real_sysinfo)(struct sysinfo_data*);
     if (!real_sysinfo) real_sysinfo = nextsym("sysinfo");
@@ -2810,36 +2571,9 @@ EXP int sysinfo(struct sysinfo_data*info) {
         info->loads[1] = 49152;
         info->loads[2] = 52428;
         info->procs = 25;
-        if (g_memkb) sysinfo_limit(info, res != 0);
         return 0;
     }
-    if (res == 0 && info && g_memkb) sysinfo_limit(info, 0);
     return res;
-}
-EXP long sysconf(int name) {
-    static long(*f)(int);
-    if (!f) f = nextsym("sysconf");
-    if (g_ncpu>0 && (name == 83 || name == 84)) return g_ncpu;
-    long r = f ? f(name) : -1;
-    if (g_memkb && (name == 85 || name == 86)) {
-        long ps = f ? f(30) : 4096;
-        if (ps <= 0) ps = 4096;
-        long maxp = (long)(g_memkb*1024/(u64) ps);
-        if (name == 85 || r<0 || r>maxp) r = maxp;
-    }
-    return r;
-}
-EXP int get_nprocs(void) {
-    static int(*f)(void);
-    if (g_ncpu>0) return g_ncpu;
-    if (!f) f = nextsym("get_nprocs");
-    return f ? f() : 1;
-}
-EXP int get_nprocs_conf(void) {
-    static int(*f)(void);
-    if (g_ncpu>0) return g_ncpu;
-    if (!f) f = nextsym("get_nprocs_conf");
-    return f ? f() : 1;
 }
 #define IDFN0(name,ty,rn,ix) EXP ty name(void){static ty(*f)(void);if(g_fake)return 0;if(g_user)return g_cr[ix];if(!f)f=nextsym(rn);return f();}
 IDFN0(getuid, u32, "getuid", C_RU) IDFN0(geteuid, u32, "geteuid", C_EU) IDFN0(getgid, u32, "getgid", C_RG) IDFN0(getegid, u32, "getegid", C_EG)
@@ -3457,7 +3191,7 @@ static char*acat(struct ar*a, const char*k, const char*v) {
     return d;
 }
 static int is_ours(const char*e) {
-    return envmatch(e, "LD_PRELOAD") || envmatch(e, "PRX_ROOTFS") || envmatch(e, "PRX_SHIM") || envmatch(e, "PRX_LIBPATH") || envmatch(e, "PRX_BIND") || envmatch(e, "PRX_FAKEROOT") || envmatch(e, "PRX_DNS") || envmatch(e, "PRX_LOADER") || envmatch(e, "PRX_QEMU") || envmatch(e, "QEMU_SET_ENV") || envmatch(e, "PRX_SELF_EXE") || envmatch(e, "PRX_VUSER") || envmatch(e, "PRX_CRED") || envmatch(e, "PRX_CPUS") || envmatch(e, "PRX_MEM_KB") || envmatch(e, "PRX_NO_ARGV0");
+    return envmatch(e, "LD_PRELOAD") || envmatch(e, "PRX_ROOTFS") || envmatch(e, "PRX_SHIM") || envmatch(e, "PRX_LIBPATH") || envmatch(e, "PRX_BIND") || envmatch(e, "PRX_FAKEROOT") || envmatch(e, "PRX_DNS") || envmatch(e, "PRX_LOADER") || envmatch(e, "PRX_QEMU") || envmatch(e, "QEMU_SET_ENV") || envmatch(e, "PRX_SELF_EXE") || envmatch(e, "PRX_VUSER") || envmatch(e, "PRX_CRED") || envmatch(e, "PRX_NO_ARGV0");
 }
 #if defined(__i386__)
 /* ELF32 (the only class an i386 guest can run) */
@@ -3625,16 +3359,6 @@ static char**mkenv(struct ar*a, char*const envp[], int native, const char*cur_ex
         ne[k++] = acat(a, "PRX_BIND=", g_bindenv);
         ne[k++] = acat(a, "PRX_DNS=", g_dns);
         ne[k++] = acat(a, "PRX_FAKEROOT=", g_fake ? "1" : "0");
-        if (g_ncpu>0) {
-            char nb[24];
-            u64_dec(nb, (u64) g_ncpu);
-            ne[k++] = acat(a, "PRX_CPUS=", nb);
-        }
-        if (g_memkb) {
-            char nb[24];
-            u64_dec(nb, g_memkb);
-            ne[k++] = acat(a, "PRX_MEM_KB=", nb);
-        }
         if (g_user) {
             char cb[4096];
             cr_encode(g_pcr_ok ? g_pcr : g_cr, cb);
