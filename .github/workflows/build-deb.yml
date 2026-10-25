@@ -78,5 +78,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/*.deb dist/SHA256SUMS \
-            --title "prx ${GITHUB_REF_NAME#v}" --generate-notes
+          gh release create "$GITHUB_REF_NAME" dist/*.deb dist/SHA256SUMS --title "prx ${GITHUB_REF_NAME#v}" --generate-notes 2>/dev/null || \
+          gh release upload "$GITHUB_REF_NAME" dist/*.deb dist/SHA256SUMS --clobber
