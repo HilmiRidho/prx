@@ -99,19 +99,6 @@ See `man prx` or `prx help` for all commands and options.
 
 ## Changelog
 
-### Unreleased
-
-- Performance: cleaning up guest processes when `prx login` exits no longer forks `tr`/`grep` for every process in `/proc`; the check is pure bash and several times faster on busy hosts (about 5x with a few hundred processes).
-- Performance: `prx list` no longer forks once per container, and the shim reads `/etc/passwd`, `/etc/group` and `/etc/hosts` with a smaller initial buffer.
-- Fix: the shim's `getpw*`, `getgr*` and `/etc/hosts` lookups followed rootfs symlinks out of the rootfs (an absolute `/etc/passwd` link read the *host* file). They now resolve links as if the rootfs were `/`.
-- Fix: `prx login -w DIR` resolves `DIR` inside the rootfs, so a symlink cannot start the session in a host directory.
-- Fix: `ldpatch` writes the patched loader to a temporary file and renames it, so two concurrent logins cannot run a half-written loader and a failed write leaves nothing behind.
-- Fix: the shim is also rebuilt when only `src/ldpatch.c` changed, and the library-path cache is refreshed when the guest's package database (dpkg, rpm, pacman, apk) or, without one, its library directories change.
-- Fix: `prx install` from a URL strips a `#fragment` from the download file name and falls back to a default name when the URL has none.
-- DNS: the shim now queries IPv6 nameservers as well. `PRX_DNS` and the guest `resolv.conf` may mix IPv4 and IPv6 (the list is comma-separated; a legacy colon-separated IPv4 list still works). Scoped addresses (`fe80::1%eth0`) are not supported and are dropped with a warning. Host-detected servers are ordered IPv4 first.
-- passwd/group emulation: `/etc/passwd`, `/etc/group` and `/etc/hosts` are read completely (no 48 KiB / 16 KiB cut-off), groups may have any number of members, and the buffers behind `getpwnam`/`getgrnam`-style calls grow on demand. The virtual supplementary-group limit is raised from 64 to 256.
-- Docs: README reorganised; `PRX_KEEP` documented.
-
 ### 1.0.1
 
 - Writes into a rootfs (`login`, `install`) no longer follow symlinks out of it: an absolute link such as `/var/lib/dbus/machine-id -> /etc/machine-id` used to make `cp`/`>` hit the *host* file (dangerous when run as root). All such writes now go through `rpath`, which resolves links as if the rootfs were `/`.
@@ -122,6 +109,16 @@ See `man prx` or `prx help` for all commands and options.
 - `prx login NAME --typo` is now an error instead of running `--typo` as a command.
 - `prx set NAME --hard-mem` alone is now saved (and warns that it needs `-m`).
 - Minor: per-install `tar.err` temp file, `execveat(NULL)` returns `EFAULT`, group file buffer raised to 64 KiB.
+- Performance: cleaning up guest processes when `prx login` exits no longer forks `tr`/`grep` for every process in `/proc`; the check is pure bash and several times faster on busy hosts (about 5x with a few hundred processes).
+- Performance: `prx list` no longer forks once per container, and the shim reads `/etc/passwd`, `/etc/group` and `/etc/hosts` with a smaller initial buffer.
+- Fix: the shim's `getpw*`, `getgr*` and `/etc/hosts` lookups followed rootfs symlinks out of the rootfs (an absolute `/etc/passwd` link read the *host* file). They now resolve links as if the rootfs were `/`.
+- Fix: `prx login -w DIR` resolves `DIR` inside the rootfs, so a symlink cannot start the session in a host directory.
+- Fix: `ldpatch` writes the patched loader to a temporary file and renames it, so two concurrent logins cannot run a half-written loader and a failed write leaves nothing behind.
+- Fix: the shim is also rebuilt when only `src/ldpatch.c` changed, and the library-path cache is refreshed when the guest's package database (dpkg, rpm, pacman, apk) or, without one, its library directories change.
+- Fix: `prx install` from a URL strips a `#fragment` from the download file name and falls back to a default name when the URL has none.
+- DNS: the shim now queries IPv6 nameservers as well. `PRX_DNS` and the guest `resolv.conf` may mix IPv4 and IPv6 (the list is comma-separated; a legacy colon-separated IPv4 list still works). Scoped addresses (`fe80::1%eth0`) are not supported and are dropped with a warning. Host-detected servers are ordered IPv4 first.
+- passwd/group emulation: `/etc/passwd`, `/etc/group` and `/etc/hosts` are read completely (no 48 KiB / 16 KiB cut-off), groups may have any number of members, and the buffers behind `getpwnam`/`getgrnam`-style calls grow on demand. The virtual supplementary-group limit is raised from 64 to 256.
+- Docs: README reorganised; `PRX_KEEP` documented.
 
 ## License
 
