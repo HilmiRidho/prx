@@ -458,12 +458,21 @@ static u64 parse_u64(const char*s) {
 #endif
 extern int sigaction(int, const void*, void*);
 static int g_inst;
+/* Must have exactly the size of the guest libc's `struct sigaction` (152 bytes
+   on x86_64/aarch64, 140 on i386): sigaction() below zeroes the caller's `old`
+   buffer with sizeof (struct ksa). An explicit pad field made it 144 on i386,
+   overrunning the caller's buffer by 4 bytes ("stack smashing detected"). */
 struct ksa {
     void*h;
     u8 mask[128];
-    int flags, pad;
+    int flags;
     void*rst;
 };
+#if defined(__i386__)
+_Static_assert(sizeof (struct ksa) == 140, "struct ksa must match i386 struct sigaction");
+#else
+_Static_assert(sizeof (struct ksa) == 152, "struct ksa must match 64-bit struct sigaction");
+#endif
 static void prx_early(void);
 EXP int sched_setaffinity(int pid, size_t cpusetsize, const void*mask) {
     (void) pid;
