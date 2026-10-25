@@ -1,0 +1,111 @@
+diff -ruN a/src/prx.c b/src/prx.c
+--- a/src/prx.c	2026-10-25 20:10:04.511332519 +0000
++++ b/src/prx.c	2026-10-25 20:10:04.513447889 +0000
+@@ -439,14 +439,6 @@
+     memcpy(dst, src, n);
+     dst[n] = 0;
+ }
+-static u64 parse_u64(const char*s) {
+-    u64 v = 0;
+-    while (*s >= '0' && *s <= '9') {
+-        v = v*10+(u64)(*s-'0');
+-        s++;
+-    }
+-    return v;
+-}
+ #if defined(__aarch64__)
+ #define UC_RET_OFF 184
+ #elif defined(__i386__)
+@@ -854,92 +846,6 @@
+     sc(N_lseek, fd, 0, 0, 0, 0, 0);
+     return (int) fd;
+ }
+-struct fb {
+-    int fd;
+-    size_t n;
+-    char b[4096];
+-};
+-static void fb_flush(struct fb*f) {
+-    size_t o = 0;
+-    while (o<f->n) {
+-        long k = sc(N_write, f->fd, (long)(f->b+o), (long)(f->n-o), 0, 0, 0);
+-        if (k <= 0) break;
+-        o += (size_t) k;
+-    }
+-    f->n = 0;
+-}
+-static void fb_put(struct fb*f, const char*s, size_t n) {
+-    while (n) {
+-        size_t room = sizeof f->b-f->n;
+-        size_t k = n<room ? n : room;
+-        memcpy(f->b+f->n, s, k);
+-        f->n += k;
+-        s += k;
+-        n -= k;
+-        if (f->n == sizeof f->b) fb_flush(f);
+-    }
+-}
+-static void fb_str(struct fb*f, const char*s) {
+-    fb_put(f, s, strlen(s));
+-}
+-static size_t u64_dec(char*o, u64 v) {
+-    char t[24];
+-    size_t k = 0, n = 0;
+-    do {
+-        t[k++] = (char)('0'+v%10);
+-        v /= 10;
+-    } while (v);
+-    while (k) o[n++] = t[--k];
+-    o[n] = 0;
+-    return n;
+-}
+-static void fb_num(struct fb*f, u64 v) {
+-    char t[24];
+-    size_t n = u64_dec(t, v);
+-    fb_put(f, t, n);
+-}
+-static void fb_pad(struct fb*f, size_t n) {
+-    while (n--) fb_put(f, " ", 1);
+-}
+-static int fake_begin(struct fb*f) {
+-    long fd = sc(N_memfd_create, (long) "fake_proc", 1, 0, 0, 0, 0);
+-    if (fd<0) return -1;
+-    f->fd = (int) fd;
+-    f->n = 0;
+-    return 0;
+-}
+-static int fake_end(struct fb*f) {
+-    fb_flush(f);
+-    sc(N_lseek, f->fd, 0, 0, 0, 0, 0);
+-    return f->fd;
+-}
+-struct lr {
+-    int fd;
+-    size_t pos, len;
+-    char b[4096];
+-};
+-static int lr_line(struct lr*r, char*o, size_t cap) {
+-    size_t n = 0;
+-    int got = 0;
+-    for (;;) {
+-        if (r->pos >= r->len) {
+-            long k = sc(N_read, r->fd, (long) r->b, (long) sizeof r->b, 0, 0, 0);
+-            if (k <= 0) break;
+-            r->len = (size_t) k;
+-            r->pos = 0;
+-        }
+-        got = 1;
+-        char c = r->b[r->pos++];
+-        if (c == '\n') {
+-            o[n] = 0;
+-            return (int) n;
+-        }
+-        if (n+1<cap) o[n++] = c;
+-    }
+-    if (!got) return-1;
+-    o[n] = 0;
+-    return (int) n;
+-}
+ struct mi {
+     char maj[24], opts[256], fst[64], src[256], sup[256];
+     int ok;
