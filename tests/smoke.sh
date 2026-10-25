@@ -166,7 +166,11 @@ if [ -x "$LDP" ]; then
 cp "$(command -v cat)" "$T/ldin"
 "$LDP" "$T/ldin" "$T/ldout" >/dev/null && [ -x "$T/ldout" ] && cmp -s "$T/ldin" "$T/ldout" && ok "ldpatch output written and executable" || fail "ldpatch output written and executable"
 if "$LDP" "$T/ldin" "$T/nodir/out" 2>/dev/null; then fail "ldpatch ignored a write error"; fi
-ls "$T"/ldout.tmp.* "$T"/nodir 2>/dev/null | grep -q . && fail "ldpatch left a temp file" || ok "ldpatch leaves no temp file behind"
+found=0
+for f in "$T"/ldout.tmp.* "$T"/nodir; do
+    if [ -e "$f" ]; then found=1; break; fi
+done
+if [ "$found" -eq 1 ]; then fail "ldpatch left a temp file"; else ok "ldpatch leaves no temp file behind"; fi
 fi
 # ------------------------------------------------------------------------
 
