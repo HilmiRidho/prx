@@ -144,6 +144,40 @@ mkdir -p "$bd"; echo bound > "$bd/f"
 fi
 # ------------------------------------------------------------------------
 
+# ---- i386 guest: qemu-user only, never native ---------------------------
+mkdir -p "$T/fs386/lib" "$T/fs386/bin" "$T/fs386/etc"
+: > "$T/fs386/lib/ld-linux.so.2"; chmod +x "$T/fs386/lib/ld-linux.so.2"
+printf '#!/bin/sh\n' > "$T/fs386/bin/sh"; chmod +x "$T/fs386/bin/sh"
+tar -C "$T/fs386" -czf "$T/fs386.tar.gz" .
+"$PRX" install i3 "$T/fs386.tar.gz" >/dev/null 2>&1
+if PRX_QEMU=/nonexistent "$PRX" login i3 -- true 2>"$T/err"; then fail "i386 rootfs ran without qemu"; fi
+grep -q 'is i386 but this host is .*qemu-i386 was not found' "$T/err" && ok "i386 rootfs requires qemu-i386 (no native mode)" || fail "i386 rootfs requires qemu-i386 (no native mode)"
+cat > "$T/qstub" <<'QEOF'
+#!/bin/sh
+case "$*" in *--help*) echo "  --argv0 STRING"; exit 0;; esac
+echo "ARGS: $*"
+echo "SETENV: $QEMU_SET_ENV"
+QEOF
+chmod +x "$T/qstub"
+if PRX_QEMU="$T/qstub" "$PRX" login i3 -- true >"$T/o386" 2>"$T/e386"; then
+if grep -q 'Guest shim built' "$T/e386"; then
+grep -q 'ld-linux.so.2 --library-path' "$T/o386" && grep -q 'i386-linux-gnu' "$T/o386" && ok "i386 guest launched through qemu with its own loader" || fail "i386 guest launched through qemu with its own loader"
+grep -q 'SETENV: LD_PRELOAD=.*libprx-i386.so' "$T/o386" && ok "i386 shim preloaded via QEMU_SET_ENV" || fail "i386 shim preloaded via QEMU_SET_ENV"
+if command -v file >/dev/null 2>&1; then file -L "$HOME/.local/share/prx/lib/libprx-i386.so" | grep -q 'ELF 32-bit.*80386' && ok "i386 shim is an ELF32 Intel 80386 object" || fail "i386 shim is an ELF32 Intel 80386 object"; fi
+else ok "i386 shim build skipped (no 32-bit capable compiler)"; fi
+else grep -q 'Cross-compiling the shim for i386 needs' "$T/e386" && ok "i386 shim build skipped (no 32-bit capable compiler)" || fail "i386 login with stub qemu"; fi
+"$PRX" remove i3 >/dev/null 2>&1
+# raw i386 syscall layer, run natively (needs gcc -m32 and a kernel that runs 32-bit binaries)
+r386=skip
+if gcc -m32 -O1 -static -nostdlib -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -no-pie -Wl,--unresolved-symbols=ignore-all -o "$T/shim_i386" "$HERE/tests/shim_i386.c" 2>/dev/null; then
+r386="$("$T/shim_i386" 2>&1 </dev/null || true)"
+fi
+case "$r386" in
+*"RESULT PASS"*) ok "i386 shim: syscalls, stat64/time64 layout, pread64, 64-bit div" ;;
+*"RESULT FAIL"*|*FAIL*) echo "$r386" >&2; fail "i386 shim native test" ;;
+*) ok "i386 shim native test skipped (no gcc -m32 or no 32-bit execution)" ;;
+esac
+
 "$PRX" remove t1 >/dev/null 2>&1 && "$PRX" remove t2 >/dev/null 2>&1
 [ "$("$PRX" list)" = "(no rootfs installed yet)" ] || [ -z "$("$PRX" list | grep -E '^t[12]$')" ] && ok "remove"
 

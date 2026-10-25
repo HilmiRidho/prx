@@ -9,7 +9,7 @@ User-space container / path-translation engine (glibc rootfs, no root needed).
 - A host running Linux on x86_64 or aarch64 (including Termux on Android).
 - `bash` 4.3 or newer, plus `coreutils`, `tar`, `findutils`, `sed` and `grep`.
 - `gcc` or `clang`, used to compile the shim.
-- Optional: `curl` (installing from a URL), and `qemu-user` (plus `lld` for cross-building the shim) to run a rootfs of the other architecture.
+- Optional: `curl` (installing from a URL), and `qemu-user` (plus `lld` for cross-building the shim) to run a rootfs of the other architecture (or an i386 rootfs, which is qemu-only).
 
 ## Install
 
@@ -69,7 +69,7 @@ See `man prx` or `prx help` for all commands and options.
 ## Known limits (by design)
 
 - Not a security boundary (LD_PRELOAD + loader patching; static/raw-syscall binaries can bypass it). This cannot be fixed within an LD_PRELOAD design; it would need a ptrace / seccomp-unotify supervisor or user namespaces.
-- glibc rootfs only (no musl); x86_64 / aarch64 hosts only. A rootfs of the other architecture runs through qemu-user.
+- glibc rootfs only (no musl); x86_64 / aarch64 hosts only. A rootfs of the other architecture runs through qemu-user. An i386 (32-bit x86) rootfs is supported on both host types but only through `qemu-i386`: there is no native i386 mode, not even on x86_64. Programs built with 64-bit `time_t` on i386 (`_TIME_BITS=64`) are covered too: `__stat64_time64`, `__lstat64_time64`, `__fstat64_time64`, `__fstatat64_time64` and `__utimensat64` are hooked and use `statx`, so timestamps past 2038 are preserved.
 - Guest PAM is `pam_permit` and sudo is `NOPASSWD` because there is no real root to authenticate. Do not treat the guest as a sandbox for untrusted code.
 - Loader patching depends on glibc machine code and may fail on some versions.
 - Bind paths cannot contain `:` or `=` (the shim's `PRX_BIND` format uses them as separators).

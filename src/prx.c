@@ -3,7 +3,8 @@ typedef long ssize_t;
 typedef unsigned int u32;
 typedef unsigned short u16;
 typedef unsigned char u8;
-typedef unsigned long u64;
+typedef unsigned long long u64;
+typedef long long s64;
 #define NULL ((void*)0)
 #define EXP __attribute__((visibility("default")))
 #define PM 4096
@@ -17,6 +18,11 @@ typedef unsigned long u64;
 #define O_APPEND 0x400
 #define O_CLOEXEC 0x80000
 #define O_ACCMODE_ 3
+#if defined(__i386__)
+#define O_LARGEFILE_ 0x8000
+#else
+#define O_LARGEFILE_ 0
+#endif
 #if defined(__aarch64__)
 #define O_NOFOLLOW 0x8000
 #else
@@ -103,6 +109,7 @@ typedef unsigned long u64;
 #define N_fcntl 25
 #define OFF_UID 24
 #define OFF_NLINK 20
+#define OFF_INO 8
 #elif defined(__x86_64__)
 #define N_fchdir 81
 #define N_read 0
@@ -160,6 +167,71 @@ typedef unsigned long u64;
 #define N_statx 332
 #define OFF_UID 28
 #define OFF_NLINK 16
+#define OFF_INO 8
+#elif defined(__i386__)
+/* i386 guest (qemu-user only). Kernel i386 ABI: 32-bit longs, *64 stat family,
+   32-bit uid/gid syscalls, 64-bit file offsets passed as lo/hi register pairs. */
+#define N_read 3
+#define N_write 4
+#define N_close 6
+#define N_execve 11
+#define N_chdir 12
+#define N_lseek 19
+#define N_getpid 20
+#define N_getppid 64
+#define N_ioctl 54
+#define N_fcntl 55
+#define N_truncate 92
+#define N_fchmod 94
+#define N_statfs 99
+#define N_fstatfs 100
+#define N_fchdir 133
+#define N_pread64 180
+#define N_capget 184
+#define N_capset 185
+#define N_getcwd 183
+#define N_truncate64 193
+#define N_fstat 197
+#define N_getuid 199
+#define N_getgid 200
+#define N_geteuid 201
+#define N_getegid 202
+#define N_gettid 224
+#define N_setxattr 226
+#define N_lsetxattr 227
+#define N_getxattr 229
+#define N_lgetxattr 230
+#define N_listxattr 232
+#define N_llistxattr 233
+#define N_removexattr 235
+#define N_lremovexattr 236
+#define N_sched_getaffinity 242
+#define N_statfs64 268
+#define N_fstatfs64 269
+#define N_openat 295
+#define N_mkdirat 296
+#define N_mknodat 297
+#define N_fchownat 298
+#define N_newfstatat 300
+#define N_unlinkat 301
+#define N_renameat 302
+#define N_linkat 303
+#define N_symlinkat 304
+#define N_readlinkat 305
+#define N_fchmodat 306
+#define N_faccessat 307
+#define N_utimensat 320
+#define N_pipe2 331
+#define N_renameat2 353
+#define N_getrandom 355
+#define N_memfd_create 356
+#define N_execveat 358
+#define N_statx 383
+#define N_utimensat_time64 412
+#define MODE_OFF 16
+#define OFF_UID 24
+#define OFF_NLINK 20
+#define OFF_INO 88
 #else
 #error "Unsupported target architecture."
 #endif
@@ -177,6 +249,28 @@ static inline long sc(long n, long a, long b, long c, long d, long e, long f) {
     __asm__ volatile("svc 0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5) : "memory", "cc");
     return x0;
 }
+#elif defined(__i386__)
+/* int 0x80 with up to six arguments. ebx (PIC register) and ebp are saved by
+   hand; the arguments are loaded from a stack array through eax. */
+static inline long sc(long n, long a, long b, long c, long d, long e, long f) {
+    long v[7] = {n, a, b, c, d, e, f};
+    long ret;
+    __asm__ volatile(
+        "push %%ebx\n\t"
+        "push %%ebp\n\t"
+        "mov 4(%%eax), %%ebx\n\t"
+        "mov 8(%%eax), %%ecx\n\t"
+        "mov 12(%%eax), %%edx\n\t"
+        "mov 16(%%eax), %%esi\n\t"
+        "mov 20(%%eax), %%edi\n\t"
+        "mov 24(%%eax), %%ebp\n\t"
+        "mov (%%eax), %%eax\n\t"
+        "int $0x80\n\t"
+        "pop %%ebp\n\t"
+        "pop %%ebx"
+        : "=a"(ret) : "a"(v) : "ecx", "edx", "esi", "edi", "memory", "cc");
+    return ret;
+}
 #else
 static inline long sc(long n, long a, long b, long c, long d, long e, long f) {
     long ret;
@@ -187,9 +281,41 @@ static inline long sc(long n, long a, long b, long c, long d, long e, long f) {
     return ret;
 }
 #endif
+#if defined(__i386__)
+/* The shim is linked with -nostdlib, so the 64-bit division/modulo helpers the
+   compiler emits on 32-bit x86 are provided here (shift/subtract, only used for
+   a few rare formatting paths). */
+static u64 udivmod64(u64 n, u64 d, u64*rem) {
+    u64 q = 0, r = 0;
+    for (int i = 63; i >= 0; i--) {
+        r = (r<<1)|((n>>i)&1);
+        if (r >= d) {
+            r -= d;
+            q |= (u64)1<<i;
+        }
+    }
+    if (rem)*rem = r;
+    return q;
+}
+__attribute__((visibility("hidden"))) u64 __udivdi3(u64 a, u64 b) {
+    return udivmod64(a, b, 0);
+}
+__attribute__((visibility("hidden"))) u64 __umoddi3(u64 a, u64 b) {
+    u64 r;
+    udivmod64(a, b, &r);
+    return r;
+}
+#endif
 #define SC3(n,a,b,c) sc((n),(long)(a),(long)(b),(long)(c),0,0,0)
 #define SC4(n,a,b,c,d) sc((n),(long)(a),(long)(b),(long)(c),(long)(d),0,0)
 #define SC5(n,a,b,c,d,e) sc((n),(long)(a),(long)(b),(long)(c),(long)(d),(long)(e),0)
+static long pread_(long fd, void*b, long n, u64 off) {
+#if defined(__i386__)
+    return sc(N_pread64, fd, (long) b, n, (long)(u32) off, (long)(u32)(off>>32), 0);
+#else
+    return sc(N_pread64, fd, (long) b, n, (long) off, 0, 0);
+#endif
+}
 extern int*__errno_location(void);
 extern void*malloc(size_t);
 extern void*realloc(void*, size_t);
@@ -325,6 +451,8 @@ static u64 parse_u64(const char*s) {
 }
 #if defined(__aarch64__)
 #define UC_RET_OFF 184
+#elif defined(__i386__)
+#define UC_RET_OFF 0
 #else
 #define UC_RET_OFF 144
 #endif
@@ -399,6 +527,11 @@ static void sys_handler(int sig, void*info, void*uc) {
     *(long*)((char*) uc+UC_RET_OFF) = -ENOSYS;
 }
 static void install_sigsys(void) {
+#if defined(__i386__)
+    /* i386 guests run under qemu-user only: no host seccomp SIGSYS to emulate */
+    (void) sys_handler;
+    return;
+#else
     struct ksa a;
     memset(&a, 0, sizeof a);
     a.h = (void*) sys_handler;
@@ -406,6 +539,7 @@ static void install_sigsys(void) {
     g_inst = 1;
     sigaction(31, &a, NULL);
     g_inst = 0;
+#endif
 }
 static int g_inited;
 static void prx_do_init(char**envp) {
@@ -1191,7 +1325,7 @@ static int do_open(int dfd, const char*p, int fl, int mode) {
         if (strncmp(p, "/proc/self/fd/", 14) == 0 || strncmp(p, "/proc/thread-self/fd/", 21) == 0) return (int) ret(SC4(N_openat, dfd, p, fl, mode));
     }
     int fol = !((fl&O_NOFOLLOW) || ((fl&(O_CREAT|O_EXCL)) == (O_CREAT|O_EXCL)));
-    TR1(dfd, p, fol) return (int) ret(SC4(N_openat, dfd, h1, fl, mode));
+    TR1(dfd, p, fol) return (int) ret(SC4(N_openat, dfd, h1, fl|O_LARGEFILE_, mode));
 }
 EXP int open(const char*p, int fl, int mode) {
     return do_open(AT_FDCWD, p, fl, mode);
@@ -1302,7 +1436,7 @@ static u64 g_l2d[NL2], g_l2i[NL2];
 static int g_l2n;
 static void l2_note(const void*b) {
     g_l2d[g_l2n%NL2] = *(const u64*) b;
-    g_l2i[g_l2n%NL2] = *(const u64*)((const char*) b+8);
+    g_l2i[g_l2n%NL2] = *(const u64*)((const char*) b+OFF_INO);
     g_l2n++;
 }
 static int l2_has(u64 d, u64 i) {
@@ -1335,7 +1469,7 @@ static int own_is_root_fd(int fd) {
 }
 static void fixstat_c(void*b, int root) {
     u32*nl = (u32*)((char*) b+OFF_NLINK);
-    if (g_l2n && *nl == 1 && l2_has(*(u64*) b, *(u64*)((char*) b+8)))*nl = 2;
+    if (g_l2n && *nl == 1 && l2_has(*(u64*) b, *(u64*)((char*) b+OFF_INO)))*nl = 2;
     if (!g_fake && !(g_user && root)) return;
     u32*u = (u32*)((char*) b+OFF_UID);
     if (u[0] == g_ruid) u[0] = 0;
@@ -1351,33 +1485,66 @@ static int do_fstat(int fd, void*buf) {
     if (r == 0) fixstat_c(buf, g_user ? own_is_root_fd(fd) : 1);
     return (int) ret(r);
 }
+#if defined(__i386__)
+/* On i386 the non-LFS entry points (stat, lstat, fstat, fstatat, __xstat...)
+   return glibc's 32-bit `struct stat`; the kernel only knows `struct stat64`.
+   Convert, with EOVERFLOW when a value does not fit (as glibc does). */
+static int stat_conv(const u8*s, u8*d) {
+    u32 ino = *(const u32*)(s+12);
+    u64 ino64 = *(const u64*)(s+88), size = *(const u64*)(s+44), blocks = *(const u64*)(s+56);
+    if (ino64 != (u64) ino || size>0x7fffffffULL || blocks>0xffffffffULL) return (int) fail(75);
+    memset(d, 0, 88);
+    memcpy(d, s, 8);
+    *(u32*)(d+12) = ino;
+    memcpy(d+16, s+16, 16);
+    memcpy(d+32, s+32, 8);
+    *(u32*)(d+44) = (u32) size;
+    *(u32*)(d+48) = *(const u32*)(s+52);
+    *(u32*)(d+52) = (u32) blocks;
+    memcpy(d+56, s+64, 24);
+    return 0;
+}
+static int do_stat_n(int dfd, const char*p, void*buf, int fl) {
+    u8 t[96];
+    if (do_stat(dfd, p, t, fl)<0) return-1;
+    return stat_conv(t, (u8*) buf);
+}
+static int do_fstat_n(int fd, void*buf) {
+    u8 t[96];
+    if (do_fstat(fd, t)<0) return-1;
+    return stat_conv(t, (u8*) buf);
+}
+#else
+#define do_stat_n do_stat
+#define do_fstat_n do_fstat
+#endif
 EXP int stat(const char*p, void*b) {
-    return do_stat(AT_FDCWD, p, b, 0);
+    return do_stat_n(AT_FDCWD, p, b, 0);
 }
 EXP int stat64(const char*p, void*b) {
     return do_stat(AT_FDCWD, p, b, 0);
 }
 EXP int lstat(const char*p, void*b) {
-    return do_stat(AT_FDCWD, p, b, AT_SYMLINK_NOFOLLOW);
+    return do_stat_n(AT_FDCWD, p, b, AT_SYMLINK_NOFOLLOW);
 }
 EXP int lstat64(const char*p, void*b) {
     return do_stat(AT_FDCWD, p, b, AT_SYMLINK_NOFOLLOW);
 }
 EXP int fstatat(int d, const char*p, void*b, int f) {
-    return do_stat(d, p, b, f);
+    return do_stat_n(d, p, b, f);
 }
 EXP int fstatat64(int d, const char*p, void*b, int f) {
     return do_stat(d, p, b, f);
 }
 EXP int fstat(int fd, void*b) {
-    return do_fstat(fd, b);
+    return do_fstat_n(fd, b);
 }
 EXP int fstat64(int fd, void*b) {
     return do_fstat(fd, b);
 }
 EXP int __xstat(int v, const char*p, void*b) {
     (void) v;
-    return do_stat(AT_FDCWD, p, b, 0);
+    return do_stat_n(AT_FDCWD, p, b, 0);
 }
 EXP int __xstat64(int v, const char*p, void*b) {
     (void) v;
@@ -1385,7 +1552,7 @@ EXP int __xstat64(int v, const char*p, void*b) {
 }
 EXP int __lxstat(int v, const char*p, void*b) {
     (void) v;
-    return do_stat(AT_FDCWD, p, b, AT_SYMLINK_NOFOLLOW);
+    return do_stat_n(AT_FDCWD, p, b, AT_SYMLINK_NOFOLLOW);
 }
 EXP int __lxstat64(int v, const char*p, void*b) {
     (void) v;
@@ -1393,7 +1560,7 @@ EXP int __lxstat64(int v, const char*p, void*b) {
 }
 EXP int __fxstat(int v, int fd, void*b) {
     (void) v;
-    return do_fstat(fd, b);
+    return do_fstat_n(fd, b);
 }
 EXP int __fxstat64(int v, int fd, void*b) {
     (void) v;
@@ -1401,7 +1568,7 @@ EXP int __fxstat64(int v, int fd, void*b) {
 }
 EXP int __fxstatat(int v, int d, const char*p, void*b, int f) {
     (void) v;
-    return do_stat(d, p, b, f);
+    return do_stat_n(d, p, b, f);
 }
 EXP int __fxstatat64(int v, int d, const char*p, void*b, int f) {
     (void) v;
@@ -1425,6 +1592,53 @@ EXP int statx(int dfd, const char*p, int fl, unsigned mask, void*buf) {
     }
     return (int) ret(r);
 }
+#if defined(__i386__)
+/* Programs built with _TIME_BITS=64 call __stat64_time64 & co. and expect
+   glibc's 108-byte struct stat with 64-bit timestamps, which the i386 kernel
+   stat64 cannot supply. Go through statx (translated path, fake ids and
+   link-count fixups are applied by the statx hook above) and repack. */
+static u64 t64_dev(const u8*x) {
+    u64 ma = *(const u32*) x, mi = *(const u32*)(x+4);
+    return ((ma&0xfffff000ULL)<<32)|((ma&0xfffULL)<<8)|((mi&0xffffff00ULL)<<12)|(mi&0xffULL);
+}
+static void statx_to_t64(const u8*x, u8*d) {
+    memset(d, 0, 108);
+    *(u64*) d = t64_dev(x+136);
+    *(u64*)(d+8) = *(const u64*)(x+32);
+    *(u32*)(d+16) = *(const u16*)(x+28);
+    *(u32*)(d+20) = *(const u32*)(x+16);
+    *(u32*)(d+24) = *(const u32*)(x+20);
+    *(u32*)(d+28) = *(const u32*)(x+24);
+    *(u64*)(d+32) = t64_dev(x+128);
+    *(u64*)(d+40) = *(const u64*)(x+40);
+    *(u32*)(d+48) = *(const u32*)(x+4);
+    *(u64*)(d+52) = *(const u64*)(x+48);
+    *(u64*)(d+60) = *(const u64*)(x+64);
+    *(u32*)(d+68) = *(const u32*)(x+72);
+    *(u64*)(d+76) = *(const u64*)(x+112);
+    *(u32*)(d+84) = *(const u32*)(x+120);
+    *(u64*)(d+92) = *(const u64*)(x+96);
+    *(u32*)(d+100) = *(const u32*)(x+104);
+}
+static int do_stat_t64(int dfd, const char*p, void*buf, int fl) {
+    u8 x[256];
+    if (statx(dfd, p, fl, 0x7ff, x)<0) return-1;
+    statx_to_t64(x, (u8*) buf);
+    return 0;
+}
+EXP int __stat64_time64(const char*p, void*b) {
+    return do_stat_t64(AT_FDCWD, p, b, 0);
+}
+EXP int __lstat64_time64(const char*p, void*b) {
+    return do_stat_t64(AT_FDCWD, p, b, AT_SYMLINK_NOFOLLOW);
+}
+EXP int __fstat64_time64(int fd, void*b) {
+    return do_stat_t64(fd, "", b, 0x1000);
+}
+EXP int __fstatat64_time64(int d, const char*p, void*b, int f) {
+    return do_stat_t64(d, p, b, f);
+}
+#endif
 static int do_access(int dfd, const char*p, int mode, int fl) {
     TR1(dfd, p, !(fl&AT_SYMLINK_NOFOLLOW)) long r = SC3(N_faccessat, dfd, h1, mode);
     if (r == -EACCES && VROOT()) {
@@ -1641,9 +1855,9 @@ static long link_fallback(int od, const char*src, int nd, const char*dst, int fo
         return SC3(N_symlinkat, t, nd, dst);
     }
     if ((mode&0170000) != 0100000) return-EPERM;
-    long in = SC4(N_openat, od, src, O_RDONLY|O_CLOEXEC|(follow ? 0 : O_NOFOLLOW), 0);
+    long in = SC4(N_openat, od, src, O_RDONLY|O_CLOEXEC|O_LARGEFILE_|(follow ? 0 : O_NOFOLLOW), 0);
     if (in<0) return in;
-    long out = SC4(N_openat, nd, dst, O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, mode&07777);
+    long out = SC4(N_openat, nd, dst, O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_LARGEFILE_, mode&07777);
     if (out<0) {
         sc(N_close, in, 0, 0, 0, 0, 0);
         return out;
@@ -1765,16 +1979,20 @@ EXP int fchown(int fd, u32 u, u32 g) {
 EXP int truncate(const char*p, long len) {
     TR1(AT_FDCWD, p, 1) return (int) ret(SC3(N_truncate, h1, len, 0));
 }
-EXP int truncate64(const char*p, long len) {
+EXP int truncate64(const char*p, s64 len) {
+#if defined(__i386__)
+    TR1(AT_FDCWD, p, 1) return (int) ret(sc(N_truncate64, (long) h1, (long)(u32) len, (long)(u32)((u64) len>>32), 0, 0, 0));
+#else
     TR1(AT_FDCWD, p, 1) return (int) ret(SC3(N_truncate, h1, len, 0));
+#endif
 }
 EXP int ftruncate(int fd, long len) {
     static int(*f)(int, long);
     if (!f) f = nextsym("ftruncate");
     return f ? f(fd, len) : 0;
 }
-EXP int ftruncate64(int fd, long len) {
-    static int(*f)(int, long);
+EXP int ftruncate64(int fd, s64 len) {
+    static int(*f)(int, s64);
     if (!f) f = nextsym("ftruncate64");
     return f ? f(fd, len) : 0;
 }
@@ -1782,6 +2000,12 @@ EXP int utimensat(int d, const char*p, const void*t, int f) {
     if (!p) return (int) ret(SC4(N_utimensat, d, 0, t, f));
     TR1(d, p, !(f&AT_SYMLINK_NOFOLLOW)) return (int) ret(SC4(N_utimensat, d, h1, t, f));
 }
+#if defined(__i386__)
+EXP int __utimensat64(int d, const char*p, const void*t, int f) {
+    if (!p) return (int) ret(SC4(N_utimensat_time64, d, 0, t, f));
+    TR1(d, p, !(f&AT_SYMLINK_NOFOLLOW)) return (int) ret(SC4(N_utimensat_time64, d, h1, t, f));
+}
+#endif
 static int do_mknod(int d, const char*p, int m, unsigned long dev) {
     TR1(d, p, 0) long r = SC4(N_mknodat, d, h1, m, dev);
     if (r == -EPERM && VROOT() && ((m&0170000) == 0020000 || (m&0170000) == 0060000)) {
@@ -1888,8 +2112,15 @@ EXP int statfs(const char*p, void*b) {
     if (r == 0) fix_statfs(b);
     return (int) ret(r);
 }
+#if defined(__i386__)
+#define SC_STATFS64(h,b) sc(N_statfs64, (long)(h), 84, (long)(b), 0, 0, 0)
+#define SC_FSTATFS64(fd,b) sc(N_fstatfs64, (long)(fd), 84, (long)(b), 0, 0, 0)
+#else
+#define SC_STATFS64(h,b) SC3(N_statfs, h, b, 0)
+#define SC_FSTATFS64(fd,b) SC3(N_fstatfs, fd, b, 0)
+#endif
 EXP int statfs64(const char*p, void*b) {
-    TR1(AT_FDCWD, p, 1) long r = SC3(N_statfs, h1, b, 0);
+    TR1(AT_FDCWD, p, 1) long r = SC_STATFS64(h1, b);
     if (r == 0) fix_statfs(b);
     return (int) ret(r);
 }
@@ -1899,7 +2130,7 @@ EXP int fstatfs(int fd, void*b) {
     return (int) ret(r);
 }
 EXP int fstatfs64(int fd, void*b) {
-    long r = SC3(N_fstatfs, fd, b, 0);
+    long r = SC_FSTATFS64(fd, b);
     if (r == 0) fix_statfs(b);
     return (int) ret(r);
 }
@@ -2100,7 +2331,7 @@ static int tmpgen(char*t, int suffix, int flags, int isdir) {
         }
         long r;
         if (isdir) r = SC3(N_mkdirat, AT_FDCWD, hb, 0700);
-        else r = SC4(N_openat, AT_FDCWD, hb, O_RDWR|O_CREAT|O_EXCL|(flags&~O_ACCMODE_), 0600);
+        else r = SC4(N_openat, AT_FDCWD, hb, O_RDWR|O_CREAT|O_EXCL|O_LARGEFILE_|(flags&~O_ACCMODE_), 0600);
         if (r >= 0) return isdir ? 0 : (int) r;
         if (r != -EEXIST) return (int) ret(r);
     }
@@ -2539,9 +2770,11 @@ struct sysinfo_data {
 static void sysinfo_limit(struct sysinfo_data*i, int synth) {
     u64 total = g_memkb*1024;
     if (synth) {
-        i->mem_unit = 1;
-        i->totalram = total;
-        i->freeram = total/2;
+        u64 su = 1;
+        while (total/su>(u64)(unsigned long)-1) su <<= 1;
+        i->mem_unit = (unsigned int) su;
+        i->totalram = (unsigned long)(total/su);
+        i->freeram = (unsigned long)(total/su/2);
         i->sharedram = 0;
         i->bufferram = 0;
         i->totalswap = 0;
@@ -3211,27 +3444,53 @@ static char*acat(struct ar*a, const char*k, const char*v) {
 static int is_ours(const char*e) {
     return envmatch(e, "LD_PRELOAD") || envmatch(e, "PRX_ROOTFS") || envmatch(e, "PRX_SHIM") || envmatch(e, "PRX_LIBPATH") || envmatch(e, "PRX_BIND") || envmatch(e, "PRX_FAKEROOT") || envmatch(e, "PRX_DNS") || envmatch(e, "PRX_LOADER") || envmatch(e, "PRX_QEMU") || envmatch(e, "QEMU_SET_ENV") || envmatch(e, "PRX_SELF_EXE") || envmatch(e, "PRX_VUSER") || envmatch(e, "PRX_CRED") || envmatch(e, "PRX_CPUS") || envmatch(e, "PRX_MEM_KB") || envmatch(e, "PRX_NO_ARGV0");
 }
+#if defined(__i386__)
+/* ELF32 (the only class an i386 guest can run) */
+#define ELF_CLASS 1
+#define ELF_PHMIN 32
+#define EH_PHOFF(h) ((u64)*(const u32*)((h)+28))
+#define EH_PHES(h) (*(const u16*)((h)+42))
+#define EH_PHN(h) (*(const u16*)((h)+44))
+#define PH_OFF(p) ((u64)*(const u32*)((p)+4))
+#define PH_VADDR(p) ((u64)*(const u32*)((p)+8))
+#define PH_FILESZ(p) ((u64)*(const u32*)((p)+16))
+#define DYN_SZ 8
+#define DYN_TAG(d) ((long)*(const int*)(d))
+#define DYN_VAL(d) ((u64)*(const u32*)((d)+4))
+#else
+#define ELF_CLASS 2
+#define ELF_PHMIN 56
+#define EH_PHOFF(h) (*(const u64*)((h)+32))
+#define EH_PHES(h) (*(const u16*)((h)+54))
+#define EH_PHN(h) (*(const u16*)((h)+56))
+#define PH_OFF(p) (*(const u64*)((p)+8))
+#define PH_VADDR(p) (*(const u64*)((p)+16))
+#define PH_FILESZ(p) (*(const u64*)((p)+32))
+#define DYN_SZ 16
+#define DYN_TAG(d) (*(const long*)(d))
+#define DYN_VAL(d) (*(const u64*)((d)+8))
+#endif
 static int elf_runpath(int fd, const u8*ph, unsigned phes, unsigned phn, char*out, size_t osz) {
     u64 dyn_off = 0, dyn_sz = 0;
     out[0] = 0;
     for (unsigned i = 0; i<phn; i++) {
         const u8*p = ph+phes*i;
         if (*(const u32*) p == 2) {
-            dyn_off = *(const u64*)(p+8);
-            dyn_sz = *(const u64*)(p+32);
+            dyn_off = PH_OFF(p);
+            dyn_sz = PH_FILESZ(p);
             break;
         }
     }
     if (!dyn_sz) return 0;
     if (dyn_sz>4096) dyn_sz = 4096;
     u8 db[4096];
-    long dn = sc(N_pread64, fd, (long) db, (long) dyn_sz, (long) dyn_off, 0, 0);
-    if (dn<16) return 0;
+    long dn = pread_(fd, db, (long) dyn_sz, dyn_off);
+    if (dn<DYN_SZ) return 0;
     u64 strtab = 0, rp = 0, rpath = 0;
     int hr = 0, hp = 0;
-    for (long i = 0; i+16 <= dn; i += 16) {
-        long tag = *(long*)(db+i);
-        u64 v = *(u64*)(db+i+8);
+    for (long i = 0; i+DYN_SZ <= dn; i += DYN_SZ) {
+        long tag = DYN_TAG(db+i);
+        u64 v = DYN_VAL(db+i);
         if (tag == 0) break;
         if (tag == 5) strtab = v;
         else if (tag == 29) {
@@ -3248,14 +3507,14 @@ static int elf_runpath(int fd, const u8*ph, unsigned phes, unsigned phn, char*ou
     for (unsigned i = 0; i<phn && !found; i++) {
         const u8*p = ph+phes*i;
         if (*(const u32*) p != 1) continue;
-        u64 po = *(const u64*)(p+8), va = *(const u64*)(p+16), fs = *(const u64*)(p+32);
+        u64 po = PH_OFF(p), va = PH_VADDR(p), fs = PH_FILESZ(p);
         if (strtab >= va && strtab<va+fs) {
             off = strtab-va+po;
             found = 1;
         }
     }
     if (!found) return 0;
-    long rn = sc(N_pread64, fd, (long) out, (long)(osz-1), (long)(off+(hr ? rp : rpath)), 0, 0);
+    long rn = pread_(fd, out, (long)(osz-1), off+(hr ? rp : rpath));
     if (rn <= 0) return 0;
     out[rn] = 0;
     return out[0] != 0;
@@ -3481,26 +3740,26 @@ static int prep_exec(struct ar*a, const char*path, char*const argv[], char*const
             gp = interp;
             continue;
         }
-        if (!(hd[0] == 0x7f && hd[1] == 'E' && hd[2] == 'L' && hd[3] == 'F') || hn<64 || hd[4] != 2) {
+        if (!(hd[0] == 0x7f && hd[1] == 'E' && hd[2] == 'L' && hd[3] == 'F') || hn<(ELF_CLASS == 1 ? 52 : 64) || hd[4] != ELF_CLASS) {
             sc(N_close, fd, 0, 0, 0, 0, 0);
             return (int) fail(ENOEXEC);
         }
-        u64 phoff = *(u64*)(hd+32);
-        unsigned phes = *(u16*)(hd+54), phn = *(u16*)(hd+56);
+        u64 phoff = EH_PHOFF(hd);
+        unsigned phes = EH_PHES(hd), phn = EH_PHN(hd);
         char interp[256];
         char rpbuf[1024];
         int have = 0;
         rpbuf[0] = 0;
-        if (phes >= 56 && phes <= 64 && phn && phn <= 40) {
+        if (phes >= ELF_PHMIN && phes <= 64 && phn && phn <= 40) {
             u8 ph[64*40];
-            long pn = sc(N_pread64, fd, (long) ph, (long)(phes*phn), (long) phoff, 0, 0);
+            long pn = pread_(fd, ph, (long)(phes*phn), phoff);
             if (pn >= (long)(phes*phn)) elf_runpath((int) fd, ph, phes, phn, rpbuf, sizeof rpbuf);
             for (unsigned i = 0; pn >= (long)(phes*(i+1)) && i<phn; i++) {
                 u8*p = ph+phes*i;
                 if (*(u32*) p == 3) {
-                    u64 off = *(u64*)(p+8), sz = *(u64*)(p+32);
+                    u64 off = PH_OFF(p), sz = PH_FILESZ(p);
                     if (sz>0 && sz<sizeof interp) {
-                        long rn = sc(N_pread64, fd, (long) interp, (long) sz, (long) off, 0, 0);
+                        long rn = pread_(fd, interp, (long) sz, off);
                         if (rn>0) {
                             interp[sz] = 0;
                             have = 1;
