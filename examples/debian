@@ -1,7 +1,9 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-# 1. install dependency
-pkg install -y root-repo x11-repo && pkg install -y pulseaudio virglrenderer-android
+# 1. Guest ~/.bashrc
+echo "Install the following packages in Termux (optional): pkg install -y tur-repo x11-repo && pkg install -y pulseaudio virglrenderer-android"
+echo "Run this command to update your ~/.bashrc (optional)"
+echo 'printf "\nexport DISPLAY=:0\nexport GALLIUM_DRIVER=virpipe\nexport MESA_GL_VERSION_OVERRIDE=4.6\nexport PULSE_SERVER=127.0.0.1\n" >> ~/.bashrc'
 
 # 2. Kill any existing instances safely
 pkill -f termux-x11
@@ -22,7 +24,3 @@ sleep 2
 
 # 6. Login to the container with shared temporary directories
 prx login debian --no-root-id --cpus 4 --memory 3G -b $PREFIX/tmp/.X11-unix:/tmp/.X11-unix -b /vendor:/vendor -b /system:/system -b /odm:/odm -b /apex:/apex -b /dev/mali0:/dev/mali0 -b /dev/dri:/dev/dri -b /sdcard:/sdcard -b $PREFIX/tmp/.virgl_test:/tmp/.virgl_test
-
-# 7. Guest ~/.bashrc
-echo "Run this command to update your ~/.bashrc (optional)"
-echo 'printf "\nexport DISPLAY=:0\nexport GALLIUM_DRIVER=virpipe\nexport MESA_GL_VERSION_OVERRIDE=4.6\nexport PULSE_SERVER=127.0.0.1\n" >> ~/.bashrc'
