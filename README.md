@@ -111,14 +111,12 @@ What it does **not** do: it is not a security boundary (a tracee's own threads c
 
 ## Changelog
 
-### Unreleased
+### 1.0.1
 
 **New**
 
 - `prx login --ptrace` (or `PRX_PTRACE=1`): static and raw-syscall programs are path-translated by an optional ptrace + seccomp helper, `prxsup` (`src/prxsup.c`, built by `prx build`, `prx supsource` prints it). Off by default; dynamic programs are never slowed down. See "Static programs".
 - `tests/ptrace.sh`: end-to-end tests on a rootfs assembled from the host's own binaries, plus a shim/supervisor path-translation parity test.
-
-### 1.0.1
 
 **Safer**
 
