@@ -113,18 +113,10 @@ What it does **not** do: it is not a security boundary (a tracee's own threads c
 
 ### 1.0.1
 
-**New**
-
 - `prx login --ptrace` (or `PRX_PTRACE=1`): static and raw-syscall programs are path-translated by an optional ptrace + seccomp helper, `prxsup` (`src/prxsup.c`, built by `prx build`, `prx supsource` prints it). Off by default; dynamic programs are never slowed down. See "Static programs".
 - `tests/ptrace.sh`: end-to-end tests on a rootfs assembled from the host's own binaries, plus a shim/supervisor path-translation parity test.
-
-**Safer**
-
 - Writing into a rootfs (`install`, `login`) no longer follows symlinks out of it, so a link like `/var/lib/dbus/machine-id -> /etc/machine-id` can't make prx touch a file on your host. The same fix covers user, group and hosts lookups, and `login -w DIR`.
 - The patched loader is written to a temporary file and renamed, so two logins at the same time can't run a half-written one.
-
-**Fixed**
-
 - `--bind` silently ignored paths longer than 159 bytes. It now accepts up to 1023 bytes per path and 50 binds, and rejects anything invalid with a clear error.
 - A mistyped option such as `prx login NAME --typo` is now an error instead of being run as a command.
 - Rootfs with glibc older than 2.33 now start correctly (set `PRX_NO_ARGV0=1` to force this mode).
@@ -133,13 +125,7 @@ What it does **not** do: it is not a security boundary (a tracee's own threads c
 - The library cache refreshes after the guest installs or removes packages, and the shim is rebuilt when only `src/ldpatch.c` changes.
 - `/etc/passwd`, `/etc/group` and `/etc/hosts` are read in full, and groups can have any number of members.
 - DNS: IPv6 nameservers now work and can be mixed with IPv4 in `PRX_DNS`; invalid entries are dropped with a warning.
-
-**Faster**
-
 - Cleaning up guest processes when `prx login` exits is about 5x faster on a busy host, and `prx list` is quicker too.
-
-**Removed**
-
 - CPU and RAM limits (`-c`, `-m`, `--hard-mem` and `prx set`).
 
 ## License
