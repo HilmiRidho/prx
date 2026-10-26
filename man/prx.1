@@ -64,11 +64,6 @@ warns and continues without it. Static programs get no fake uid/gid, no
 /proc fakes and no AF_UNIX path translation, and cannot use ptrace themselves.
 This is still not a security boundary. Default off; see
 .BR PRX_PTRACE .
-.TP
-.B \-\-no\-ptrace
-Do not use the tracer, even if
-.B PRX_PTRACE
-is set.
 .RE
 .TP
 .B list

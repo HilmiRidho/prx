@@ -61,7 +61,7 @@ See `man prx` or `prx help` for all commands and options.
 | `-e, --env KEY=VAL` | Pass an environment variable. |
 | `--no-root-id` | Run as the host user instead of fake root; `sudo` and `su` still work. |
 | `--trace` | Debug syscall and seccomp tracing. |
-| `--ptrace` | Also translate paths for static and raw-syscall programs (see below). Default off; `PRX_PTRACE=1` turns it on for every login, `--no-ptrace` turns it off again. |
+| `--ptrace` | Also translate paths for static and raw-syscall programs (see below). Default off; `PRX_PTRACE=1` turns it on for every login. |
 
 ## Environment
 

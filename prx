@@ -39,8 +39,6 @@ Usage:
         --no-root-id                 Run as the host user (host name/UID/GID); sudo/su still work
         --trace                      Enable debug syscall & seccomp tracing
         --ptrace                     Also translate paths of static / raw-syscall programs
-                                     (ptrace + seccomp helper; see "Static programs" below)
-        --no-ptrace                  Do not (default; overrides PRX_PTRACE=1)
   prx list                           List all installed rootfs containers
   prx fixperm NAME                   Fix file permissions & clear cache
   prx remove NAME                    Completely remove a container
@@ -57,20 +55,14 @@ Environment:
   CC=PROGRAM        C compiler used to build the shim
 
 Static programs:
-By default only programs that use the guest's libc are path-translated; static binaries
-(Go, busybox-static, ...) and raw syscalls bypass the shim. 'prx login --ptrace' starts
-exactly those programs under a small tracer (prxsup) that translates their paths too, and
-leaves everything else untouched. It needs ptrace and seccomp-bpf on the host, an
-x86_64 or aarch64 rootfs of the host's architecture (not qemu-user), and it is still not
-a security boundary.
+By default only programs that use the guest's libc are path-translated; static and
+raw-syscall binaries (Go, busybox-static, ...) bypass the shim. --ptrace runs those under
+a small tracer (prxsup) that translates their paths too. It needs ptrace and seccomp on
+the host and a rootfs of the host's architecture (not qemu-user). Not a security boundary.
 
-Cross-arch rootfs is detected automatically and run through qemu-user, in both
-directions: x86_64 rootfs on an aarch64 host (needs qemu-x86_64) and aarch64 rootfs
-on an x86_64 host (needs qemu-aarch64). To cross-build the shim you also need
-clang + lld, or a cross gcc (aarch64-linux-gnu-gcc / x86_64-linux-gnu-gcc).
-An i386 (32-bit x86) rootfs is supported on both host types, but only through
-qemu-user (qemu-i386): there is no native i386 mode, even on an x86_64 host. Its
-shim is built with clang + lld, i686-linux-gnu-gcc, or gcc -m32 (gcc-multilib).
+Cross-arch rootfs (x86_64, aarch64, i386) is detected automatically and runs through
+qemu-user; i386 is qemu-only, even on an x86_64 host. Cross-building the shim needs
+clang + lld or a cross gcc (i386: i686-linux-gnu-gcc or gcc -m32).
   Termux:        pkg install qemu-user-x86-64 qemu-user-aarch64 qemu-user-i386 clang
   Debian/Ubuntu: apt install qemu-user-static clang lld
   PRX_QEMU=/path/to/qemu-ARCH        Use a specific qemu-user binary
@@ -675,7 +667,6 @@ shift 2 ;;
 --no-root-id) fake=0; shift ;;
 --trace)      trace=1; shift ;;
 --ptrace)     ptrace=1; shift ;;
---no-ptrace)  ptrace=0; shift ;;
 --) shift; break ;;
 -*) die "Unknown option for 'login': $1 (put '--' before the command if it starts with '-')" ;;
 *) break ;;
