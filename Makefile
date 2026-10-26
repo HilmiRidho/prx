@@ -6,7 +6,7 @@ DATADIR ?= $(PREFIX)/share/prx
 MANDIR  ?= $(PREFIX)/share/man/man1
 CC      ?= cc
 
-.PHONY: all install uninstall check lint clean
+.PHONY: all install uninstall check check-ptrace lint clean
 
 all:
 	@echo "Nothing to compile at install time: the shim is built per-user on first 'prx login' (or 'prx build')."
@@ -31,6 +31,10 @@ lint:
 
 check: lint
 	bash tests/smoke.sh
+
+# --ptrace tests: skip themselves when ptrace/seccomp is unavailable
+check-ptrace:
+	bash tests/ptrace.sh
 
 clean:
 	rm -rf tests/.tmp tests/.tmp-ptrace

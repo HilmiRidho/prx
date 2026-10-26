@@ -44,11 +44,11 @@ See `man prx` or `prx help` for all commands and options.
 | Command | Purpose |
 | --- | --- |
 | `prx build` | Compile the shim, the loader patcher and the ptrace helper. |
-| `prx install NAME FILE\|URL [--sha256 HEX]` | Extract a rootfs archive as container `NAME`; the checksum is verified before extraction. |
+| `prx install NAME FILE\|URL [--sha256 HEX]` | Extract a rootfs archive as container `NAME`; the checksum is verified before extraction. A plain `http://` URL is refused without `--sha256`. |
 | `prx login NAME [options] [-- cmd]` | Start a shell, or run one command, inside the container. |
 | `prx list` | List installed containers. |
 | `prx fixperm NAME` | Repair permissions and flush the library-path cache. |
-| `prx remove NAME` | Delete a container and its derived files. |
+| `prx remove [-y] NAME` | Delete a container and its derived files. Asks for confirmation on a terminal; `-y` skips it. |
 | `prx source`, `prx ldsource`, `prx supsource` | Print the C sources of the shim / loader patcher / ptrace helper. |
 | `prx --version` | Print the version. |
 

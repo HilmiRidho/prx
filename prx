@@ -41,7 +41,7 @@ Usage:
         --ptrace                     Also translate paths of static / raw-syscall programs
   prx list                           List all installed rootfs containers
   prx fixperm NAME                   Fix file permissions & clear cache
-  prx remove NAME                    Completely remove a container
+  prx remove [-y] NAME               Completely remove a container (asks first on a terminal; -y skips)
   prx source | prx ldsource | prx supsource
                                      Print the C sources (shim / loader patcher / ptrace helper)
   prx --version                      Show version
@@ -433,6 +433,7 @@ dest="$(rootdir "$name")"
 mkdir -p "$PRX_HOME/dl"
 case "$src" in
 http://*|https://*)
+case "$src" in http://*) [ -n "$sha" ] || die "Refusing to download over plain http:// without --sha256 (use https:// or pass --sha256 HEX)" ;; esac
 local base="${src%%\?*}"; base="${base%%#*}"; base="${base%/}"; base="${base##*/}"
 case "$base" in ""|.|..) base="rootfs-$name.tar" ;; esac
 file="$PRX_HOME/dl/$base"
@@ -902,13 +903,28 @@ echo "(no rootfs installed yet)"
 fi
 }
 cmd_remove() {
+local yes=0
+while [ $# -gt 0 ]; do
+case "$1" in
+-y|--yes) yes=1; shift ;;
+--) shift; break ;;
+-*) die "Unknown option for 'remove': $1" ;;
+*) break ;;
+esac
+done
 [ $# -ge 1 ] || { usage; exit 1; }
 local name="$1" d; chk "$name"; d="$(rootdir "$name")"; [ -d "$d" ] || die "Rootfs not found: $name"
+if [ "$yes" = 0 ] && [ -t 0 ]; then
+local ans=""
+printf "prx: delete container '%s' (%s) and everything in it? [y/N] " "$name" "$d" >&2
+read -r ans || ans=""
+case "$ans" in y|Y|yes|YES) ;; *) die "Aborted; nothing was removed" ;; esac
+fi
 chmod -R u+rwX "$d" 2>/dev/null || true
 rm -rf "$d"
 rm -f "$PRX_HOME/lib/ld-$name.so" "$PRX_HOME/lib/ld-$name.so.stamp" "$PRX_HOME/lib/libpath-$name"
 rm -rf "$PRX_HOME/lib/libc-$name"
-rm -f "$PRX_HOME/conf/$name.conf"
+rm -f "$PRX_HOME/conf/$name.conf"   # legacy: left behind by older versions (limits via the removed "prx set")
 info "Removed container '$name' and associated patches."
 }
 case "${1:-}" in

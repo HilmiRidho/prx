@@ -26,6 +26,7 @@ Compile the C runtime shim and loader patcher (needs a C compiler).
 Extract a rootfs archive as container NAME. With
 .B \-\-sha256
 the archive is verified before extraction; without it a warning is printed.
+A plain \fBhttp://\fR URL is refused unless \fB\-\-sha256\fR is given.
 .TP
 \fBlogin\fR \fINAME\fR [\fIoptions\fR] [\fB\-\-\fR \fIcommand\fR...]
 Start a shell or command inside the container.
@@ -72,8 +73,10 @@ List installed containers.
 \fBfixperm\fR \fINAME\fR
 Repair permissions and flush the library-path cache.
 .TP
-\fBremove\fR \fINAME\fR
-Delete a container and its derived files.
+\fBremove\fR [\fB\-y\fR] \fINAME\fR
+Delete a container and its derived files. When standard input is a terminal,
+prx asks for confirmation first; \fB\-y\fR (\fB\-\-yes\fR) skips the question.
+Non-interactive use (scripts) is never prompted.
 .TP
 .B source, ldsource, supsource
 Print the C sources of the shim, the loader patcher and the ptrace helper.

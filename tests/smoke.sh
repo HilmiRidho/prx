@@ -34,6 +34,15 @@ make -s -C "$HERE" install DESTDIR="$D" PREFIX=/usr >/dev/null
 "$D/usr/bin/prx" source | cmp -s - "$HERE/src/prx.c" && ok "installed layout finds sources"
 [ -f "$D/usr/share/man/man1/prx.1" ] && ok "manpage installed"
 
+# plain http:// is refused without --sha256 (before any download is attempted)
+if "$PRX" install h1 http://example.invalid/rootfs.tar.gz 2>"$T/err"; then fail "http:// without --sha256 accepted"; fi
+grep -q 'plain http' "$T/err" && ok "refuses http:// without --sha256"
+[ ! -e "$HOME/.local/share/prx/dl/rootfs.tar.gz" ] && ok "no download attempted for refused http://"
+
+# remove: unknown option is an error; -y is accepted
+if "$PRX" remove --bogus x 2>"$T/err"; then fail "remove accepted an unknown option"; fi
+grep -q "Unknown option for 'remove'" "$T/err" && ok "remove rejects unknown options"
+
 # name validation
 if "$PRX" login ../evil 2>"$T/err"; then fail "path traversal accepted"; fi
 grep -q 'Invalid container name' "$T/err" && ok "rejects invalid container name"
