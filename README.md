@@ -18,7 +18,7 @@ User-space container / path-translation engine (glibc rootfs, no root needed).
     make install PREFIX=/usr DESTDIR=pkgroot   # for packagers
     make check                                 # lint + smoke tests (needs a C compiler)
 
-The shim is compiled per user on the first `prx login` (or explicitly with `prx build`). It is rebuilt automatically when `prx`, `src/prx.c` or `src/ldpatch.c` change.
+The shim is compiled per user on the first `prx login` (or explicitly with `prx build`). It is rebuilt automatically when `prx`, `src/prx.c`, one of its `src/prx_*.h` headers or `src/ldpatch.c` change.
 
 Prebuilt packages:
 
@@ -68,7 +68,7 @@ See `man prx` or `prx help` for all commands and options.
 | Variable | Meaning |
 | --- | --- |
 | `PRX_HOME` | Data directory. Default: `~/.prx` if it exists, otherwise `$XDG_DATA_HOME/prx` (`~/.local/share/prx`). |
-| `PRX_SRCDIR` | Directory holding `prx.c`, `ldpatch.c` and `prxsup.c`. |
+| `PRX_SRCDIR` | Directory holding `prx.c` (with its `prx_*.h` headers), `ldpatch.c` and `prxsup.c`. |
 | `PRX_PTRACE` | Set to `1` to behave as if `--ptrace` were given. |
 | `PRX_DNS` | IPv4 / IPv6 nameservers for the guest, separated by `,`, `;` or blanks. |
 | `PRX_QEMU` | Path to a specific `qemu-user` binary for cross-architecture rootfs. |
@@ -79,7 +79,17 @@ See `man prx` or `prx help` for all commands and options.
 ## Layout
 
     prx            shell front-end (pure bash, passes `bash -n` / shellcheck)
-    src/prx.c      LD_PRELOAD path-translation shim
+    src/prx.c      LD_PRELOAD path-translation shim: one translation unit that
+                   #includes the parts below, in this order (`prx source` prints it expanded)
+    src/prx_sys.h    freestanding runtime: types, per-arch layouts, raw syscalls
+    src/prx_core.h   shim state, bind table, SIGSYS handler, start-up
+    src/prx_path.h   guest <-> host path translation, /proc fakes
+    src/prx_fs.h     filesystem entry points (open, stat, readlink, ...)
+    src/prx_net.h    socket entry points
+    src/prx_misc.h   capabilities, prctl, uname, signals, small hooks
+    src/prx_cred.h   fake root, virtual credentials, passwd/group lookups
+    src/prx_exec.h   exec/spawn, ELF inspection, library path
+    src/prx_dns.h    DNS and getaddrinfo
     src/ldpatch.c  glibc loader/libc patcher
     src/prxsup.c   optional ptrace helper for static programs (`--ptrace`)
     man/prx.1      manual page

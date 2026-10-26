@@ -43,12 +43,12 @@ Usage:
   prx fixperm NAME                   Fix file permissions & clear cache
   prx remove [-y] NAME               Completely remove a container (asks first on a terminal; -y skips)
   prx source | prx ldsource | prx supsource
-                                     Print the C sources (shim / loader patcher / ptrace helper)
+                                     Print the C sources (shim, with its headers expanded / loader patcher / ptrace helper)
   prx --version                      Show version
 
 Environment:
   PRX_HOME=DIR      Data directory (default: ~/.prx if present, else \$XDG_DATA_HOME/prx)
-  PRX_SRCDIR=DIR    Directory holding prx.c and ldpatch.c
+  PRX_SRCDIR=DIR    Directory holding prx.c (with its prx_*.h headers) and ldpatch.c
   PRX_DNS=LIST      IPv4/IPv6 DNS servers for the guest (separated by ',', ';' or blanks)
   PRX_NO_ARGV0=1    Never pass --argv0 to the loader (auto-detected; glibc < 2.33 lacks it)
   PRX_PTRACE=1      Same as 'prx login --ptrace'
@@ -83,9 +83,30 @@ need_src() { SRCDIR="$(prx_srcdir)" || die "C sources not found (set PRX_SRCDIR,
 shim_stale() {
 [ -f "$1" ] || return 0
 need_src
-[ "$SELF" -nt "$1" ] || [ "$SRCDIR/prx.c" -nt "$1" ] || [ "$SRCDIR/ldpatch.c" -nt "$1" ]
+local h
+if [ "$SELF" -nt "$1" ] || [ "$SRCDIR/prx.c" -nt "$1" ] || [ "$SRCDIR/ldpatch.c" -nt "$1" ]; then return 0; fi
+# prx.c is split into prx_*.h headers: a change to any of them also needs a rebuild
+for h in "$SRCDIR"/prx_*.h; do
+[ "$h" -nt "$1" ] && return 0
+done
+return 1
 }
-cmd_source()   { need_src; cat "$SRCDIR/prx.c"; }
+# prx_flatten FILE: print FILE with each '#include "prx_*.h"' line replaced by that
+# header (looked up next to FILE), so the split shim prints as one self-contained file.
+prx_flatten() {
+local f="$1" line h
+while IFS= read -r line || [ -n "$line" ]; do
+case "$line" in
+'#include "prx_'*'.h"')
+h="${line#*\"}"; h="${h%\"*}"
+case "$h" in */*) die "bad include in $f: $h" ;; esac
+[ -f "${f%/*}/$h" ] || die "source header not found: ${f%/*}/$h"
+cat "${f%/*}/$h" ;;
+*) printf '%s\n' "$line" ;;
+esac
+done < "$f"
+}
+cmd_source()   { need_src; prx_flatten "$SRCDIR/prx.c"; }
 cmd_ldsource() { need_src; cat "$SRCDIR/ldpatch.c"; }
 cmd_supsource() { need_src; [ -f "$SRCDIR/prxsup.c" ] || die "prxsup.c not found"; cat "$SRCDIR/prxsup.c"; }
 cmd_build() {
@@ -591,15 +612,10 @@ chk_binds_total() {
 if [ "$nbinds" -gt 50 ]; then die "Too many --bind options (limit 50)"; fi
 if [ "${#binds}" -ge 16000 ]; then die "--bind list too long (limit 16000 bytes in total)"; fi
 }
-cmd_login() {
-[ $# -ge 1 ] || { usage; exit 1; }
-local name="$1"; shift
-local R binds="" nbinds=0 wd=/root wdset=0 fake=1 bh bg trace=0 ptrace=0
-[ "${PRX_PTRACE:-}" = 1 ] && ptrace=1
-local -a extra_envs=()
-chk "$name"
-R="$(rootdir "$name")"
-[ -d "$R" ] || die "Rootfs '$name' does not exist. Use: prx install $name ARCHIVE"
+# prx_prepare_rootfs ROOT: idempotently seed what a rootfs needs to be usable
+# without root (PAM/sudo stubs, passwd/group, machine-id, /dev links).
+prx_prepare_rootfs() {
+local R="$1" pam_svc shadow_h gd MID DMID DEVD
 mkdir -p "$(rpath "$R" /etc/pam.d)" "$(rpath "$R" /etc/sudoers.d)"
 for pam_svc in sudo su chfn chsh login other sshd; do
 rwfile "$R" "/etc/pam.d/$pam_svc" 'auth sufficient pam_permit.so\naccount sufficient pam_permit.so\nsession sufficient pam_permit.so\npassword sufficient pam_permit.so\n'
@@ -616,7 +632,6 @@ fi
 if [ ! -f "$(rpath "$R" /etc/group)" ]; then
 rwfile "$R" /etc/group 'root:x:0:\ndaemon:x:1:\nbin:x:2:\nsys:x:3:\nadm:x:4:\ntty:x:5:\ndisk:x:6:\nsudo:x:27:\naudio:x:29:\nvideo:x:44:\nusers:x:100:\nnogroup:x:65534:\n'
 fi
-local shadow_h gd MID DMID DEVD
 shadow_h="$(rpath "$R" /etc/shadow)"
 if [ -f "$shadow_h" ]; then
 sed -i 's/^root:[^:]*:/root::/' "$shadow_h" 2>/dev/null || true
@@ -641,6 +656,13 @@ ln -sf /proc/self/fd/0 "$DEVD/stdin"  2>/dev/null || true
 ln -sf /proc/self/fd/1 "$DEVD/stdout" 2>/dev/null || true
 ln -sf /proc/self/fd/2 "$DEVD/stderr" 2>/dev/null || true
 ln -sf /dev/pts/ptmx   "$DEVD/ptmx"   2>/dev/null || true
+return 0
+}
+# prx_parse_login_opts ROOT ARGS...: parse the options of 'prx login'.
+# Writes the caller's binds nbinds wd wdset fake trace ptrace extra_envs and sets
+# login_consumed to the number of arguments used, so the caller can shift them.
+prx_parse_login_opts() {
+local R="$1" bh bg total; shift; total=$#
 while [ $# -gt 0 ]; do
 case "$1" in
 -b|--bind)
@@ -673,7 +695,13 @@ shift 2 ;;
 *) break ;;
 esac
 done
-local vuser="" vhome="/root"
+login_consumed=$((total - $#))
+return 0
+}
+# prx_resolve_user ROOT: with --no-root-id, set up the host user inside the rootfs.
+# Reads fake wdset; writes the caller's vuser vhome wd.
+prx_resolve_user() {
+local R="$1"
 if [ "$fake" = 0 ]; then
 local huid hgid hu
 huid="$(id -u)"; hgid="$(id -g)"
@@ -689,7 +717,12 @@ prx_setup_user "$R" "$hu" "$huid" "$hgid"
 [ "$wdset" = 1 ] || wd="$vhome"
 fi
 fi
-local QEMU=""
+return 0
+}
+# prx_select_shim ROOT NAME: detect the guest arch and make sure a matching shim
+# exists. Sets the caller's QEMU (empty for a native guest) and SHIM.
+prx_select_shim() {
+local R="$1" name="$2"
 detect_guest "$R" || true
 if [ "$ARCH" != "$HARCH" ]; then
 QEMU="$(find_qemu "$ARCH")" || die "Rootfs '$name' is $ARCH but this host is $HARCH, and qemu-$ARCH was not found. Install it ($(qemu_hint "$ARCH")) or set PRX_QEMU=/path/to/qemu-$ARCH"
@@ -703,14 +736,12 @@ elif shim_stale "$SHIM"; then
 info "Compiling path-translation shim..."
 cmd_build
 fi
-local LD; LD="$(find_loader "$R")" || die "Glibc dynamic loader not found. Container must be glibc-based."
-# ld.so --argv0 exists only in glibc >= 2.33; older rootfs get the full path as argv[0].
-local NOARGV0=0
-if [ "${PRX_NO_ARGV0:-}" = 1 ]; then NOARGV0=1
-elif ! { ${QEMU:+"$QEMU"} "$LD" --help 2>&1 || true; } | grep -q -- '--argv0'; then NOARGV0=1
-fi
-if [ "$NOARGV0" = 1 ] && [ "$trace" = 1 ]; then info "loader has no --argv0 (glibc < 2.33): argv[0] will be the full path"; fi
-local PL=""
+return 0
+}
+# prx_patch_loader ROOT NAME: on a native aarch64 guest, patch the loader and libc
+# (syscall rewriting). Reads QEMU; writes the caller's LD PL PLCD.
+prx_patch_loader() {
+local R="$1" name="$2" c
 if [ "$ARCH" = aarch64 ] && [ -z "$QEMU" ]; then
 [ -x "$PRX_HOME/lib/ldpatch" ] || cmd_build
 PL="$PRX_HOME/lib/ld-$name.so"
@@ -723,7 +754,8 @@ local np; np="$("$PRX_HOME/lib/ldpatch" "$LD" "$PL")" || die "Failed to patch EL
 printf '%s\n' "$ldst" > "$PL.stamp"
 fi
 LD="$PL"
-local LC="" PLCD="$PRX_HOME/lib/libc-$name" target
+local LC="" target
+PLCD="$PRX_HOME/lib/libc-$name"
 for c in \
 "$R/usr/lib/$TRIPLET/libc.so.6" "$R/lib/$TRIPLET/libc.so.6" \
 "$R/lib64/libc.so.6" "$R/usr/lib64/libc.so.6" \
@@ -747,7 +779,12 @@ else
 PLCD=""
 fi
 fi
-local LP="" d
+return 0
+}
+# prx_build_libpath ROOT NAME: assemble the guest library path into the caller's LP
+# (reads PLCD; refreshes the per-container library cache when stale).
+prx_build_libpath() {
+local R="$1" name="$2" d
 for d in \
 "$R/usr/local/lib/$TRIPLET" "$R/usr/lib/$TRIPLET" "$R/lib/$TRIPLET" \
 "$R/usr/local/lib64" "$R/usr/lib64" "$R/lib64" \
@@ -796,10 +833,12 @@ while IFS= read -r d; do
 case "$d" in /*) [ -d "$R$d" ] && lp_add "$R$d" ;; esac
 done < "$cf"
 done
-local SH; SH="$(find_shell "$R")" || die "No suitable shell (bash/sh) found in rootfs"
-local gshell=/bin/bash
-case "$SH" in */sh) gshell=/bin/sh ;; esac
-local -a supenv=()
+return 0
+}
+# prx_setup_ptrace ROOT LOADER SHELL: for --ptrace, build/probe the supervisor and
+# fill the caller's supenv array. Reads ptrace QEMU; any failure only warns.
+prx_setup_ptrace() {
+local R="$1" LD="$2" SH="$3"
 if [ "$ptrace" = 1 ]; then
 if [ -n "$QEMU" ]; then
 warn "--ptrace does not support cross-architecture rootfs (qemu-user); ignored"
@@ -821,6 +860,50 @@ warn "ptrace/seccomp is not usable here; static programs run without path transl
 fi
 fi
 fi
+return 0
+}
+# prx_detect_lang ROOT: print C.UTF-8 if the guest has that locale, else C.
+prx_detect_lang() {
+local R="$1" LANGV=C lcd
+for lcd in "$R/usr/lib/locale/C.utf8" "$R/usr/lib/locale/C.UTF-8"; do
+[ -s "$lcd/LC_CTYPE" ] && { LANGV=C.UTF-8; break; }
+done
+if [ "$LANGV" = C ] && [ -s "$R/usr/lib/locale/locale-archive" ] && grep -aqi 'C\.utf-\?8' "$R/usr/lib/locale/locale-archive" 2>/dev/null; then LANGV=C.UTF-8; fi
+printf '%s\n' "$LANGV"
+return 0
+}
+cmd_login() {
+[ $# -ge 1 ] || { usage; exit 1; }
+local name="$1"; shift
+local R binds="" nbinds=0 wd=/root wdset=0 fake=1 trace=0 ptrace=0 login_consumed=0
+[ "${PRX_PTRACE:-}" = 1 ] && ptrace=1
+local -a extra_envs=()
+chk "$name"
+R="$(rootdir "$name")"
+[ -d "$R" ] || die "Rootfs '$name' does not exist. Use: prx install $name ARCHIVE"
+prx_prepare_rootfs "$R"
+prx_parse_login_opts "$R" "$@"
+shift "$login_consumed"
+local vuser="" vhome="/root"
+prx_resolve_user "$R"
+local QEMU=""
+prx_select_shim "$R" "$name"
+local LD; LD="$(find_loader "$R")" || die "Glibc dynamic loader not found. Container must be glibc-based."
+# ld.so --argv0 exists only in glibc >= 2.33; older rootfs get the full path as argv[0].
+local NOARGV0=0
+if [ "${PRX_NO_ARGV0:-}" = 1 ]; then NOARGV0=1
+elif ! { ${QEMU:+"$QEMU"} "$LD" --help 2>&1 || true; } | grep -q -- '--argv0'; then NOARGV0=1
+fi
+if [ "$NOARGV0" = 1 ] && [ "$trace" = 1 ]; then info "loader has no --argv0 (glibc < 2.33): argv[0] will be the full path"; fi
+local PL="" PLCD=""
+prx_patch_loader "$R" "$name"
+local LP=""
+prx_build_libpath "$R" "$name"
+local SH; SH="$(find_shell "$R")" || die "No suitable shell (bash/sh) found in rootfs"
+local gshell=/bin/bash
+case "$SH" in */sh) gshell=/bin/sh ;; esac
+local -a supenv=()
+prx_setup_ptrace "$R" "$LD" "$SH"
 local startdir; startdir="$(rpath "$R" "$wd")" || startdir=""
 [ -n "$startdir" ] && [ -d "$startdir" ] || { startdir="$R"; wd=/; }
 local -a prog
@@ -829,12 +912,8 @@ prog=("$SH" -l)
 else
 prog=("$SH" -c 'exec "$@"' prx "$@")
 fi
-local LANGV=C lcd
 local GCONV="$R/usr/lib/$TRIPLET/gconv:$R/usr/lib/gconv"
-for lcd in "$R/usr/lib/locale/C.utf8" "$R/usr/lib/locale/C.UTF-8"; do
-[ -s "$lcd/LC_CTYPE" ] && { LANGV=C.UTF-8; break; }
-done
-if [ "$LANGV" = C ] && [ -s "$R/usr/lib/locale/locale-archive" ] && grep -aqi 'C\.utf-\?8' "$R/usr/lib/locale/locale-archive" 2>/dev/null; then LANGV=C.UTF-8; fi
+local LANGV; LANGV="$(prx_detect_lang "$R")"
 cd "$startdir"
 local tok="$$.$RANDOM$RANDOM" rc=0
 trap : INT

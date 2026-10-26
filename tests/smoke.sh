@@ -14,7 +14,12 @@ fail() { echo "FAIL - $1" >&2; exit 1; }
 bash -n "$PRX" && ok "bash -n prx"
 [ "$("$PRX" --version)" = "prx $(sed -n 's/^PRX_VERSION=//p' "$PRX")" ] && ok "--version"
 "$PRX" help | grep -q 'prx install NAME' && ok "help"
-"$PRX" source   | cmp -s - "$HERE/src/prx.c"     && ok "prx source matches src/prx.c"
+# prx.c #includes src/prx_*.h; 'prx source' must print it as one self-contained file
+# that the compiler sees exactly as it sees src/prx.c
+"$PRX" source > "$T/prx-flat.c"
+grep -q '^#include "prx_' "$T/prx-flat.c" && fail "prx source left a header include unexpanded"
+[ "$("${CC:-cc}" -E -P -x c "$T/prx-flat.c" | md5sum)" = "$("${CC:-cc}" -E -P -x c "$HERE/src/prx.c" | md5sum)" ] \
+  && ok "prx source expands src/prx.c with its headers" || fail "prx source differs from src/prx.c after preprocessing"
 "$PRX" ldsource | cmp -s - "$HERE/src/ldpatch.c" && ok "prx ldsource matches src/ldpatch.c"
 "$PRX" supsource | cmp -s - "$HERE/src/prxsup.c" && ok "prx supsource matches src/prxsup.c"
 
@@ -31,7 +36,9 @@ rm -rf "$HOME/.prx"
 # installed layout: bin/prx finds ../share/prx/src
 D="$T/dest"
 make -s -C "$HERE" install DESTDIR="$D" PREFIX=/usr >/dev/null
-"$D/usr/bin/prx" source | cmp -s - "$HERE/src/prx.c" && ok "installed layout finds sources"
+"$D/usr/bin/prx" source | cmp -s - "$T/prx-flat.c" && ok "installed layout finds sources"
+for h in "$HERE"/src/prx_*.h; do [ -f "$D/usr/share/prx/src/${h##*/}" ] || fail "make install did not install ${h##*/}"; done
+ok "make install installs every src/prx_*.h header"
 [ -f "$D/usr/share/man/man1/prx.1" ] && ok "manpage installed"
 
 # plain http:// is refused without --sha256 (before any download is attempted)
@@ -119,6 +126,14 @@ ln -s "$T/decoy/pam-sudo"   "$T/fs2/etc/pam.d/sudo"
 tar -C "$T/fs2" -czf "$T/fs2.tar.gz" .
 "$PRX" install t3 "$T/fs2.tar.gz" >/dev/null 2>&1 || fail "install t3"
 "$PRX" login t3 >/dev/null 2>&1 || true      # stops at 'loader not found', after the writes
+
+# editing any src/prx_*.h header must rebuild the shim; an untouched tree must not
+S="$D/usr/share/prx/src"
+PRX_SRCDIR="$S" "$PRX" login t3 >/dev/null 2>&1 || true        # bring the shim up to date
+if PRX_SRCDIR="$S" "$PRX" login t3 2>&1 | grep -q 'Compiling path-translation shim'; then fail "shim rebuilt although no source changed"; fi
+sleep 1; touch "$S/prx_dns.h"
+PRX_SRCDIR="$S" "$PRX" login t3 2>&1 | grep -q 'Compiling path-translation shim' \
+  && ok "editing a prx_*.h header triggers a shim rebuild" || fail "editing a prx_*.h header did not trigger a shim rebuild"
 [ "$(cat "$T/decoy/machine-id")" = keep ] && [ "$(cat "$T/decoy/pam-sudo")" = keep ] && ok "rootfs symlinks cannot redirect writes to the host" || fail "rootfs symlinks cannot redirect writes to the host"
 grep -q pam_permit "$HOME/.local/share/prx/rootfs/t3$T/decoy/pam-sudo" && ok "write landed inside the rootfs instead" || fail "write landed inside the rootfs instead"
 "$PRX" remove t3 >/dev/null 2>&1
