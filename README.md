@@ -126,7 +126,6 @@ What it does **not** do: it is not a security boundary (a tracee's own threads c
 - `/etc/passwd`, `/etc/group` and `/etc/hosts` are read in full, and groups can have any number of members.
 - DNS: IPv6 nameservers now work and can be mixed with IPv4 in `PRX_DNS`; invalid entries are dropped with a warning.
 - Cleaning up guest processes when `prx login` exits is about 5x faster on a busy host, and `prx list` is quicker too.
-- CPU and RAM limits (`-c`, `-m`, `--hard-mem` and `prx set`).
 
 ## License
 
