@@ -74,8 +74,9 @@ Suggests: $SUGGESTS
 Maintainer: HilmiCode <hilmialiridho2006@gmail.com>
 Description: user-space container and path-translation engine
  prx runs a glibc-based Linux root filesystem as an unprivileged user,
- without root, namespaces or ptrace. Paths are translated by an LD_PRELOAD
- shim that is compiled per user on first use.
+ without root or namespaces. Paths are translated by an LD_PRELOAD shim that
+ is compiled per user on first use; static programs can optionally be
+ handled by a small ptrace helper (prx login --ptrace).
  .
  It is a convenience tool, not a security boundary. Only glibc root
  filesystems on x86_64 and aarch64 hosts are supported; foreign-architecture

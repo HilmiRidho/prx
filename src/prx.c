@@ -82,6 +82,7 @@ typedef long long s64;
 #define N_capget 90
 #define N_capset 91
 #define N_getpid 172
+#define N_exit_group 94
 #define N_sched_getaffinity 123
 #define N_getppid 173
 #define N_getuid 174
@@ -120,6 +121,7 @@ typedef long long s64;
 #define N_ioctl 16
 #define N_pread64 17
 #define N_getpid 39
+#define N_exit_group 231
 #define N_sched_getaffinity 204
 #define N_execve 59
 #define N_fcntl 72
@@ -178,6 +180,7 @@ typedef long long s64;
 #define N_chdir 12
 #define N_lseek 19
 #define N_getpid 20
+#define N_exit_group 252
 #define N_getppid 64
 #define N_ioctl 54
 #define N_fcntl 55
@@ -375,6 +378,10 @@ static char g_shim[PM];
 static char g_libpath[LPM];
 static char g_loader[PM];
 static char g_qemu[PM];
+/* optional ptrace supervisor for static programs (prx login --ptrace): see prxsup.c */
+static char g_sup[PM], g_ld[PM], g_sh[PM];
+static char g_traced[8];   /* PRX_TRACED: "1" inside a traced tree, "off" if tracing is unavailable */
+static int g_delegate;     /* PRX_DELEGATE=1: this process only exists to run one execve() */
 #define BENV 16384
 static char g_bindenv[BENV];
 static int g_noargv0;
@@ -541,6 +548,11 @@ static void prx_do_init(char**envp) {
         else if (envmatch(s, "PRX_FAKEROOT")) g_fake = (s[13] == '1');
         else if (envmatch(s, "PRX_VUSER")) copyval(g_vuser, sizeof g_vuser, s+10);
         else if (envmatch(s, "PRX_CRED")) copyval(g_credbuf, sizeof g_credbuf, s+9);
+        else if (envmatch(s, "PRX_SUP")) copyval(g_sup, PM, s+8);
+        else if (envmatch(s, "PRX_LD")) copyval(g_ld, PM, s+7);
+        else if (envmatch(s, "PRX_SH")) copyval(g_sh, PM, s+7);
+        else if (envmatch(s, "PRX_TRACED")) copyval(g_traced, sizeof g_traced, s+11);
+        else if (envmatch(s, "PRX_DELEGATE")) g_delegate = (s[13] == '1');
     }
     g_rl = strlen(g_root);
     while (g_rl>1 && g_root[g_rl-1] == '/') g_root[--g_rl] = 0;
@@ -573,10 +585,10 @@ static void prx_do_init(char**envp) {
     g_user = (!g_fake && g_vuser[0] && g_rl) ? 1 : 0;
     if (g_user) cred_init();
 }
+static void prx_delegate(int argc, char**argv);
 __attribute__((constructor)) static void prx_init(int argc, char**argv, char**envp) {
-    (void) argc;
-    (void) argv;
     prx_do_init(envp);
+    if (g_delegate) prx_delegate(argc, argv);
 }
 /* LD_PRELOAD constructors run after the constructors of the app's own libs
    (jemalloc, ...). Interposed entry points call this so the SIGSYS handler
@@ -3097,7 +3109,7 @@ static char*acat(struct ar*a, const char*k, const char*v) {
     return d;
 }
 static int is_ours(const char*e) {
-    return envmatch(e, "LD_PRELOAD") || envmatch(e, "PRX_ROOTFS") || envmatch(e, "PRX_SHIM") || envmatch(e, "PRX_LIBPATH") || envmatch(e, "PRX_BIND") || envmatch(e, "PRX_FAKEROOT") || envmatch(e, "PRX_DNS") || envmatch(e, "PRX_LOADER") || envmatch(e, "PRX_QEMU") || envmatch(e, "QEMU_SET_ENV") || envmatch(e, "PRX_SELF_EXE") || envmatch(e, "PRX_VUSER") || envmatch(e, "PRX_CRED") || envmatch(e, "PRX_NO_ARGV0");
+    return envmatch(e, "LD_PRELOAD") || envmatch(e, "PRX_ROOTFS") || envmatch(e, "PRX_SHIM") || envmatch(e, "PRX_LIBPATH") || envmatch(e, "PRX_BIND") || envmatch(e, "PRX_FAKEROOT") || envmatch(e, "PRX_DNS") || envmatch(e, "PRX_LOADER") || envmatch(e, "PRX_QEMU") || envmatch(e, "QEMU_SET_ENV") || envmatch(e, "PRX_SELF_EXE") || envmatch(e, "PRX_VUSER") || envmatch(e, "PRX_CRED") || envmatch(e, "PRX_NO_ARGV0") || envmatch(e, "PRX_SUP") || envmatch(e, "PRX_LD") || envmatch(e, "PRX_SH") || envmatch(e, "PRX_TRACED") || envmatch(e, "PRX_DELEGATE");
 }
 #if defined(__i386__)
 /* ELF32 (the only class an i386 guest can run) */
@@ -3275,6 +3287,10 @@ static char**mkenv(struct ar*a, char*const envp[], int native, const char*cur_ex
         if (g_loader[0]) ne[k++] = acat(a, "PRX_LOADER=", g_loader);
         if (g_noargv0) ne[k++] = acat(a, "PRX_NO_ARGV0=", "1");
         if (g_qemu[0]) ne[k++] = acat(a, "PRX_QEMU=", g_qemu);
+        if (g_sup[0]) ne[k++] = acat(a, "PRX_SUP=", g_sup);
+        if (g_ld[0]) ne[k++] = acat(a, "PRX_LD=", g_ld);
+        if (g_sh[0]) ne[k++] = acat(a, "PRX_SH=", g_sh);
+        if (g_traced[0]) ne[k++] = acat(a, "PRX_TRACED=", g_traced);
         int has = 0;
         for (int i = 0; i<n; i++) if (envmatch(envp[i], "GLIBC_TUNABLES")) has = 1;
         if (!has) ne[k++] = acat(a, "GLIBC_TUNABLES=", "glibc.pthread.rseq=0");
@@ -3442,6 +3458,33 @@ static int prep_exec(struct ar*a, const char*path, char*const argv[], char*const
                 qv[qk] = NULL;
                 *op = g_qemu;
                 *oa = qv;
+            } else if (g_sup[0] && !g_traced[0]) {
+                /* --ptrace: let the supervisor decide whether this really is a
+                   static program and, if so, trace it (it keeps our pid) */
+                char**sv = am(a, (size_t)(argc+8)*sizeof (char*));
+                if (!sv) return (int) fail(ENOMEM);
+                int sk = 0;
+                sv[sk++] = g_sup;
+                sv[sk++] = "run";
+                sv[sk++] = "--";
+                sv[sk++] = (char*) h;
+                for (int j = 0; j<argc; j++) sv[sk++] = av[j];
+                sv[sk] = NULL;
+                *op = g_sup;
+                *oa = sv;
+                exec_cred_prepare(h);
+                *oe = mkenv(a, envp, 0, gp);
+                if (!*oe) return (int) fail(ENOMEM);
+                /* the supervisor is a host program: it must not load the shim or
+                   guest libraries, so it gets these two under another name */
+                for (char**ev = *oe; *ev; ev++) {
+                    if (envmatch(*ev, "LD_PRELOAD") || envmatch(*ev, "LD_LIBRARY_PATH")) {
+                        char*r = acat(a, "PRX_SUP_", *ev);
+                        if (!r) return (int) fail(ENOMEM);
+                        *ev = r;
+                    }
+                }
+                return 0;
             } else {
                 *op = h;
                 *oa = av;
@@ -3492,6 +3535,27 @@ static int do_execve(const char*path, char*const argv[], char*const envp[]) {
 }
 EXP int execve(const char*p, char*const a[], char*const e[]) {
     return do_execve(p, a, e);
+}
+/* Constructor side of the supervisor's exec delegation (prxsup.c): this process
+   is the guest shell started under the loader with PRX_DELEGATE=1 and argv =
+   { shell, PATH, ORIGINAL-ARGV... }. Do the execve() the traced program asked
+   for, with the full shim logic (shebangs, loader, credentials, ...). */
+static void prx_delegate(int argc, char**argv) {
+    char*fb[2];
+    char*const*av = argv+2;
+    if (argc < 2) return;
+    if (argc == 2) {
+        fb[0] = argv[1];
+        fb[1] = NULL;
+        av = fb;
+    }
+    do_execve(argv[1], av, environ);
+    int e = geterr();
+    static const char m1[] = "prx: cannot execute ";
+    sc(N_write, 2, (long) m1, (long) sizeof m1-1, 0, 0, 0);
+    sc(N_write, 2, (long) argv[1], (long) strlen(argv[1]), 0, 0, 0);
+    sc(N_write, 2, (long) "\n", 1, 0, 0, 0);
+    sc(N_exit_group, (e == ENOENT || e == ENOTDIR) ? 127 : 126, 0, 0, 0, 0, 0);
 }
 static int exec_hostpath(const char*hp, char*const argv[], char*const envp[]) {
     char rb[PM];

@@ -8,13 +8,15 @@ prx \- user-space container and path-translation engine
 .SH DESCRIPTION
 .B prx
 runs a glibc-based Linux root filesystem as an unprivileged user, without
-root, namespaces or ptrace. Paths are translated by an
+root or namespaces, and by default without ptrace. Paths are translated by an
 .B LD_PRELOAD
 shim and the guest's dynamic loader and libc are patched at run time.
 .PP
 .B prx
-is a convenience tool, not a security boundary: a program that issues raw
-syscalls or is statically linked can bypass the translation layer.
+is a convenience tool, not a security boundary: unless
+.B \-\-ptrace
+is used, a program that issues raw syscalls or is statically linked bypasses
+the translation layer.
 .SH COMMANDS
 .TP
 .B build
@@ -48,6 +50,25 @@ Run as the host user instead of fake root.
 .TP
 .B \-\-trace
 Debug syscall and seccomp tracing.
+.TP
+.B \-\-ptrace
+Also translate the paths of static and raw-syscall programs. Such a program is
+started under a small tracer,
+.BR prxsup ,
+that uses ptrace and a seccomp-bpf filter to stop only the path-taking
+syscalls and rewrite their arguments like the shim does; dynamic programs are
+not traced. Requires ptrace and seccomp on the host and a rootfs of the host's
+architecture (qemu-user rootfs are not supported). If they are unavailable,
+.B prx
+warns and continues without it. Static programs get no fake uid/gid, no
+/proc fakes and no AF_UNIX path translation, and cannot use ptrace themselves.
+This is still not a security boundary. Default off; see
+.BR PRX_PTRACE .
+.TP
+.B \-\-no\-ptrace
+Do not use the tracer, even if
+.B PRX_PTRACE
+is set.
 .RE
 .TP
 .B list
@@ -59,12 +80,17 @@ Repair permissions and flush the library-path cache.
 \fBremove\fR \fINAME\fR
 Delete a container and its derived files.
 .TP
-.B source, ldsource
-Print the C sources of the shim and the loader patcher.
+.B source, ldsource, supsource
+Print the C sources of the shim, the loader patcher and the ptrace helper.
 .TP
 .B \-\-version
 Print the version.
 .SH ENVIRONMENT
+.TP
+.B PRX_PTRACE
+Set to 1 to behave as if
+.B \-\-ptrace
+were given on every login.
 .TP
 .B PRX_HOME
 Data directory. Default: \fI~/.prx\fR if it exists, otherwise
@@ -105,6 +131,9 @@ with NOPASSWD, because there is no real root to authenticate against. Do not
 treat the guest as a sandbox for untrusted code.
 .SH LIMITATIONS
 Only glibc rootfs are supported (not musl). Only x86_64 and aarch64 hosts.
+Without
+.B \-\-ptrace
+static programs bypass path translation.
 The loader patch depends on glibc's machine code and may not apply to every
 version.
 .SH FILES

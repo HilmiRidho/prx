@@ -16,6 +16,7 @@ bash -n "$PRX" && ok "bash -n prx"
 "$PRX" help | grep -q 'prx install NAME' && ok "help"
 "$PRX" source   | cmp -s - "$HERE/src/prx.c"     && ok "prx source matches src/prx.c"
 "$PRX" ldsource | cmp -s - "$HERE/src/ldpatch.c" && ok "prx ldsource matches src/ldpatch.c"
+"$PRX" supsource | cmp -s - "$HERE/src/prxsup.c" && ok "prx supsource matches src/prxsup.c"
 
 # XDG default location (no ~/.prx present)
 "$PRX" build >/dev/null 2>&1 || fail "prx build"
@@ -208,6 +209,13 @@ esac
 
 "$PRX" remove t1 >/dev/null 2>&1 && "$PRX" remove t2 >/dev/null 2>&1
 [ "$("$PRX" list)" = "(no rootfs installed yet)" ] || [ -z "$("$PRX" list | grep -E '^t[12]$')" ] && ok "remove"
+
+# ---- --ptrace: path translation for static programs (tests/ptrace.sh) ------
+if out="$(bash "$HERE/tests/ptrace.sh" 2>&1)"; then
+while IFS= read -r l; do echo "$l"; pass=$((pass+1)); done <<<"$out"
+else
+echo "$out" >&2; fail "tests/ptrace.sh"
+fi
 
 rm -rf "$T"
 echo "all $pass checks passed"

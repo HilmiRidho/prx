@@ -38,10 +38,14 @@ Usage:
         -e, --env KEY=VAL            Pass custom environment variable
         --no-root-id                 Run as the host user (host name/UID/GID); sudo/su still work
         --trace                      Enable debug syscall & seccomp tracing
+        --ptrace                     Also translate paths of static / raw-syscall programs
+                                     (ptrace + seccomp helper; see "Static programs" below)
+        --no-ptrace                  Do not (default; overrides PRX_PTRACE=1)
   prx list                           List all installed rootfs containers
   prx fixperm NAME                   Fix file permissions & clear cache
   prx remove NAME                    Completely remove a container
-  prx source | prx ldsource          Print the C sources (shim / loader patcher)
+  prx source | prx ldsource | prx supsource
+                                     Print the C sources (shim / loader patcher / ptrace helper)
   prx --version                      Show version
 
 Environment:
@@ -49,7 +53,16 @@ Environment:
   PRX_SRCDIR=DIR    Directory holding prx.c and ldpatch.c
   PRX_DNS=LIST      IPv4/IPv6 DNS servers for the guest (separated by ',', ';' or blanks)
   PRX_NO_ARGV0=1    Never pass --argv0 to the loader (auto-detected; glibc < 2.33 lacks it)
+  PRX_PTRACE=1      Same as 'prx login --ptrace'
   CC=PROGRAM        C compiler used to build the shim
+
+Static programs:
+By default only programs that use the guest's libc are path-translated; static binaries
+(Go, busybox-static, ...) and raw syscalls bypass the shim. 'prx login --ptrace' starts
+exactly those programs under a small tracer (prxsup) that translates their paths too, and
+leaves everything else untouched. It needs ptrace and seccomp-bpf on the host, an
+x86_64 or aarch64 rootfs of the host's architecture (not qemu-user), and it is still not
+a security boundary.
 
 Cross-arch rootfs is detected automatically and run through qemu-user, in both
 directions: x86_64 rootfs on an aarch64 host (needs qemu-x86_64) and aarch64 rootfs
@@ -82,6 +95,7 @@ need_src
 }
 cmd_source()   { need_src; cat "$SRCDIR/prx.c"; }
 cmd_ldsource() { need_src; cat "$SRCDIR/ldpatch.c"; }
+cmd_supsource() { need_src; [ -f "$SRCDIR/prxsup.c" ] || die "prxsup.c not found"; cat "$SRCDIR/prxsup.c"; }
 cmd_build() {
 local cc="${CC:-}"
 if [ -z "$cc" ]; then
@@ -105,6 +119,18 @@ fi
 info "Shim built successfully: $SHIM"
 "$cc" -O2 -o "$PRX_HOME/lib/ldpatch" "$SRCDIR/ldpatch.c" || die "Failed to build ldpatch"
 info "Loader patch tool built successfully: $PRX_HOME/lib/ldpatch"
+build_sup "$cc" || true
+}
+# build_sup CC: the optional ptrace helper; a failure only disables --ptrace
+build_sup() {
+[ -f "$SRCDIR/prxsup.c" ] || return 1
+if "$1" -O2 -o "$PRX_HOME/lib/prxsup" "$SRCDIR/prxsup.c" 2>/dev/null; then
+info "Ptrace helper built successfully: $PRX_HOME/lib/prxsup"
+else
+rm -f "$PRX_HOME/lib/prxsup"
+warn "Could not build the ptrace helper (prxsup.c); 'prx login --ptrace' will not be available"
+return 1
+fi
 }
 set_arch() {
 case "$1" in
@@ -575,7 +601,8 @@ if [ "${#binds}" -ge 16000 ]; then die "--bind list too long (limit 16000 bytes 
 cmd_login() {
 [ $# -ge 1 ] || { usage; exit 1; }
 local name="$1"; shift
-local R binds="" nbinds=0 wd=/root wdset=0 fake=1 bh bg trace=0
+local R binds="" nbinds=0 wd=/root wdset=0 fake=1 bh bg trace=0 ptrace=0
+[ "${PRX_PTRACE:-}" = 1 ] && ptrace=1
 local -a extra_envs=()
 chk "$name"
 R="$(rootdir "$name")"
@@ -647,6 +674,8 @@ shift 2 ;;
 -e|--env)     [ $# -ge 2 ] || die "-e requires KEY=VALUE"; extra_envs+=("$2"); shift 2 ;;
 --no-root-id) fake=0; shift ;;
 --trace)      trace=1; shift ;;
+--ptrace)     ptrace=1; shift ;;
+--no-ptrace)  ptrace=0; shift ;;
 --) shift; break ;;
 -*) die "Unknown option for 'login': $1 (put '--' before the command if it starts with '-')" ;;
 *) break ;;
@@ -778,6 +807,28 @@ done
 local SH; SH="$(find_shell "$R")" || die "No suitable shell (bash/sh) found in rootfs"
 local gshell=/bin/bash
 case "$SH" in */sh) gshell=/bin/sh ;; esac
+local -a supenv=()
+if [ "$ptrace" = 1 ]; then
+if [ -n "$QEMU" ]; then
+warn "--ptrace does not support cross-architecture rootfs (qemu-user); ignored"
+else
+local SUP="$PRX_HOME/lib/prxsup" cc_sup=""
+need_src
+if [ ! -x "$SUP" ] || [ "$SRCDIR/prxsup.c" -nt "$SUP" ]; then
+mkdir -p "$PRX_HOME/lib"
+cc_sup="${CC:-}"
+[ -n "$cc_sup" ] || { command -v clang >/dev/null 2>&1 && cc_sup=clang; } || { command -v gcc >/dev/null 2>&1 && cc_sup=gcc; } || true
+if [ -n "$cc_sup" ]; then build_sup "$cc_sup" || true; else warn "No C compiler found to build the ptrace helper"; fi
+fi
+if [ ! -x "$SUP" ]; then
+warn "--ptrace requested but the helper is not available; static programs run without path translation"
+elif "$SUP" probe; then
+supenv=(PRX_SUP="$SUP" PRX_LD="$LD" PRX_SH="$(rpath "$R" "${SH#"$R"}")")
+else
+warn "ptrace/seccomp is not usable here; static programs run without path translation"
+fi
+fi
+fi
 local startdir; startdir="$(rpath "$R" "$wd")" || startdir=""
 [ -n "$startdir" ] && [ -d "$startdir" ] || { startdir="$R"; wd=/; }
 local -a prog
@@ -828,6 +879,7 @@ PRX_DNS="$cur_dns" PRX_FAKEROOT="$fake" PRX_VUSER="$vuser" \
 PRX_TRACE="$trace" PRX_LOADER="$PL" PRX_NO_ARGV0="$NOARGV0" \
 GLIBC_TUNABLES="${GLIBC_TUNABLES:-glibc.pthread.rseq=0}" \
 ${ldenv[@]+"${ldenv[@]}"} \
+${supenv[@]+"${supenv[@]}"} \
 ${term_envs[@]+"${term_envs[@]}"} \
 ${extra_envs[@]+"${extra_envs[@]}"} \
 ${runner[@]+"${runner[@]}"} "$LD" --library-path "$LP" ${argv0opt[@]+"${argv0opt[@]}"} "${prog[@]}" || rc=$?
@@ -878,6 +930,7 @@ remove) shift; cmd_remove "$@" ;;
 source) cmd_source ;;
 --version|-V|version) echo "prx $PRX_VERSION" ;;
 ldsource) cmd_ldsource ;;
+supsource) cmd_supsource ;;
 ""|-h|--help|help) usage ;;
 *) die "Unknown command '$1'. Run '$0 help' for usage." ;;
 esac

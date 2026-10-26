@@ -16,6 +16,7 @@ install:
 	install -Dm755 prx          $(DESTDIR)$(BINDIR)/prx
 	install -Dm644 src/prx.c     $(DESTDIR)$(DATADIR)/src/prx.c
 	install -Dm644 src/ldpatch.c $(DESTDIR)$(DATADIR)/src/ldpatch.c
+	install -Dm644 src/prxsup.c  $(DESTDIR)$(DATADIR)/src/prxsup.c
 	install -Dm644 man/prx.1     $(DESTDIR)$(MANDIR)/prx.1
 
 uninstall:
@@ -24,11 +25,12 @@ uninstall:
 
 lint:
 	bash -n prx
-	@if command -v shellcheck >/dev/null 2>&1; then shellcheck -S warning -s bash prx tests/smoke.sh; else echo "shellcheck not installed, skipped"; fi
+	@if command -v shellcheck >/dev/null 2>&1; then shellcheck -S warning -s bash prx tests/smoke.sh tests/ptrace.sh; else echo "shellcheck not installed, skipped"; fi
 	$(CC) -fsyntax-only -Wall -Wno-unused-function src/ldpatch.c
+	$(CC) -fsyntax-only -Wall -Wextra src/prxsup.c
 
 check: lint
 	bash tests/smoke.sh
 
 clean:
-	rm -rf tests/.tmp
+	rm -rf tests/.tmp tests/.tmp-ptrace
