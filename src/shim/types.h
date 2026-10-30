@@ -49,6 +49,7 @@ typedef long long s64;
 #define EINTR 4
 #define ESTALE 116
 #define E2BIG 7
+#define ENOSPC 28
 #define EOPNOTSUPP 95
 #define R_OK 4
 #define W_OK 2
