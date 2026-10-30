@@ -137,9 +137,6 @@ as before. `prx source` prints the modules expanded into one file.
 
 - Cleaning up guest processes when `prx login` exits is about 5x faster on a busy host, and `prx list` is quicker too.
 
-**Removed**
-
-- CPU and RAM limits (`-c`, `-m`, `--hard-mem` and `prx set`).
 
 ## License
 
