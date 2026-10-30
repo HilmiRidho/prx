@@ -15,6 +15,7 @@
 #include "shim/path.h"      /* guest <-> host path translation              */
 #include "shim/procfs.h"    /* fake /proc files, mountinfo                  */
 #include "shim/fs_open.h"   /* open / fopen / dlopen                        */
+#include "shim/ipc_shm.h"
 #include "shim/fs_stat.h"   /* stat / statx family                          */
 #include "shim/fs_ops.h"    /* access, cwd, rename, chmod, xattr, statfs... */
 #include "shim/tty.h"       /* ioctl, isatty, tcgetattr, fcntl              */
