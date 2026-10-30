@@ -16,6 +16,8 @@ install:
 	install -Dm755 prx          $(DESTDIR)$(BINDIR)/prx
 	install -Dm644 src/prx.c     $(DESTDIR)$(DATADIR)/src/prx.c
 	install -Dm644 src/ldpatch.c $(DESTDIR)$(DATADIR)/src/ldpatch.c
+	install -d $(DESTDIR)$(DATADIR)/src/shim
+	install -m644 src/shim/*.h   $(DESTDIR)$(DATADIR)/src/shim/
 	install -Dm644 man/prx.1     $(DESTDIR)$(MANDIR)/prx.1
 
 uninstall:

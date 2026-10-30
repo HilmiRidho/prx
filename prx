@@ -46,7 +46,7 @@ Usage:
 
 Environment:
   PRX_HOME=DIR      Data directory (default: ~/.prx if present, else \$XDG_DATA_HOME/prx)
-  PRX_SRCDIR=DIR    Directory holding prx.c and ldpatch.c
+  PRX_SRCDIR=DIR    Directory holding prx.c, ldpatch.c and shim/
   PRX_DNS=LIST      IPv4/IPv6 DNS servers for the guest (separated by ',', ';' or blanks)
   PRX_NO_ARGV0=1    Never pass --argv0 to the loader (auto-detected; glibc < 2.33 lacks it)
   CC=PROGRAM        C compiler used to build the shim
@@ -67,7 +67,7 @@ EOF
 prx_srcdir() {
 local d
 for d in "${PRX_SRCDIR:-}" "${SELF%/*}/../share/prx/src" "${SELF%/*}/src"; do
-if [ -n "$d" ] && [ -f "$d/prx.c" ] && [ -f "$d/ldpatch.c" ]; then
+if [ -n "$d" ] && [ -f "$d/prx.c" ] && [ -f "$d/ldpatch.c" ] && [ -f "$d/shim/types.h" ]; then
 (cd "$d" && pwd)
 return 0
 fi
@@ -78,9 +78,24 @@ need_src() { SRCDIR="$(prx_srcdir)" || die "C sources not found (set PRX_SRCDIR,
 shim_stale() {
 [ -f "$1" ] || return 0
 need_src
-[ "$SELF" -nt "$1" ] || [ "$SRCDIR/prx.c" -nt "$1" ] || [ "$SRCDIR/ldpatch.c" -nt "$1" ]
+local f
+for f in "$SELF" "$SRCDIR/prx.c" "$SRCDIR/ldpatch.c" "$SRCDIR"/shim/*.h; do
+[ "$f" -nt "$1" ] && return 0
+done
+return 1
 }
-cmd_source()   { need_src; cat "$SRCDIR/prx.c"; }
+# Print the whole shim as one file: src/prx.c with every `#include "shim/X.h"`
+# replaced by that module (the compiler resolves the same includes itself).
+cmd_source() {
+need_src
+local line f
+while IFS= read -r line || [ -n "$line" ]; do
+case "$line" in
+'#include "shim/'*) f="${line#*\"}"; f="${f%%\"*}"; cat "$SRCDIR/$f" ;;
+*) printf '%s\n' "$line" ;;
+esac
+done < "$SRCDIR/prx.c"
+}
 cmd_ldsource() { need_src; cat "$SRCDIR/ldpatch.c"; }
 cmd_build() {
 local cc="${CC:-}"

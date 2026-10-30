@@ -14,7 +14,13 @@ fail() { echo "FAIL - $1" >&2; exit 1; }
 bash -n "$PRX" && ok "bash -n prx"
 [ "$("$PRX" --version)" = "prx $(sed -n 's/^PRX_VERSION=//p' "$PRX")" ] && ok "--version"
 "$PRX" help | grep -q 'prx install NAME' && ok "help"
-"$PRX" source   | cmp -s - "$HERE/src/prx.c"     && ok "prx source matches src/prx.c"
+# `prx source` expands the shim modules into one self-contained file
+"$PRX" source > "$T/shim_all.c"
+if grep -q '^#include "shim/' "$T/shim_all.c"; then fail "prx source left a shim include unresolved"; fi
+ok "prx source has no unresolved shim includes"
+exp=$(( $(grep -vc '^#include "shim/' "$HERE/src/prx.c") + $(cat "$HERE"/src/shim/*.h | wc -l) ))
+[ "$(wc -l < "$T/shim_all.c")" = "$exp" ] && ok "prx source = src/prx.c + every src/shim module"
+"${CC:-cc}" -fsyntax-only -w -ffreestanding "$T/shim_all.c" 2>/dev/null && ok "prx source compiles standalone"
 "$PRX" ldsource | cmp -s - "$HERE/src/ldpatch.c" && ok "prx ldsource matches src/ldpatch.c"
 
 # XDG default location (no ~/.prx present)
@@ -30,7 +36,8 @@ rm -rf "$HOME/.prx"
 # installed layout: bin/prx finds ../share/prx/src
 D="$T/dest"
 make -s -C "$HERE" install DESTDIR="$D" PREFIX=/usr >/dev/null
-"$D/usr/bin/prx" source | cmp -s - "$HERE/src/prx.c" && ok "installed layout finds sources"
+"$D/usr/bin/prx" source | cmp -s - "$T/shim_all.c" && ok "installed layout finds sources"
+ls "$D"/usr/share/prx/src/shim/*.h >/dev/null 2>&1 && ok "shim modules installed"
 [ -f "$D/usr/share/man/man1/prx.1" ] && ok "manpage installed"
 
 # name validation

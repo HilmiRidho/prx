@@ -76,7 +76,8 @@ See `man prx` or `prx help` for all commands and options.
 ## Layout
 
     prx            shell front-end (pure bash, passes `bash -n` / shellcheck)
-    src/prx.c      LD_PRELOAD path-translation shim
+    src/prx.c      shim entry point: includes the modules below, in order
+    src/shim/      shim modules (one concern each, see below)
     src/ldpatch.c  glibc loader/libc patcher
     man/prx.1      manual page
     tests/         smoke.sh (offline smoke tests), shim_unit.c and shim_i386.c (shim tests)
@@ -84,6 +85,21 @@ See `man prx` or `prx help` for all commands and options.
     examples/      debian: example Termux launcher script (PulseAudio + Termux:X11 + `prx login debian`)
     Makefile       install / uninstall / lint / check
     LICENSE        Apache License 2.0
+
+### Shim modules
+
+The shim is still compiled as a single translation unit (`src/prx.c` includes the
+modules in dependency order), so the build, the static helpers and the tests work
+as before. `prx source` prints the modules expanded into one file.
+
+| Module | Concern |
+| --- | --- |
+| `types.h`, `sysnum.h`, `sys.h`, `libc.h` | Types and constants, per-arch syscall numbers, raw syscalls, libc imports |
+| `state.h`, `init.h` | Global state, bind parsing, SIGSYS handler, early init |
+| `path.h`, `procfs.h` | Guest/host path translation, fake `/proc` files |
+| `fs_open.h`, `fs_stat.h`, `fs_ops.h`, `tty.h`, `glob_tmp.h` | File-system interposers |
+| `net_unix.h`, `resolve.h` | AF_UNIX path translation, DNS and `/etc/hosts` |
+| `proc.h`, `cred.h`, `pwdb.h`, `exec.h` | Capabilities and signals, virtual credentials, passwd/group, exec and spawn |
 
 ## Known limits (by design)
 
@@ -94,6 +110,10 @@ See `man prx` or `prx help` for all commands and options.
 - Bind paths cannot contain `:` or `=` (the shim's `PRX_BIND` format uses them as separators).
 
 ## Changelog
+
+### Unreleased
+
+- The shim source is split into modules under `src/shim/` (same single-file build, identical generated code). `prx source` still prints the complete shim.
 
 ### 1.0.1
 
