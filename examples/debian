@@ -1,0 +1,26 @@
+#!/data/data/com.termux/files/usr/bin/bash
+
+# 1. Guest ~/.bashrc
+echo "Install the following packages in Termux (optional) pkg install -y tur-repo x11-repo && pkg install -y pulseaudio virglrenderer-android"
+echo "Run this command to update your ~/.bashrc (optional)"
+echo 'printf "\nexport DISPLAY=:0\nexport GALLIUM_DRIVER=virpipe\nexport MESA_GL_VERSION_OVERRIDE=4.6\nexport PULSE_SERVER=127.0.0.1\n" >> ~/.bashrc'
+
+# 2. Kill any existing instances safely
+pkill -f termux-x11
+pulseaudio --kill 2>/dev/null
+
+# 3. Start PulseAudio server
+pulseaudio --start \
+  --load="module-native-protocol-tcp auth-ip-acl=127.0.0.1 auth-anonymous=1" \
+  --load="module-sles-sink rate=48000 latency_time=20" \
+  --exit-idle-time=-1
+
+# 4. Start Termux:X11 and virgl server
+termux-x11 :0 -ac &
+virgl_test_server_android &
+
+# 5. Wait briefly for servers to initialize
+sleep 2
+
+# 6. Login to the container with shared temporary directories
+prx login debian --no-root-id --cpus 4 --memory 3G -b $PREFIX/tmp/.X11-unix:/tmp/.X11-unix -b /vendor:/vendor -b /system:/system -b /odm:/odm -b /apex:/apex -b /dev/mali0:/dev/mali0 -b /dev/dri:/dev/dri -b /sdcard:/sdcard -b $PREFIX/tmp/.virgl_test:/tmp/.virgl_test
