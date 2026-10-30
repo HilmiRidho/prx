@@ -18,6 +18,10 @@
 #define MAP_SHARED_ 0x01
 #define MAP_FIXED_  0x10
 
+#ifndef ENOSPC
+#define ENOSPC 28
+#endif
+
 struct prx_shm_meta {
     u32 key;
     u32 shmid;
@@ -36,7 +40,6 @@ struct prx_local_shm {
 };
 static struct prx_local_shm g_shm_att[MAX_LOCAL_SHM];
 
-/* Helper: Create a path in the guest's rootfs /dev/shm */
 static int shm_build_path(char *out, const char *type, int id) {
     if (!g_rl) return -1;
     char num[16];
@@ -47,7 +50,6 @@ static int shm_build_path(char *out, const char *type, int id) {
         v /= 10;
     } while (v);
     
-    /* Target: $PRX_ROOTFS/dev/shm/.prx_shm_<type>_<num> */
     size_t k = 0;
     memcpy(out + k, g_root, g_rl);
     k += g_rl;
@@ -62,7 +64,6 @@ static int shm_build_path(char *out, const char *type, int id) {
     return 0;
 }
 
-/* Read segment metadata */
 static int shm_read_meta(int shmid, struct prx_shm_meta *meta) {
     char p[PM];
     if (shm_build_path(p, "m", shmid) < 0) return -1;
@@ -70,10 +71,9 @@ static int shm_read_meta(int shmid, struct prx_shm_meta *meta) {
     if (fd < 0) return -1;
     long r = SC3(N_read, fd, meta, sizeof(*meta));
     sc(N_close, fd, 0, 0, 0, 0, 0);
-    return (r == sizeof(*meta)) ? 0 : -1;
+    return (r == (long)sizeof(*meta)) ? 0 : -1;
 }
 
-/* Write segment metadata */
 static int shm_write_meta(int shmid, const struct prx_shm_meta *meta) {
     char p[PM];
     if (shm_build_path(p, "m", shmid) < 0) return -1;
@@ -81,7 +81,7 @@ static int shm_write_meta(int shmid, const struct prx_shm_meta *meta) {
     if (fd < 0) return -1;
     long w = SC3(N_write, fd, meta, sizeof(*meta));
     sc(N_close, fd, 0, 0, 0, 0, 0);
-    return (w == sizeof(*meta)) ? 0 : -1;
+    return (w == (long)sizeof(*meta)) ? 0 : -1;
 }
 
 static void shm_unlink_all(int shmid, u32 key) {
@@ -94,8 +94,7 @@ static void shm_unlink_all(int shmid, u32 key) {
 EXP int shmget(int key, size_t size, int shmflg) {
     static int (*real_shmget)(int, size_t, int);
     if (!real_shmget) real_shmget = nextsym("shmget");
-  
-    /* 1. Try the native kernel SYSV IPC first */
+    
     if (real_shmget) {
         int r = real_shmget(key, size, shmflg);
         if (r >= 0) return r;
@@ -103,13 +102,11 @@ EXP int shmget(int key, size_t size, int shmflg) {
         if (err != ENOSYS && err != EACCES && err != EPERM) return -1;
     }
 
-    /* 2. Fallback emulation using a backing file */
     if (size > 0x7fffffffULL) return (int)fail(EINVAL);
     
     int shmid = -1;
     char kp[PM], dp[PM];
 
-    /* If the key is not IPC_PRIVATE, check whether the key already has an associated shmid */
     if (key != IPC_PRIVATE) {
         if (shm_build_path(kp, "k", key) < 0) return (int)fail(ENOMEM);
         long kfd = SC4(N_openat, AT_FDCWD, kp, O_RDONLY | O_CLOEXEC, 0);
@@ -117,12 +114,12 @@ EXP int shmget(int key, size_t size, int shmflg) {
             u32 old_id = 0;
             long rd = SC3(N_read, kfd, &old_id, sizeof(old_id));
             sc(N_close, kfd, 0, 0, 0, 0, 0);
-            if (rd == sizeof(old_id)) {
+            if (rd == (long)sizeof(old_id)) {
                 if ((shmflg & IPC_CREAT) && (shmflg & IPC_EXCL)) return (int)fail(EEXIST);
                 struct prx_shm_meta meta;
-                if (shm_read_meta(old_id, &meta) == 0) {
+                if (shm_read_meta((int)old_id, &meta) == 0) {
                     if (size > meta.size) return (int)fail(EINVAL);
-                    return old_id;
+                    return (int)old_id;
                 }
             }
         }
@@ -131,7 +128,6 @@ EXP int shmget(int key, size_t size, int shmflg) {
 
     if (size == 0) return (int)fail(EINVAL);
 
-    /* Search for unused random IDs (1 .. 65535) */
     u16 rnd = 0;
     for (int tries = 0; tries < 1000; tries++) {
         sc(N_getrandom, (long)&rnd, sizeof(rnd), 0, 0, 0, 0);
@@ -139,8 +135,7 @@ EXP int shmget(int key, size_t size, int shmflg) {
         if (shm_build_path(dp, "d", cand) < 0) return (int)fail(ENOMEM);
         long dfd = SC4(N_openat, AT_FDCWD, dp, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
         if (dfd >= 0) {
-            /* Data file successfully created */
-            if (SC3(N_truncate, dp, size, 0) < 0) {
+            if (SC3(N_truncate, dp, (long)size, 0) < 0) {
                 sc(N_close, dfd, 0, 0, 0, 0, 0);
                 SC3(N_unlinkat, AT_FDCWD, dp, 0);
                 return (int)fail(ENOMEM);
@@ -152,7 +147,6 @@ EXP int shmget(int key, size_t size, int shmflg) {
     }
     if (shmid < 0) return (int)fail(ENOSPC);
 
-    /* Initialize metadata */
     struct prx_shm_meta meta;
     memset(&meta, 0, sizeof(meta));
     meta.key = (u32)key;
@@ -168,7 +162,6 @@ EXP int shmget(int key, size_t size, int shmflg) {
         return (int)fail(ENOMEM);
     }
 
-    /* Save index key -> shmid */
     if (key != IPC_PRIVATE) {
         long kfd = SC4(N_openat, AT_FDCWD, kp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
         if (kfd >= 0) {
@@ -187,7 +180,6 @@ EXP void *shmat(int shmid, const void *shmaddr, int shmflg) {
     
     struct prx_shm_meta meta;
     if (shm_read_meta(shmid, &meta) < 0) {
-        /* If not present in the emulation metadata, try invoking the native syscall */
         if (!real_shmat) real_shmat = nextsym("shmat");
         if (real_shmat) return real_shmat(shmid, shmaddr, shmflg);
         fail(EINVAL);
@@ -219,12 +211,12 @@ EXP void *shmat(int shmid, const void *shmaddr, int shmflg) {
     void *addr = real_mmap((void*)shmaddr, (size_t)meta.size, prot, flags, (int)fd, 0);
     sc(N_close, fd, 0, 0, 0, 0, 0);
 
-    if (addr == (void*)-1 || (long)addr < 0) {
+    /* Validasi pointer mmap (aman untuk 32-bit dan 64-bit) */
+    if (addr == (void*)-1 || (unsigned long)addr >= (unsigned long)-4095UL) {
         fail(ENOMEM);
         return (void*)-1;
     }
 
-    /* Record to the local attachment table */
     for (int i = 0; i < MAX_LOCAL_SHM; i++) {
         if (!g_shm_att[i].addr) {
             g_shm_att[i].addr = addr;
@@ -252,7 +244,6 @@ EXP int shmdt(const void *shmaddr) {
         }
     }
 
-    /* If not registered in the emulation, pass through to the native shmdt */
     if (idx < 0) {
         if (!real_shmdt) real_shmdt = nextsym("shmdt");
         return real_shmdt ? real_shmdt(shmaddr) : (int)fail(EINVAL);
@@ -302,7 +293,6 @@ EXP int shmctl(int shmid, int cmd, void *buf) {
 
     if (cmd == IPC_STAT && buf) {
         memset(buf, 0, 112);
-        /* Offset shm_segsz & shm_nattch on glibc 64-bit / 32-bit */
 #if defined(__i386__)
         *(u32*)((char*)buf + 24) = (u32)meta.size;
         *(u32*)((char*)buf + 40) = meta.nattch;
