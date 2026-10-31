@@ -101,6 +101,7 @@ static void*do_fopen(const char*p, const char*mode) {
     char m2[16];
     size_t k = 0;
     for (const char*c = mode; *c; c++) {
+        if (*c == ',') break; /* "ccs=..." etc. is not part of the flags */
         if (*c == 'r') fl = O_RDONLY;
         else if (*c == 'w') fl = O_WRONLY|O_CREAT|O_TRUNC;
         else if (*c == 'a') fl = O_WRONLY|O_CREAT|O_APPEND;

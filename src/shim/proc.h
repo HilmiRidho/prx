@@ -42,9 +42,14 @@ EXP int capset(struct cap_header_t*hdrp, const struct cap_data_t*datap) {
 }
 EXP int prctl(int option, unsigned long a2, unsigned long a3, unsigned long a4, unsigned long a5) {
     if ((g_fake || g_user) && option == 23) return 1;
-    if (option == 38) return 0;
     static int(*f)(int, unsigned long, unsigned long, unsigned long, unsigned long);
     if (!f) f = nextsym("prctl");
+    if (option == 38) {
+        /* PR_SET_NO_NEW_PRIVS: really apply it; only when the host refuses it
+           (seccomp/SELinux) keep the old behaviour of reporting success. */
+        if (f) f(option, a2, a3, a4, a5);
+        return 0;
+    }
     return f ? f(option, a2, a3, a4, a5) : 0;
 }
 struct utsname_t {

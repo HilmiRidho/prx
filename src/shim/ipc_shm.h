@@ -37,14 +37,35 @@ struct prx_local_shm {
     void *addr;
     size_t size;
     int shmid;
+    int pid; /* process that attached (and counted) this mapping */
 };
 static struct prx_local_shm g_shm_att[MAX_LOCAL_SHM];
 
+#if defined(__aarch64__)
+#define N_flock_ 32
+#elif defined(__i386__)
+#define N_flock_ 143
+#else
+#define N_flock_ 73
+#endif
+static int shm_build_path(char *out, const char *type, int id);
+/* One global lock file serialises every read-modify-write of the metadata. */
+static long shm_lock(void) {
+    char p[PM];
+    if (shm_build_path(p, "l", 0) < 0) return -1;
+    long fd = SC4(N_openat, AT_FDCWD, p, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    while (sc(N_flock_, fd, 2 /* LOCK_EX */, 0, 0, 0, 0) == -EINTR) {}
+    return fd;
+}
+static void shm_unlock(long fd) {
+    if (fd >= 0) sc(N_close, fd, 0, 0, 0, 0, 0);
+}
 static int shm_build_path(char *out, const char *type, int id) {
     if (!g_rl) return -1;
     char num[16];
     int n = 0;
-    unsigned int v = (id < 0) ? (unsigned int)-id : (unsigned int)id;
+    unsigned int v = (unsigned int)id; /* bit pattern: -5 and 5 must not share a path */
     do {
         num[n++] = '0' + (v % 10);
         v /= 10;
@@ -222,12 +243,17 @@ EXP void *shmat(int shmid, const void *shmaddr, int shmflg) {
             g_shm_att[i].addr = addr;
             g_shm_att[i].size = (size_t)meta.size;
             g_shm_att[i].shmid = shmid;
+            g_shm_att[i].pid = (int)sc(N_getpid, 0, 0, 0, 0, 0, 0);
             break;
         }
     }
 
-    meta.nattch++;
-    shm_write_meta(shmid, &meta);
+    long lk = shm_lock();
+    if (shm_read_meta(shmid, &meta) == 0) {
+        meta.nattch++;
+        shm_write_meta(shmid, &meta);
+    }
+    shm_unlock(lk);
 
     return addr;
 }
@@ -253,9 +279,12 @@ EXP int shmdt(const void *shmaddr) {
     if (real_munmap) real_munmap((void*)shmaddr, g_shm_att[idx].size);
 
     int shmid = g_shm_att[idx].shmid;
+    int mine = g_shm_att[idx].pid == (int)sc(N_getpid, 0, 0, 0, 0, 0, 0);
     g_shm_att[idx].addr = NULL;
+    if (!mine) return 0; /* inherited across fork: the attaching process owns the count */
 
     struct prx_shm_meta meta;
+    long lk = shm_lock();
     if (shm_read_meta(shmid, &meta) == 0) {
         if (meta.nattch > 0) meta.nattch--;
         if (meta.deleted && meta.nattch == 0) {
@@ -264,11 +293,12 @@ EXP int shmdt(const void *shmaddr) {
             shm_write_meta(shmid, &meta);
         }
     }
+    shm_unlock(lk);
 
     return 0;
 }
 
-EXP int shmctl(int shmid, int cmd, void *buf) {
+static int shmctl_locked(int shmid, int cmd, void *buf) {
     static int (*real_shmctl)(int, int, void*);
     struct prx_shm_meta meta;
     
@@ -292,12 +322,14 @@ EXP int shmctl(int shmid, int cmd, void *buf) {
     }
 
     if (cmd == IPC_STAT && buf) {
-        memset(buf, 0, 112);
 #if defined(__i386__)
-        *(u32*)((char*)buf + 24) = (u32)meta.size;
-        *(u32*)((char*)buf + 40) = meta.nattch;
-        *(u16*)((char*)buf + 14) = (u16)meta.mode;
+        /* glibc i386 struct shmid_ds: 84 bytes, 32-bit uid/gid in ipc_perm */
+        memset(buf, 0, 84);
+        *(u32*)((char*)buf + 36) = (u32)meta.size;
+        *(u32*)((char*)buf + 72) = meta.nattch;
+        *(u16*)((char*)buf + 20) = (u16)meta.mode;
 #else
+        memset(buf, 0, 112);
         *(u64*)((char*)buf + 48) = meta.size;
         *(u64*)((char*)buf + 88) = (u64)meta.nattch;
         *(u16*)((char*)buf + 20) = (u16)meta.mode;
@@ -307,7 +339,7 @@ EXP int shmctl(int shmid, int cmd, void *buf) {
 
     if (cmd == IPC_SET && buf) {
 #if defined(__i386__)
-        meta.mode = *(u16*)((char*)buf + 14) & 0777;
+        meta.mode = *(u16*)((char*)buf + 20) & 0777;
 #else
         meta.mode = *(u16*)((char*)buf + 20) & 0777;
 #endif
@@ -316,4 +348,35 @@ EXP int shmctl(int shmid, int cmd, void *buf) {
     }
 
     return 0;
+}
+
+EXP int shmctl(int shmid, int cmd, void *buf) {
+    long lk = shm_lock();
+    int r = shmctl_locked(shmid, cmd, buf);
+    int e = geterr();
+    shm_unlock(lk);
+    *__errno_location() = e;
+    return r;
+}
+
+/* Drop the attach count of mappings this process still holds when it exits
+   normally, so a segment marked IPC_RMID is not kept forever (exit() only:
+   _exit(), crashes and signals cannot be covered). */
+__attribute__((destructor)) static void prx_shm_fini(void) {
+    if (!g_rl) return;
+    int me = (int)sc(N_getpid, 0, 0, 0, 0, 0, 0), any = 0;
+    for (int i = 0; i < MAX_LOCAL_SHM; i++) if (g_shm_att[i].addr && g_shm_att[i].pid == me) any = 1;
+    if (!any) return;
+    long lk = shm_lock();
+    for (int i = 0; i < MAX_LOCAL_SHM; i++) {
+        if (!g_shm_att[i].addr || g_shm_att[i].pid != me) continue;
+        struct prx_shm_meta meta;
+        if (shm_read_meta(g_shm_att[i].shmid, &meta) == 0) {
+            if (meta.nattch > 0) meta.nattch--;
+            if (meta.deleted && meta.nattch == 0) shm_unlink_all(g_shm_att[i].shmid, meta.key);
+            else shm_write_meta(g_shm_att[i].shmid, &meta);
+        }
+        g_shm_att[i].addr = NULL;
+    }
+    shm_unlock(lk);
 }

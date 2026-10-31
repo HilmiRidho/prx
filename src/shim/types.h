@@ -34,6 +34,7 @@ typedef long long s64;
 #define AT_SYMLINK_FOLLOW 0x400
 #define AT_REMOVEDIR 0x200
 #define EPERM 1
+#define EBADF 9
 #define ENOENT 2
 #define ENOEXEC 8
 #define EACCES 13

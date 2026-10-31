@@ -442,9 +442,10 @@ EXP int execveat(int dirfd, const char*pathname, char*const argv[], char*const e
     if (!empty && dirfd == AT_FDCWD) {
         return do_execve(pathname, argv, envp);
     }
-    if (empty && dirfd<0) return (int) fail(EINVAL);
+    if (dirfd<0) return (int) fail(EBADF);
     fdpath(fd_path, dirfd);
-    long n = ret(sc(N_readlinkat, AT_FDCWD, (long) fd_path, (long) abs_path, PM-1, 0, 0));
+    long n = sc(N_readlinkat, AT_FDCWD, (long) fd_path, (long) abs_path, PM-1, 0, 0);
+    if (n<0) return (int) fail((int)-n);
     if (n>0) {
         abs_path[n] = 0;
         if (empty) return exec_hostpath(abs_path, argv, envp);

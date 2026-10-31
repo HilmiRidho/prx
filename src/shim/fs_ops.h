@@ -300,10 +300,7 @@ EXP int fchmodat(int d, const char*p, int m, int f) {
     TR1(d, p, !(f&AT_SYMLINK_NOFOLLOW)) char st[256];
     if (f&AT_SYMLINK_NOFOLLOW) {
         long r = SC4(N_newfstatat, d, h1, st, AT_SYMLINK_NOFOLLOW);
-        if (r<0) {
-            if (VROOT()) return 0;
-            return (int) ret(r);
-        }
+        if (r<0) return (int) ret(r);
         u32 mode = *(u32*)(st+MODE_OFF);
         if ((mode&0170000) == 0120000) return (int) fail(EOPNOTSUPP);
         m = fake_mode(st, m);
@@ -311,7 +308,8 @@ EXP int fchmodat(int d, const char*p, int m, int f) {
         m = fake_mode(st, m);
     }
     long res = SC3(N_fchmodat, d, h1, m);
-    if (res<0 && VROOT()) return 0;
+    /* fake root: only permission-type failures are papered over, never ENOENT etc. */
+    if ((res == -EPERM || res == -EACCES) && VROOT()) return 0;
     return (int) ret(res);
 }
 static int do_chown(int d, const char*p, u32 u, u32 g, int fl) {

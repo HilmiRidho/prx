@@ -199,28 +199,65 @@ struct ucred_t {
     u32 uid;
     u32 gid;
 };
+struct iovec_t {
+    void*iov_base;
+    size_t iov_len;
+};
+static int msg_has_creds(const struct msghdr_t*msg) {
+    if (!msg || !msg->msg_control) return 0;
+    const char*p = (const char*) msg->msg_control;
+    size_t clen = msg->msg_controllen;
+    while (clen >= sizeof (struct cmsghdr_t)) {
+        const struct cmsghdr_t*cm = (const struct cmsghdr_t*) p;
+        if (cm->cmsg_len<sizeof (struct cmsghdr_t) || cm->cmsg_len>clen) break;
+        if (cm->cmsg_level == SOL_SOCKET_ && cm->cmsg_type == SCM_CREDENTIALS_) return 1;
+        size_t step = (cm->cmsg_len+sizeof (size_t)-1)&~(sizeof (size_t)-1);
+        if (step>clen) break;
+        p += step;
+        clen -= step;
+    }
+    return 0;
+}
 EXP ssize_t sendmsg(int sockfd, const struct msghdr_t*msg, int flags) {
     static ssize_t(*real_sendmsg)(int, const void*, int);
     if (!real_sendmsg) real_sendmsg = nextsym("sendmsg");
-    ssize_t ret = real_sendmsg ? real_sendmsg(sockfd, msg, flags) : -1;
-    if (ret<0 && *__errno_location() == EPERM) {
-        if (msg && msg->msg_iov && msg->msg_iovlen>0) {
-            struct iovec_t {
-                void*iov_base;
-                size_t iov_len;
-            }*iov = (struct iovec_t*) msg->msg_iov;
-            *__errno_location() = 0;
-            return (ssize_t) iov[0].iov_len;
+    if (!real_sendmsg) return fail(ENOSYS);
+    struct msghdr_t m2;
+    const struct msghdr_t*mp = msg;
+    u8 na[110];
+    unsigned nl = 0;
+    int tfd = -1;
+    if (msg && msg->msg_name && msg->msg_namelen >= 3) {
+        int r = un_fix(msg->msg_name, msg->msg_namelen, 1, na, &nl, &tfd);
+        if (r<0) return-1;
+        if (r) {
+            m2 = *msg;
+            m2.msg_name = na;
+            m2.msg_namelen = nl;
+            mp = &m2;
         }
-        *__errno_location() = 0;
-        return 1;
     }
-    return ret;
+    ssize_t rv = real_sendmsg(sockfd, mp, flags);
+    int e = geterr();
+    un_done(tfd);
+    *__errno_location() = e;
+    /* Emulated credentials (fake root) cannot be honoured by the kernel: pretend
+       the message was sent, but only for messages that carry SCM_CREDENTIALS, and
+       report the full length. Every other EPERM is a real error. */
+    if (rv<0 && e == EPERM && VROOT() && msg_has_creds(msg)) {
+        size_t total = 0;
+        const struct iovec_t*iov = (const struct iovec_t*) msg->msg_iov;
+        for (size_t i = 0; iov && i<msg->msg_iovlen; i++) total += iov[i].iov_len;
+        *__errno_location() = 0;
+        return (ssize_t) total;
+    }
+    return rv;
 }
 EXP ssize_t recvmsg(int sockfd, struct msghdr_t*msg, int flags) {
     static ssize_t(*real_recvmsg)(int, struct msghdr_t*, int);
     if (!real_recvmsg) real_recvmsg = nextsym("recvmsg");
     ssize_t res = real_recvmsg ? real_recvmsg(sockfd, msg, flags) : -1;
+    if (res >= 0 && msg && msg->msg_name && msg->msg_namelen) un_strip(msg->msg_name, &msg->msg_namelen);
     if (res >= 0 && VROOT() && msg && msg->msg_control && msg->msg_controllen >= sizeof (struct cmsghdr_t)) {
         char*cmsg_ptr = (char*) msg->msg_control;
         size_t clen = msg->msg_controllen;
