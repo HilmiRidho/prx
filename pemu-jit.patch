@@ -1,0 +1,1137 @@
+diff -ruN orig/prx-main/Makefile prx-main/Makefile
+--- orig/prx-main/Makefile	2026-10-31 08:42:24.000000000 +0000
++++ prx-main/Makefile	2026-10-31 13:17:20.039763656 +0000
+@@ -54,7 +54,7 @@
+ check: lint
+ 	bash tests/smoke.sh
+ 	@if [ "$$(uname -m)" = x86_64 ]; then \
+-		if command -v python3 >/dev/null 2>&1; then $(MAKE) --no-print-directory pemu && python3 tests/pemu_test.py ./pemu; fi; \
++		if command -v python3 >/dev/null 2>&1; then $(MAKE) --no-print-directory pemu && python3 tests/pemu_test.py ./pemu && python3 tests/pemu_fuzz.py ./pemu 200 1; fi; \
+ 		$(MAKE) --no-print-directory pemu-x64 && bash tests/pemu_x64_test.sh ./pemu-x64; \
+ 	elif [ "$$(uname -m)" = aarch64 ]; then \
+ 		$(MAKE) --no-print-directory pemu && bash tests/pemu_x64_test.sh ./pemu; \
+diff -ruN orig/prx-main/README.md prx-main/README.md
+--- orig/prx-main/README.md	2026-10-31 08:42:24.000000000 +0000
++++ prx-main/README.md	2026-10-31 13:17:20.040745355 +0000
+@@ -110,7 +110,7 @@
+ 
+ | host | guest rootfs | source | notes |
+ |------|--------------|--------|-------|
+-| x86_64  | aarch64 | `src/pemu.c`     | integer ISA, scalar FP, tiny NEON subset |
++| x86_64  | aarch64 | `src/pemu.c`     | JIT + interpreter; integer ISA, scalar FP, tiny NEON subset |
+ | aarch64 | x86_64  | `src/pemu_x64.c` | integer ISA, SSE2, x87 subset; runs real glibc programs |
+ 
+     prx build                       # also builds $PRX_HOME/lib/pemu for your host
+@@ -120,7 +120,9 @@
+ `pemu_x64` was validated against native runs of static and dynamic glibc programs, bash, python3,
+ perl, gcc and common coreutils (on an x86_64 host); the aarch64-host build is the same code using the
+ generic syscall ABI, but has not been executed on a real aarch64 machine or on Android/Termux.
+-It is an interpreter (no JIT): expect it to be 50-1000x slower than native. Arithmetic flags are evaluated lazily, which makes it a little faster, but it is still far slower than `qemu-user` (a JIT).
++`pemu_x64` is an interpreter (no JIT): expect it to be 50-1000x slower than native. Arithmetic flags are evaluated lazily, which makes it a little faster, but it is still far slower than `qemu-user` (a JIT).
++
++`pemu` (aarch64 guest on an x86_64 host) has a block-translating **JIT** that is on by default: guest basic blocks are compiled to x86_64 code, direct branches are chained, indirect branches go through an inline cache, and x86 flags are used directly (a compare followed by a branch/`csel` costs one `cmp` + `jcc`). Integer ALU, bitfield, multiply/divide, conditional select/compare, branches, scalar and vector (`ldr q`, `ldp q`) loads/stores are translated natively; everything else (FP arithmetic, NEON ALU, exclusives, ...) runs through the interpreter from inside the translated block, so behaviour is identical. Roughly 20x faster than the interpreter on integer / memory loops. The code cache is flushed when the guest unmaps, re-protects or `MAP_FIXED`-overwrites translated pages, and on `ic` instructions, so self-modifying code and `dlopen` work. Disable it with `PEMU_JIT=0` or `pemu -nojit` (the JIT also switches itself off if an executable mapping can't be created). `tests/pemu_fuzz.py` runs random programs under both engines and compares all registers, NZCV and memory.
+ 
+ Threads (`CLONE_THREAD`, so pthreads / futex / `pthread_join`) work in `pemu_x64`: every guest thread runs on its own host pthread.
+ 
+diff -ruN orig/prx-main/src/pemu.c prx-main/src/pemu.c
+--- orig/prx-main/src/pemu.c	2026-10-31 08:42:24.000000000 +0000
++++ prx-main/src/pemu.c	2026-10-31 13:15:39.249945196 +0000
+@@ -35,6 +35,8 @@
+ #include <sys/wait.h>
+ #include <sys/auxv.h>
+ #include <sys/random.h>
++#include <stddef.h>
++#include <ucontext.h>
+ 
+ #ifndef __x86_64__
+ #error "pemu currently targets x86_64 hosts (an aarch64 host does not need it)"
+@@ -52,12 +54,16 @@
+     u32 nzcv;           /* N=8 Z=4 C=2 V=1 */
+     u64 v[32][2];
+     u64 xaddr, xval; int xsz;   /* exclusive monitor */
++    u64 xfl, jflag, patch;      /* JIT: saved x86 flags, async-signal flag, chain patch site */
+ } CPU;
+ 
+ static CPU cpu;
+ static int g_trace;
+ static char g_self[4096];
+ static u64 g_tramp;
++static int g_jit;                       /* JIT enabled */
++static u64 jit_rip2pc(u64 rip);
++static void jit_syscall_hook(u64 n, u64 a0, u64 a1, u64 a2, u64 a3);
+ 
+ /* ------------------------------------------------------------ helpers */
+ #define X(r)     ((r) == 31 ? 0 : c->x[r])
+@@ -154,9 +160,9 @@
+ static sigjmp_buf g_jb;
+ static volatile int g_fault; static volatile u64 g_faddr;
+ 
+-static void hsig(int s, siginfo_t*si, void*u) { (void) u; if (si) pinfo[s] = *si; __atomic_or_fetch(&pend, 1ULL << s, __ATOMIC_SEQ_CST); }
++static void hsig(int s, siginfo_t*si, void*u) { (void) u; if (si) pinfo[s] = *si; __atomic_or_fetch(&pend, 1ULL << s, __ATOMIC_SEQ_CST); cpu.jflag = 1; }
+ static void hsegv(int s, siginfo_t*si, void*u) {
+-    (void) u;
++    if (g_jit && u) { u64 gp = jit_rip2pc((u64)((ucontext_t*) u)->uc_mcontext.gregs[REG_RIP]); if (gp) cpu.pc = gp; }
+     if (gsa[s].handler > 1) { g_fault = s; g_faddr = (u64) si->si_addr; siglongjmp(g_jb, 1); }
+     fprintf(stderr, "pemu: guest fault (signal %d) at addr=%p pc=%#llx\n", s, si->si_addr, (unsigned long long) cpu.pc);
+     signal(s, SIG_DFL); raise(s);
+@@ -302,6 +308,7 @@
+     u64 n = c->x[8], a0 = c->x[0], a1 = c->x[1], a2 = c->x[2], a3 = c->x[3], a4 = c->x[4], a5 = c->x[5];
+     long r;
+     (void) noset;
++    if (g_jit) jit_syscall_hook(n, a0, a1, a2, a3);
+     switch (n) {
+     case 93: case 94: return hs(SYS_exit_group, (long) a0, 0, 0, 0, 0, 0);
+     case 56: return hs(SYS_openat, (long) a0, (long) a1, fl_g2h((long) a2), (long) a3, 0, 0);
+@@ -657,7 +664,7 @@
+             if (!sf && hw > 1) undef(c, i);
+             if (opc == 0) SET(rd, ~imm & msk(sf));
+             else if (opc == 2) SET(rd, imm);
+-            else if (opc == 3) SET(rd, (X(rd) & ~(0xffffULL << (hw * 16))) | imm);
++            else if (opc == 3) SET(rd, ((X(rd) & ~(0xffffULL << (hw * 16))) | imm) & msk(sf));   /* Wd form zero-extends */
+             else undef(c, i);
+         } else if ((i & 0x1F800000) == 0x13000000) {           /* bitfield */
+             u64 wm, tm; int opc = (i >> 29) & 3, immr = (i >> 16) & 0x3f, imms = (i >> 10) & 0x3f;
+@@ -817,6 +824,721 @@
+     c->pc = npc;
+ }
+ 
++/* ------------------------------------------------------------ JIT (AArch64 -> x86_64)
++ *
++ * Block-translating JIT. Guest registers stay in the CPU struct (r15 points at it);
++ * every guest instruction becomes a short x86_64 sequence that works on that memory
++ * directly, so no register state is cached across instructions. This keeps the
++ * fallback path trivial: any instruction not translated natively is executed by the
++ * interpreter (step()) through a helper call, in the middle of a translated block.
++ *
++ * Condition flags: after a flag-setting instruction the x86 flags are captured with
++ * LAHF/SETO into cpu.xfl (carry kept INVERTED, i.e. x86 "borrow" convention, so one
++ * jcc table serves both ADD and SUB). A consumer right after the producer uses the
++ * live x86 flags, otherwise they are restored with ADD AL,0x7f / SAHF.
++ * cpu.xfl is the canonical flag state while the JIT runs; cpu.nzcv is only valid
++ * around interpreter helpers (jsync_in / jsync_out convert between the two).
++ *
++ * Direct branches are chained (patched on first use); indirect ones use a small
++ * direct-mapped inline cache. Async signals are polled on backward / indirect
++ * branches and after every syscall. The cache is flushed when the guest changes
++ * executable mappings (munmap, mprotect, MAP_FIXED over code, IC instructions). */
++enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15 };
++enum { A_ADD, A_OR, A_ADC, A_SBB, A_AND, A_SUB, A_XOR, A_CMP };
++enum { S_ROL = 0, S_ROR = 1, S_SHL = 4, S_SHR = 5, S_SAR = 7 };
++#define OFF_X(n)   ((s32) offsetof(CPU, x) + 8 * (n))
++#define OFF_V(n)   ((s32) offsetof(CPU, v) + 16 * (n))
++#define OFF_SP     ((s32) offsetof(CPU, sp))
++#define OFF_PC     ((s32) offsetof(CPU, pc))
++#define OFF_TPIDR  ((s32) offsetof(CPU, tpidr))
++#define OFF_XFL    ((s32) offsetof(CPU, xfl))
++#define OFF_JFLAG  ((s32) offsetof(CPU, jflag))
++#define OFF_PATCH  ((s32) offsetof(CPU, patch))
++
++#define JCACHE_SZ  (160u << 20)
++#define JTRAMP_SZ  128
++#define JH_BITS    19
++#define JIC_BITS   14
++#define JMAP_CAP   (6u << 20)
++#define JPG_BITS   15
++#define JMAXI      48
++
++typedef struct { u64 pc; u8 *code; } JEnt;
++static u8 *jbase, *jcur, *jlim, *jenter, *jepi;
++static JEnt *jh, *jic;
++static u32 jhn, jmapn, jpgn;
++static u32 *jm_off; static u64 *jm_pc, *jpg;
++static unsigned long long jstat_blocks, jstat_flush;
++
++/* ---- raw emitters */
++static void e1(u32 b) { *jcur++ = (u8) b; }
++static void e2(u32 v) { memcpy(jcur, &v, 2); jcur += 2; }
++static void e4(u32 v) { memcpy(jcur, &v, 4); jcur += 4; }
++static void e8(u64 v) { memcpy(jcur, &v, 8); jcur += 8; }
++static void rexp(int w, int reg, int idx, int base, int force) {
++    u32 r = 0x40u | ((u32) w << 3) | ((((u32) reg >> 3) & 1) << 2) | ((((u32) idx >> 3) & 1) << 1) | (((u32) base >> 3) & 1);
++    if (r != 0x40u || force) e1(r);
++}
++static void modrm_m(int reg, int base, s32 disp) {
++    int b = base & 7;
++    int mod = (disp == 0 && b != 5) ? 0 : (disp >= -128 && disp <= 127) ? 1 : 2;
++    e1((u32)(mod << 6 | (reg & 7) << 3 | b));
++    if (b == 4) e1(0x24);
++    if (mod == 1) e1((u32) disp & 0xff); else if (mod == 2) e4((u32) disp);
++}
++static void op_m(int pfx, int w, u32 op, int reg, int base, s32 disp, int force) {
++    if (pfx) e1((u32) pfx);
++    rexp(w, reg, 0, base, force);
++    if (op > 0xff) { e1(0x0F); e1(op & 0xff); } else e1(op);
++    modrm_m(reg, base, disp);
++}
++static void op_r(int pfx, int w, u32 op, int reg, int rm, int force) {
++    if (pfx) e1((u32) pfx);
++    rexp(w, reg, 0, rm, force);
++    if (op > 0xff) { e1(0x0F); e1(op & 0xff); } else e1(op);
++    e1(0xC0u | (u32)(reg & 7) << 3 | (u32)(rm & 7));
++}
++static void ldq(int w, int r, int base, s32 d) { op_m(0, w, 0x8B, r, base, d, 0); }
++static void stq(int w, int r, int base, s32 d) { op_m(0, w, 0x89, r, base, d, 0); }
++static void lea(int w, int r, int base, s32 d) { op_m(0, w, 0x8D, r, base, d, 0); }
++static void mov_rr(int w, int dst, int src) { op_r(0, w, 0x89, src, dst, 0); }
++static void alu_rr(int w, int k, int dst, int src) { op_r(0, w, (u32) k * 8 + 1, src, dst, 0); }
++static void alu_ri(int w, int k, int dst, s32 imm) {
++    if (imm >= -128 && imm <= 127) { op_r(0, w, 0x83, k, dst, 0); e1((u32) imm & 0xff); }
++    else { op_r(0, w, 0x81, k, dst, 0); e4((u32) imm); }
++}
++static void mov_ri(int r, u64 v) {                  /* never touches flags */
++    if (v <= 0xffffffffULL) { rexp(0, 0, 0, r, 0); e1(0xB8u + (u32)(r & 7)); e4((u32) v); }
++    else if ((s64) v == (s32) v) { rexp(1, 0, 0, r, 0); e1(0xC7); e1(0xC0u | (u32)(r & 7)); e4((u32) v); }
++    else { rexp(1, 0, 0, r, 0); e1(0xB8u + (u32)(r & 7)); e8(v); }
++}
++static void sh_i(int w, int k, int r, int n) { if (n) { op_r(0, w, 0xC1, k, r, 0); e1((u32) n); } }
++static void sh_cl(int w, int k, int r) { op_r(0, w, 0xD3, k, r, 0); }
++static void f7(int w, int k, int r) { op_r(0, w, 0xF7, k, r, 0); }
++static void imul_rr(int w, int d, int s) { op_r(0, w, 0x0FAF, d, s, 0); }
++static void test_rr(int w, int a, int b) { op_r(0, w, 0x85, b, a, 0); }
++static void cmov(int w, int cc, int d, int s) { op_r(0, w, 0x0F40u + (u32) cc, d, s, 0); }
++static void movzx8(int d, int s) { op_r(0, 0, 0x0FB6, d, s, s >= 4); }
++static void movzx16(int d, int s) { op_r(0, 0, 0x0FB7, d, s, 0); }
++static void movsx8(int w, int d, int s) { op_r(0, w, 0x0FBE, d, s, s >= 4); }
++static void movsx16(int w, int d, int s) { op_r(0, w, 0x0FBF, d, s, 0); }
++static void movsxd(int d, int s) { op_r(0, 1, 0x63, d, s, 0); }
++static u8 *jcc_fwd(int cc) { e1(0x0F); e1(0x80u + (u32) cc); e4(0); return jcur - 4; }
++static u8 *jmp_fwd(void) { e1(0xE9); e4(0); return jcur - 4; }
++static void here(u8 *p) { s32 d = (s32)(jcur - (p + 4)); memcpy(p, &d, 4); }
++static void jmp_to(u8 *t) { e1(0xE9); e4((u32)(s32)(t - (jcur + 4))); }
++static void call_abs(void *f) { mov_ri(RAX, (u64) f); e1(0xFF); e1(0xD0); }
++static void fl_spill(void) { e1(0x9F); e1(0x0F); e1(0x90); e1(0xC0); op_m(0x66, 0, 0x89, RAX, R15, OFF_XFL, 0); }
++static void fl_restore(void) { op_m(0x66, 0, 0x8B, RAX, R15, OFF_XFL, 0); e1(0x04); e1(0x7F); e1(0x9E); }
++static void cmc(void) { e1(0xF5); }
++static void stc(void) { e1(0xF9); }
++
++/* ---- guest register access (x[31] is never written, XZR reads are constants) */
++static void gld(int w, int hr, int g) { if (g == 31) mov_ri(hr, 0); else ldq(w, hr, R15, OFF_X(g)); }
++static void gldsp(int w, int hr, int g) { if (g == 31) ldq(w, hr, R15, OFF_SP); else ldq(w, hr, R15, OFF_X(g)); }
++static void gst(int hr, int g) { if (g != 31) stq(1, hr, R15, OFF_X(g)); }
++static void gsts(int hr, int g) { if (g == 31) stq(1, hr, R15, OFF_SP); else stq(1, hr, R15, OFF_X(g)); }
++static void set_pc(u64 pc) { mov_ri(RAX, pc); stq(1, RAX, R15, OFF_PC); }
++static int xcc(int cc) { static const u8 t[7] = {4, 3, 8, 0, 7, 0xD, 0xF}; return t[cc >> 1] ^ (cc & 1); }
++
++/* ---- flag state conversion (xfl <-> nzcv) */
++static void jsync_in(CPU *c) {
++    u32 f = (u32) c->xfl, ah = (f >> 8) & 0xff, al = f & 0xff;
++    c->nzcv = ((ah >> 7) & 1) << 3 | ((ah >> 6) & 1) << 2 | ((~ah) & 1) << 1 | (al & 1);
++}
++static void jsync_out(CPU *c) {
++    u32 n = c->nzcv & 15, ah = ((n >> 3) & 1) << 7 | ((n >> 2) & 1) << 6 | ((~n >> 1) & 1);
++    c->xfl = (u64)((ah << 8) | (n & 1));
++}
++
++/* ---- tables */
++static u32 hpc(u64 pc, int bits) { return (u32)(((pc >> 2) * 0x9E3779B97F4A7C15ULL) >> (64 - bits)); }
++static u8 *jfind(u64 pc) {
++    u32 h = hpc(pc, JH_BITS);
++    for (;;) { if (jh[h].pc == pc) return jh[h].code; if (!jh[h].pc) return NULL; h = (h + 1) & ((1u << JH_BITS) - 1); }
++}
++static void jins(u64 pc, u8 *code) {
++    u32 h = hpc(pc, JH_BITS);
++    while (jh[h].pc) h = (h + 1) & ((1u << JH_BITS) - 1);
++    jh[h].pc = pc; jh[h].code = code; jhn++;
++}
++static void jpg_add(u64 page) {
++    u64 k = page | (1ULL << 63); u32 h = hpc(page << 2, JPG_BITS);
++    for (;;) { if (jpg[h] == k) return; if (!jpg[h]) { jpg[h] = k; jpgn++; return; } h = (h + 1) & ((1u << JPG_BITS) - 1); }
++}
++static int jpg_has(u64 page) {
++    u64 k = page | (1ULL << 63); u32 h = hpc(page << 2, JPG_BITS);
++    for (;;) { if (jpg[h] == k) return 1; if (!jpg[h]) return 0; h = (h + 1) & ((1u << JPG_BITS) - 1); }
++}
++static void jflush(void) {
++    jcur = jbase + JTRAMP_SZ;
++    memset(jh, 0, sizeof(JEnt) << JH_BITS); memset(jic, 0, sizeof(JEnt) << JIC_BITS); memset(jpg, 0, sizeof(u64) << JPG_BITS);
++    jhn = jmapn = jpgn = 0; cpu.patch = 0; jstat_flush++;
++}
++static int jit_has_code(u64 addr, u64 len) {
++    if (!g_jit || !jpgn || !len) return 0;
++    u64 p0 = addr >> 12, p1 = (addr + len - 1) >> 12;
++    if (p1 < p0) p1 = ~0ULL >> 12;
++    if (p1 - p0 < 64) { for (u64 p = p0; p <= p1; p++) if (jpg_has(p)) return 1; return 0; }
++    for (u32 k = 0; k < (1u << JPG_BITS); k++) if (jpg[k]) { u64 p = jpg[k] & ~(1ULL << 63); if (p >= p0 && p <= p1) return 1; }
++    return 0;
++}
++static void jit_syscall_hook(u64 n, u64 a0, u64 a1, u64 a2, u64 a3) {
++    int fl = 0;
++    switch (n) {
++    case 215: fl = jit_has_code(a0, a1); break;                       /* munmap */
++    case 216: fl = jit_has_code(a0, a1); break;                       /* mremap */
++    case 226: fl = jit_has_code(a0, a1); break;                       /* mprotect */
++    case 222: fl = (a3 & MAP_FIXED) && jit_has_code(a0, a1); (void) a2; break;   /* mmap */
++    default: break;
++    }
++    if (fl) jflush();
++}
++static u64 jit_rip2pc(u64 rip) {
++    if (!g_jit || rip < (u64) jbase || rip >= (u64) jcur || !jmapn) return 0;
++    u32 off = (u32)(rip - (u64) jbase), lo = 0, hi = jmapn;
++    while (hi - lo > 1) { u32 mid = (lo + hi) / 2; if (jm_off[mid] <= off) lo = mid; else hi = mid; }
++    return jm_off[lo] <= off ? jm_pc[lo] : 0;
++}
++
++/* ---- helpers called from translated code */
++static void jit_interp(CPU *c) { jsync_in(c); step(c); jsync_out(c); }
++static void jit_svc(CPU *c) { jsync_in(c); do_svc(c); jsync_out(c); }
++static void jit_flush_helper(CPU *c) { (void) c; jflush(); }
++
++/* ---- control flow exits */
++static void jpoll_exit(u64 target) {
++    op_m(0, 1, 0x83, 7, R15, OFF_JFLAG, 0); e1(0);
++    u8 *ok = jcc_fwd(4);
++    mov_ri(RAX, target); stq(1, RAX, R15, OFF_PC); jmp_to(jepi);
++    here(ok);
++}
++static void jexit_direct(u64 from, u64 target) {
++    if (target <= from) jpoll_exit(target);
++    u8 *tc = jfind(target);
++    if (tc) { jmp_to(tc); return; }
++    u8 *site = jcur; e1(0xE9); e4(0);
++    mov_ri(RAX, (u64)(site + 1)); stq(1, RAX, R15, OFF_PATCH);   /* address of the rel32 */
++    mov_ri(RAX, target); stq(1, RAX, R15, OFF_PC);
++    jmp_to(jepi);
++}
++static void jexit_indirect(void) {                  /* target in RAX */
++    op_m(0, 1, 0x83, 7, R15, OFF_JFLAG, 0); e1(0);
++    u8 *m1 = jcc_fwd(5);
++    mov_rr(1, RCX, RAX); sh_i(1, S_SHR, RCX, 2); alu_ri(0, A_AND, RCX, (1 << JIC_BITS) - 1); sh_i(0, S_SHL, RCX, 4);
++    alu_rr(1, A_ADD, RCX, R14);
++    op_m(0, 1, 0x39, RAX, RCX, 0, 0);               /* cmp [rcx], rax */
++    u8 *m2 = jcc_fwd(5);
++    op_m(0, 0, 0xFF, 4, RCX, 8, 0);                 /* jmp [rcx+8] */
++    here(m1); here(m2);
++    stq(1, RAX, R15, OFF_PC); jmp_to(jepi);
++}
++static void j_fallback(u64 pc, int term) {
++    set_pc(pc);
++    mov_rr(1, RDI, R15);
++    call_abs((void*) jit_interp);
++    if (term) jmp_to(jepi);
++}
++
++/* ---- loads / stores */
++static void gpr_ld(int nb, int sgn, int to64, int base, s32 d) {       /* -> RAX */
++    switch (nb) {
++    case 1: op_m(0, sgn ? to64 : 0, sgn ? 0x0FBE : 0x0FB6, RAX, base, d, 0); break;
++    case 2: op_m(0, sgn ? to64 : 0, sgn ? 0x0FBF : 0x0FB7, RAX, base, d, 0); break;
++    case 4: if (sgn) op_m(0, 1, 0x63, RAX, base, d, 0); else ldq(0, RAX, base, d); break;
++    default: ldq(1, RAX, base, d);
++    }
++}
++static void gpr_st(int nb, int src, int base, s32 d) {
++    switch (nb) {
++    case 1: op_m(0, 0, 0x88, src, base, d, src >= 4); break;
++    case 2: op_m(0x66, 0, 0x89, src, base, d, 0); break;
++    case 4: stq(0, src, base, d); break;
++    default: stq(1, src, base, d);
++    }
++}
++static void vld(int rt, int nb, int base, s32 d) {
++    s32 vo = OFF_V(rt);
++    if (nb == 16) { op_m(0, 0, 0x0F10, 0, base, d, 0); op_m(0, 0, 0x0F11, 0, R15, vo, 0); }
++    else { gpr_ld(nb, 0, 0, base, d); stq(1, RAX, R15, vo); op_m(0, 1, 0xC7, 0, R15, vo + 8, 0); e4(0); }
++}
++static void vst(int rt, int nb, int base, s32 d) {
++    s32 vo = OFF_V(rt);
++    if (nb == 16) { op_m(0, 0, 0x0F10, 0, R15, vo, 0); op_m(0, 0, 0x0F11, 0, base, d, 0); }
++    else { ldq(1, RAX, R15, vo); gpr_st(nb, RAX, base, d); }
++}
++static void ext_rcx(int opt, int sh) {
++    switch (opt) {
++    case 0: movzx8(RCX, RCX); break;
++    case 1: movzx16(RCX, RCX); break;
++    case 2: mov_rr(0, RCX, RCX); break;
++    case 4: movsx8(1, RCX, RCX); break;
++    case 5: movsx16(1, RCX, RCX); break;
++    case 6: movsxd(RCX, RCX); break;
++    default: break;
++    }
++    sh_i(1, S_SHL, RCX, sh);
++}
++static int j_ldst(u64 pc, u32 i) {
++    int rn = (i >> 5) & 31, rt = i & 31;
++    if ((i & 0x3B000000) == 0x18000000) {                      /* literal */
++        int opc = i >> 30, V = (i >> 26) & 1;
++        u64 a = pc + (u64)(sext((i >> 5) & 0x7ffff, 19) * 4);
++        if (!V) {
++            if (opc == 3) return 0;
++            mov_ri(RCX, a);
++            if (opc == 0) ldq(0, RAX, RCX, 0); else if (opc == 1) ldq(1, RAX, RCX, 0); else op_m(0, 1, 0x63, RAX, RCX, 0, 0);
++            gst(RAX, rt);
++        } else {
++            if (opc > 2) return -1;
++            mov_ri(RCX, a); vld(rt, 4 << opc, RCX, 0);
++        }
++        return 0;
++    }
++    if ((i & 0x3A000000) == 0x28000000) {                      /* pair */
++        int opc = i >> 30, V = (i >> 26) & 1, L = (i >> 22) & 1, idx = (i >> 23) & 3, rt2 = (i >> 10) & 31, sc, nb;
++        if (opc == 3) return -1;
++        sc = !V ? (opc == 2 ? 3 : 2) : 2 + opc; nb = 1 << sc;
++        s32 off = (s32)(sext((i >> 15) & 0x7f, 7) * (1 << sc)), d = 0;
++        gldsp(1, RCX, rn);
++        if (idx == 3) lea(1, RCX, RCX, off); else if (idx != 1) d = off;
++        if (!V) {
++            if (L) {
++                int sg = opc == 1;
++                gpr_ld(nb, sg, 1, RCX, d); mov_rr(1, RSI, RAX);
++                gpr_ld(nb, sg, 1, RCX, d + nb);
++                gst(RSI, rt); gst(RAX, rt2);
++            } else {
++                gld(1, RAX, rt); gld(1, RDX, rt2);
++                gpr_st(nb, RAX, RCX, d); gpr_st(nb, RDX, RCX, d + nb);
++            }
++        } else if (L) {
++            if (nb == 16) {
++                op_m(0, 0, 0x0F10, 0, RCX, d, 0); op_m(0, 0, 0x0F10, 1, RCX, d + 16, 0);
++                op_m(0, 0, 0x0F11, 0, R15, OFF_V(rt), 0); op_m(0, 0, 0x0F11, 1, R15, OFF_V(rt2), 0);
++            } else {
++                gpr_ld(nb, 0, 0, RCX, d); mov_rr(1, RSI, RAX);
++                gpr_ld(nb, 0, 0, RCX, d + nb);
++                stq(1, RSI, R15, OFF_V(rt)); op_m(0, 1, 0xC7, 0, R15, OFF_V(rt) + 8, 0); e4(0);
++                stq(1, RAX, R15, OFF_V(rt2)); op_m(0, 1, 0xC7, 0, R15, OFF_V(rt2) + 8, 0); e4(0);
++            }
++        } else {
++            if (nb == 16) {
++                op_m(0, 0, 0x0F10, 0, R15, OFF_V(rt), 0); op_m(0, 0, 0x0F10, 1, R15, OFF_V(rt2), 0);
++                op_m(0, 0, 0x0F11, 0, RCX, d, 0); op_m(0, 0, 0x0F11, 1, RCX, d + 16, 0);
++            } else {
++                ldq(1, RAX, R15, OFF_V(rt)); ldq(1, RDX, R15, OFF_V(rt2));
++                gpr_st(nb, RAX, RCX, d); gpr_st(nb, RDX, RCX, d + nb);
++            }
++        }
++        if (idx == 1) { lea(1, RSI, RCX, off); gsts(RSI, rn); } else if (idx == 3) gsts(RCX, rn);
++        return 0;
++    }
++    if ((i & 0x3B000000) == 0x38000000 || (i & 0x3B000000) == 0x39000000) {   /* register */
++        int size = i >> 30, V = (i >> 26) & 1, opc = (i >> 22) & 3, sc, nb, isld, sgn = 0, to64 = 0;
++        if (!V) {
++            sc = size; nb = 1 << size;
++            if (opc == 0) isld = 0; else if (opc == 1) isld = 1;
++            else { if (size == 3) { if (opc == 2) return 0; return -1; } if (opc == 3 && size == 2) return -1; isld = 1; sgn = 1; to64 = opc == 2; }
++        } else {
++            if (opc >= 2 && size == 0) { nb = 16; sc = 4; isld = opc & 1; }
++            else if (opc < 2) { nb = 1 << size; sc = size; isld = opc & 1; }
++            else return -1;
++        }
++        s32 d = 0; int wb = 0, imm = 0;
++        gldsp(1, RCX, rn);
++        if ((i >> 24) & 1) d = (s32)(((i >> 10) & 0xfff) << sc);
++        else if (!((i >> 21) & 1)) {
++            imm = (s32) sext((i >> 12) & 0x1ff, 9); int m = (i >> 10) & 3;
++            if (m == 1) wb = 1;
++            else if (m == 3) { lea(1, RCX, RCX, imm); wb = 2; }
++            else d = imm;
++        } else if (((i >> 10) & 3) == 2) {
++            gld(1, RDX, (i >> 16) & 31);
++            mov_rr(1, RSI, RCX); mov_rr(1, RCX, RDX);
++            ext_rcx((i >> 13) & 7, ((i >> 12) & 1) ? sc : 0);
++            alu_rr(1, A_ADD, RCX, RSI);
++        } else return -1;
++        if (!V) {
++            if (isld) { gpr_ld(nb, sgn, to64, RCX, d); gst(RAX, rt); }
++            else { gld(1, RAX, rt); gpr_st(nb, RAX, RCX, d); }
++        } else {
++            if (isld) vld(rt, nb, RCX, d); else vst(rt, nb, RCX, d);
++        }
++        if (wb == 1) { lea(1, RSI, RCX, imm); gsts(RSI, rn); } else if (wb == 2) gsts(RCX, rn);
++        return 0;
++    }
++    return -1;
++}
++
++/* ---- data processing */
++static void ld_shifted(int sf, int hr, int rm, int type, int amt) {
++    gld(sf, hr, rm);
++    if (amt) sh_i(sf, type == 0 ? S_SHL : type == 1 ? S_SHR : type == 2 ? S_SAR : S_ROR, hr, amt);
++}
++static void and_imm(int w, int reg, u64 v, int tmp) {          /* reg &= v (v already limited to the operand size) */
++    if (w ? ((s64) v == (s32) v) : 1) alu_ri(w, A_AND, reg, (s32) v);
++    else { mov_ri(tmp, v); alu_rr(w, A_AND, reg, tmp); }
++}
++static int j_dpimm(u64 pc, u32 i, int *flive) {
++    int sf = i >> 31, rd = i & 31, rn = (i >> 5) & 31;
++    if ((i & 0x1F000000) == 0x10000000) {                      /* ADR / ADRP */
++        s64 imm = sext((((i >> 5) & 0x7ffff) << 2) | ((i >> 29) & 3), 21);
++        u64 v = (i >> 31) ? ((pc & ~0xfffULL) + (u64)(imm * 4096)) : pc + (u64) imm;
++        if (rd != 31) { mov_ri(RAX, v); gst(RAX, rd); }
++    } else if ((i & 0x1F000000) == 0x11000000) {               /* ADD/SUB imm */
++        u32 imm = (i >> 10) & 0xfff; if ((i >> 22) & 1) imm <<= 12;
++        int sub = (i >> 30) & 1, S = (i >> 29) & 1;
++        gldsp(sf, RAX, rn);
++        alu_ri(sf, sub ? A_SUB : A_ADD, RAX, (s32) imm);
++        if (S && !sub) cmc();
++        if (S) gst(RAX, rd); else gsts(RAX, rd);
++        if (S) { fl_spill(); *flive = 1; }
++    } else if ((i & 0x1F800000) == 0x12000000) {               /* logical imm */
++        u64 wm, tm;
++        if (decode_bm((i >> 22) & 1, (i >> 10) & 0x3f, (i >> 16) & 0x3f, sf, &wm, &tm) < 0) return -1;
++        int opc = (i >> 29) & 3;
++        wm &= msk(sf);
++        gld(sf, RAX, rn);
++        if (opc == 1) { if (sf ? ((s64) wm == (s32) wm) : 1) alu_ri(sf, A_OR, RAX, (s32) wm); else { mov_ri(RCX, wm); alu_rr(sf, A_OR, RAX, RCX); } }
++        else if (opc == 2) { if (sf ? ((s64) wm == (s32) wm) : 1) alu_ri(sf, A_XOR, RAX, (s32) wm); else { mov_ri(RCX, wm); alu_rr(sf, A_XOR, RAX, RCX); } }
++        else and_imm(sf, RAX, wm, RCX);
++        if (opc == 3) { stc(); gst(RAX, rd); fl_spill(); *flive = 1; } else gsts(RAX, rd);
++    } else if ((i & 0x1F800000) == 0x12800000) {               /* move wide */
++        int opc = (i >> 29) & 3, hw = (i >> 21) & 3; u64 imm = (u64)((i >> 5) & 0xffff) << (hw * 16);
++        if (!sf && hw > 1) return -1;
++        if (opc == 1) return -1;
++        if (opc == 3) {
++            if (rd == 31) return 0;
++            if (sf) { op_m(0x66, 0, 0xC7, 0, R15, OFF_X(rd) + 2 * hw, 0); e2((u32)((i >> 5) & 0xffff)); }
++            else { gld(0, RAX, rd); alu_ri(0, A_AND, RAX, (s32)(u32) ~(0xffffu << (hw * 16))); alu_ri(0, A_OR, RAX, (s32)(u32) imm); gst(RAX, rd); }
++        } else if (rd != 31) {
++            mov_ri(RAX, opc == 0 ? (~imm & msk(sf)) : imm); gst(RAX, rd);
++        }
++    } else if ((i & 0x1F800000) == 0x13000000) {               /* bitfield */
++        u64 wm, tm; int opc = (i >> 29) & 3, immr = (i >> 16) & 0x3f, imms = (i >> 10) & 0x3f, n = sf ? 64 : 32;
++        if (opc == 3 || decode_bm((i >> 22) & 1, imms, immr, sf, &wm, &tm) < 0) return -1;
++        if (rd == 31) return 0;
++        gld(sf, RAX, rn);
++        if (opc == 2) {                                        /* UBFM */
++            if (imms == n - 1) sh_i(sf, S_SHR, RAX, immr);                              /* LSR */
++            else if (imms + 1 == immr) sh_i(sf, S_SHL, RAX, n - immr);                  /* LSL */
++            else if (immr == 0 && imms == 7) movzx8(RAX, RAX);
++            else if (immr == 0 && imms == 15) movzx16(RAX, RAX);
++            else if (immr == 0 && imms == 31 && sf) mov_rr(0, RAX, RAX);
++            else if (imms >= immr) {
++                sh_i(sf, S_SHR, RAX, immr);
++                int wdt = imms - immr + 1;
++                and_imm(sf, RAX, wdt == 64 ? ~0ULL : ((1ULL << wdt) - 1), RCX);
++            } else {
++                and_imm(sf, RAX, (1ULL << (imms + 1)) - 1, RCX);
++                sh_i(sf, S_SHL, RAX, n - immr);
++            }
++        } else if (opc == 0) {                                 /* SBFM */
++            if (imms == n - 1) sh_i(sf, S_SAR, RAX, immr);                              /* ASR */
++            else if (immr == 0 && imms == 7) movsx8(sf, RAX, RAX);
++            else if (immr == 0 && imms == 15) movsx16(sf, RAX, RAX);
++            else if (immr == 0 && imms == 31 && sf) movsxd(RAX, RAX);
++            else if (imms >= immr) { sh_i(sf, S_SHL, RAX, n - 1 - imms); sh_i(sf, S_SAR, RAX, n - 1 - imms + immr); }
++            else { sh_i(sf, S_SHL, RAX, n - 1 - imms); sh_i(sf, S_SAR, RAX, immr - imms - 1); }
++        } else {                                               /* BFM */
++            u64 m = msk(sf);
++            gld(sf, RDX, rd);
++            sh_i(sf, S_ROR, RAX, immr);
++            and_imm(sf, RAX, wm & m, RCX);                     /* rax = ror(src) & wm */
++            mov_ri(RCX, ~wm & m); alu_rr(sf, A_AND, RCX, RDX); /* rcx = dst & ~wm */
++            alu_rr(sf, A_OR, RAX, RCX);                        /* bot */
++            and_imm(sf, RAX, tm & m, RCX);                     /* bot & tm */
++            mov_ri(RCX, ~tm & m); alu_rr(sf, A_AND, RCX, RDX); /* dst & ~tm */
++            alu_rr(sf, A_OR, RAX, RCX);
++        }
++        gst(RAX, rd);
++    } else if ((i & 0x1F800000) == 0x13800000) {               /* EXTR */
++        int imms = (i >> 10) & 0x3f, rm = (i >> 16) & 31;
++        if (!sf && imms >= 32) return -1;
++        if (rd == 31) return 0;
++        gld(sf, RAX, rm); gld(sf, RCX, rn);
++        if (imms) { op_r(0, sf, 0x0FAC, RCX, RAX, 0); e1((u32) imms); }       /* shrd rax, rcx, imms */
++        gst(RAX, rd);
++    } else return -1;
++    return 0;
++}
++static void j_div(int sf, int sgn, int rd, int rn, int rm) {
++    gld(sf, RAX, rn); gld(sf, RCX, rm);
++    test_rr(sf, RCX, RCX);
++    u8 *nz = jcc_fwd(5);
++    mov_ri(RAX, 0); u8 *d1 = jmp_fwd();
++    here(nz);
++    if (!sgn) { mov_ri(RDX, 0); f7(sf, 6, RCX); }
++    else {
++        alu_ri(sf, A_CMP, RCX, -1);
++        u8 *gen = jcc_fwd(5);
++        f7(sf, 3, RAX);
++        u8 *d2 = jmp_fwd();
++        here(gen);
++        if (sf) e1(0x48);
++        e1(0x99);
++        f7(sf, 7, RCX);
++        here(d2);
++    }
++    here(d1);
++    gst(RAX, rd);
++}
++/* returns 1 when the instruction ended the block, 0 to continue, -1 when it is not handled */
++static int j_dpreg(u64 pc, u32 i, int fl, int *flive) {
++    int sf = i >> 31, rd = i & 31, rn = (i >> 5) & 31, rm = (i >> 16) & 31;
++    (void) pc;
++    if ((i & 0x1F000000) == 0x0A000000) {                      /* logical shifted */
++        int opc = (i >> 29) & 3, nn = (i >> 21) & 1, amt = (i >> 10) & 0x3f, ty = (i >> 22) & 3;
++        if (!sf && amt >= 32) return -1;
++        if (opc == 1 && rn == 31 && !nn) {                     /* MOV / shifted MOV */
++            ld_shifted(sf, RAX, rm, ty, amt); gst(RAX, rd); return 0;
++        }
++        ld_shifted(sf, RCX, rm, ty, amt);
++        if (nn) f7(sf, 2, RCX);
++        gld(sf, RAX, rn);
++        alu_rr(sf, opc == 1 ? A_OR : opc == 2 ? A_XOR : A_AND, RAX, RCX);
++        if (opc == 3) stc();
++        gst(RAX, rd);
++        if (opc == 3) { fl_spill(); *flive = 1; }
++    } else if ((i & 0x1F200000) == 0x0B000000) {               /* add/sub shifted */
++        int sub = (i >> 30) & 1, S = (i >> 29) & 1, ty = (i >> 22) & 3, amt = (i >> 10) & 0x3f;
++        if (ty == 3 || (!sf && amt >= 32)) return -1;
++        ld_shifted(sf, RCX, rm, ty, amt);
++        gld(sf, RAX, rn);
++        alu_rr(sf, sub ? A_SUB : A_ADD, RAX, RCX);
++        if (S && !sub) cmc();
++        gst(RAX, rd);
++        if (S) { fl_spill(); *flive = 1; }
++    } else if ((i & 0x1F200000) == 0x0B200000) {               /* add/sub extended */
++        int sub = (i >> 30) & 1, S = (i >> 29) & 1, sh = (i >> 10) & 7;
++        gld(1, RCX, rm); ext_rcx((i >> 13) & 7, sh);
++        gldsp(sf, RAX, rn);
++        alu_rr(sf, sub ? A_SUB : A_ADD, RAX, RCX);
++        if (S && !sub) cmc();
++        if (S) gst(RAX, rd); else gsts(RAX, rd);
++        if (S) { fl_spill(); *flive = 1; }
++    } else if ((i & 0x1FE00000) == 0x1A000000) {               /* ADC / SBC */
++        int sub = (i >> 30) & 1, S = (i >> 29) & 1;
++        if (!fl) fl_restore();
++        gld(sf, RAX, rn); gld(sf, RCX, rm);
++        if (sub) alu_rr(sf, A_SBB, RAX, RCX);
++        else { cmc(); alu_rr(sf, A_ADC, RAX, RCX); if (S) cmc(); }
++        gst(RAX, rd);
++        if (S) { fl_spill(); *flive = 1; }
++    } else if ((i & 0x1FE00000) == 0x1A400000) {               /* CCMP / CCMN */
++        int sub = (i >> 30) & 1, cc = (i >> 12) & 15;
++        int nz = i & 15;
++        u32 ah = ((nz >> 3) & 1) << 7 | ((nz >> 2) & 1) << 6 | ((~nz >> 1) & 1), cx = (ah << 8) | (u32)(nz & 1);
++        u8 *jf = NULL, *jd = NULL;
++        if ((cc >> 1) != 7) { if (!fl) fl_restore(); jf = jcc_fwd(xcc(cc) ^ 1); }
++        gld(sf, RAX, rn);
++        if ((i >> 11) & 1) mov_ri(RCX, (i >> 16) & 31); else gld(sf, RCX, rm);
++        alu_rr(sf, sub ? A_CMP : A_ADD, RAX, RCX);
++        if (!sub) cmc();
++        fl_spill();
++        if (jf) {
++            jd = jmp_fwd();
++            here(jf);
++            op_m(0, 1, 0xC7, 0, R15, OFF_XFL, 0); e4(cx);
++            here(jd);
++        }
++    } else if ((i & 0x1FE00000) == 0x1A800000) {               /* CSEL family */
++        int op = (i >> 30) & 1, o2 = (i >> 10) & 1, cc = (i >> 12) & 15;
++        if ((cc >> 1) == 7) { gld(sf, RAX, rn); gst(RAX, rd); return 0; }
++        if (!fl) fl_restore();
++        gld(sf, RDX, rm);
++        if (op) f7(sf, 2, RDX);
++        if (o2) lea(sf, RDX, RDX, 1);
++        gld(sf, RCX, rn);
++        cmov(sf, xcc(cc), RDX, RCX);
++        gst(RDX, rd);
++    } else if ((i & 0x5FE00000) == 0x1AC00000) {               /* 2-source */
++        int op = (i >> 10) & 0x3f;
++        switch (op) {
++        case 2: j_div(sf, 0, rd, rn, rm); break;
++        case 3: j_div(sf, 1, rd, rn, rm); break;
++        case 8: case 9: case 10: case 11:
++            gld(sf, RAX, rn); gld(sf, RCX, rm);
++            sh_cl(sf, op == 8 ? S_SHL : op == 9 ? S_SHR : op == 10 ? S_SAR : S_ROR, RAX);
++            gst(RAX, rd); break;
++        default: return -1;
++        }
++    } else if ((i & 0x5FE00000) == 0x5AC00000) {               /* 1-source */
++        int op = (i >> 10) & 0x3f, n = sf ? 64 : 32;
++        if (op == 4) {                                         /* CLZ */
++            gld(sf, RAX, rn);
++            op_r(0, sf, 0x0FBD, RCX, RAX, 0);
++            mov_ri(RDX, ~0ULL); cmov(1, 4, RCX, RDX);
++            f7(1, 3, RCX); alu_ri(1, A_ADD, RCX, n - 1);
++            gst(RCX, rd);
++        } else if (op == 2 || (op == 3 && sf)) {               /* REV32 / REV */
++            gld(sf, RAX, rn);
++            rexp(sf, 0, 0, RAX, 0); e1(0x0F); e1(0xC8);        /* bswap rax / eax */
++            if (op == 2 && sf) sh_i(1, S_ROR, RAX, 32);
++            gst(RAX, rd);
++        } else return -1;
++    } else if ((i & 0x1F000000) == 0x1B000000) {               /* 3-source */
++        int o0 = (i >> 15) & 1, op31 = (i >> 21) & 7, ra = (i >> 10) & 31;
++        switch (op31) {
++        case 0:
++            gld(sf, RAX, rn); gld(sf, RCX, rm); imul_rr(sf, RAX, RCX);
++            if (ra != 31) { gld(sf, RDX, ra); if (o0) { alu_rr(sf, A_SUB, RDX, RAX); mov_rr(sf, RAX, RDX); } else alu_rr(sf, A_ADD, RAX, RDX); }
++            else if (o0) f7(sf, 3, RAX);
++            gst(RAX, rd); break;
++        case 1: case 5:
++            gld(0, RAX, rn); gld(0, RCX, rm);
++            if (op31 == 1) { movsxd(RAX, RAX); movsxd(RCX, RCX); }
++            imul_rr(1, RAX, RCX);
++            if (ra != 31) { gld(1, RDX, ra); if (o0) { alu_rr(1, A_SUB, RDX, RAX); mov_rr(1, RAX, RDX); } else alu_rr(1, A_ADD, RAX, RDX); }
++            else if (o0) f7(1, 3, RAX);
++            gst(RAX, rd); break;
++        case 2: case 6:
++            gld(1, RAX, rn); gld(1, RCX, rm);
++            f7(1, op31 == 2 ? 5 : 4, RCX);
++            gst(RDX, rd); break;
++        default: return -1;
++        }
++    } else return -1;
++    return 0;
++}
++
++/* ---- branches and system instructions; 1 = block ended, 0 = continue, -1 = not handled */
++static int j_branch(u64 pc, u32 i, int fl) {
++    int sf = i >> 31, rd = i & 31, rn = (i >> 5) & 31;
++    if ((i & 0x7C000000) == 0x14000000) {                      /* B / BL */
++        if (i >> 31) { mov_ri(RAX, pc + 4); stq(1, RAX, R15, OFF_X(30)); }
++        jexit_direct(pc, pc + (u64)(sext(i & 0x3ffffff, 26) * 4));
++        return 1;
++    } else if ((i & 0x7E000000) == 0x34000000) {               /* CBZ / CBNZ */
++        gld(sf, RAX, rd); test_rr(sf, RAX, RAX);
++        u8 *t = jcc_fwd(((i >> 24) & 1) ? 5 : 4);
++        jexit_direct(pc, pc + 4); here(t);
++        jexit_direct(pc, pc + (u64)(sext((i >> 5) & 0x7ffff, 19) * 4));
++        return 1;
++    } else if ((i & 0x7E000000) == 0x36000000) {               /* TBZ / TBNZ */
++        int bit = ((i >> 31) << 5) | ((i >> 19) & 31);
++        gld(1, RAX, rd); op_r(0, 1, 0x0FBA, 4, RAX, 0); e1((u32) bit);
++        u8 *t = jcc_fwd(((i >> 24) & 1) ? 2 : 3);
++        jexit_direct(pc, pc + 4); here(t);
++        jexit_direct(pc, pc + (u64)(sext((i >> 5) & 0x3fff, 14) * 4));
++        return 1;
++    } else if ((i & 0xFF000010) == 0x54000000) {               /* B.cond */
++        int cc = i & 15; u64 tgt = pc + (u64)(sext((i >> 5) & 0x7ffff, 19) * 4);
++        if ((cc >> 1) == 7) { jexit_direct(pc, tgt); return 1; }
++        if (!fl) fl_restore();
++        u8 *t = jcc_fwd(xcc(cc));
++        jexit_direct(pc, pc + 4); here(t);
++        jexit_direct(pc, tgt);
++        return 1;
++    } else if ((i & 0xFE000000) == 0xD6000000) {               /* BR / BLR / RET */
++        int opc = (i >> 21) & 15;
++        if (opc > 2) return -1;
++        gld(1, RAX, rn);
++        if (opc == 1) { mov_ri(RCX, pc + 4); stq(1, RCX, R15, OFF_X(30)); }
++        jexit_indirect();
++        return 1;
++    } else if ((i & 0xFFE0001F) == 0xD4000001) {               /* SVC */
++        set_pc(pc + 4); mov_rr(1, RDI, R15); call_abs((void*) jit_svc); jmp_to(jepi);
++        return 1;
++    } else if ((i & 0xFF000000) == 0xD4000000) {               /* BRK etc. */
++        j_fallback(pc, 1); return 1;
++    } else if ((i & 0xFFFFFFE0) == 0xD50B7420) {               /* DC ZVA */
++        gld(1, RAX, rd); alu_ri(1, A_AND, RAX, -64);
++        e1(0x0F); e1(0x57); e1(0xC0);                          /* xorps xmm0, xmm0 */
++        for (int k = 0; k < 4; k++) op_m(0, 0, 0x0F11, 0, RAX, 16 * k, 0);
++    } else if ((i & 0xFFF80000) == 0xD5080000) {               /* SYS (cache maintenance) */
++        int crn = (i >> 12) & 15, crm = (i >> 8) & 15;
++        if (crn == 7 && (crm == 5 || crm == 1)) {              /* IC: translated code may be stale */
++            mov_rr(1, RDI, R15); call_abs((void*) jit_flush_helper);
++            set_pc(pc + 4); jmp_to(jepi);
++            return 1;
++        }
++    } else if ((i & 0xFFFFF000) == 0xD5033000 || (i & 0xFFFFF01F) == 0xD503201F || (i & 0xFFFFF000) == 0xD5032000) {
++        /* barriers / hints */
++    } else if ((i & 0xFFF00000) == 0xD5300000 && ((i >> 5) & 0x7fff) == 0x5E82) {   /* MRS TPIDR_EL0 */
++        ldq(1, RAX, R15, OFF_TPIDR); gst(RAX, rd);
++    } else if ((i & 0xFFF00000) == 0xD5100000 && ((i >> 5) & 0x7fff) == 0x5E82) {   /* MSR TPIDR_EL0 */
++        gld(1, RAX, rd); stq(1, RAX, R15, OFF_TPIDR);
++    } else if ((i & 0xFFF8F01F) == 0xD500401F) {               /* MSR (immediate) - ignored */
++    } else if ((i & 0xFFF00000) == 0xD5300000 || (i & 0xFFF00000) == 0xD5100000) {
++        j_fallback(pc, 0);
++    } else return -1;
++    return 0;
++}
++
++static int jit_insn(u64 pc, u32 i, int fl, int *flive) {
++    int r;
++    switch ((i >> 25) & 15) {
++    case 8: case 9:
++        r = j_dpimm(pc, i, flive); if (r < 0) { j_fallback(pc, 0); return 0; } return r;
++    case 10: case 11:
++        r = j_branch(pc, i, fl); if (r < 0) { j_fallback(pc, 1); return 1; } return r;
++    case 4: case 6: case 12: case 14:
++        r = j_ldst(pc, i); if (r < 0) j_fallback(pc, 0); return 0;
++    case 5: case 13:
++        r = j_dpreg(pc, i, fl, flive); if (r < 0) { j_fallback(pc, 0); return 0; } return r;
++    default:
++        j_fallback(pc, 0); return 0;       /* SIMD/FP and anything else: interpreter (undef exits the process) */
++    }
++}
++
++static u8 *jtranslate(u64 pc0) {
++    if ((size_t)(jlim - jcur) < (512u << 10) || jmapn + 4096 > JMAP_CAP || jhn > (1u << JH_BITS) / 2 || jpgn > (1u << JPG_BITS) / 2) jflush();
++    u8 *start = jcur;
++    jins(pc0, start); jstat_blocks++;
++    u64 pc = pc0; int flive = 0, ended = 0, n = 0;
++    while (!ended && n < JMAXI) {
++        u32 ins = *(u32*) pc;
++        jm_off[jmapn] = (u32)(jcur - jbase); jm_pc[jmapn] = pc; jmapn++;
++        int fl = flive; flive = 0;
++        ended = jit_insn(pc, ins, fl, &flive);
++        n++; pc += 4;
++    }
++    if (!ended) jexit_direct(pc - 4, pc);
++    for (u64 p = pc0 >> 12; p <= (pc - 1) >> 12; p++) jpg_add(p);
++    return start;
++}
++
++static int jit_init(void) {
++    size_t hs = sizeof(JEnt) << JH_BITS, is = sizeof(JEnt) << JIC_BITS, ps = sizeof(u64) << JPG_BITS;
++    int pr = PROT_READ | PROT_WRITE, fg = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
++    jbase = mmap(NULL, JCACHE_SZ, pr | PROT_EXEC, fg, -1, 0);
++    if (jbase == MAP_FAILED) return -1;
++    jh = mmap(NULL, hs, pr, fg, -1, 0); jic = mmap(NULL, is, pr, fg, -1, 0);
++    jm_off = mmap(NULL, JMAP_CAP * 4ull, pr, fg, -1, 0); jm_pc = mmap(NULL, JMAP_CAP * 8ull, pr, fg, -1, 0);
++    jpg = mmap(NULL, ps, pr, fg, -1, 0);
++    if (jh == MAP_FAILED || jic == MAP_FAILED || jm_off == MAP_FAILED || jm_pc == MAP_FAILED || jpg == MAP_FAILED) return -1;
++    jlim = jbase + JCACHE_SZ;
++    static const u8 enter[] = {0x53, 0x55, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x08,
++                               0x49, 0x89, 0xFF, 0x49, 0x89, 0xD6, 0xFF, 0xE6};
++    static const u8 epi[] = {0x48, 0x83, 0xC4, 0x08, 0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C, 0x5D, 0x5B, 0xC3};
++    jenter = jbase; memcpy(jenter, enter, sizeof enter);
++    jepi = jbase + 64; memcpy(jepi, epi, sizeof epi);
++    jcur = jbase + JTRAMP_SZ;
++    return 0;
++}
++
++static void run_jit(CPU *c) {
++    jsync_out(c);
++    if (sigsetjmp(g_jb, 1)) {                                  /* host fault with a guest handler */
++        int s = g_fault; sigset_t ss; sigemptyset(&ss); sigaddset(&ss, s); sigprocmask(SIG_UNBLOCK, &ss, NULL);
++        siginfo_t si; memset(&si, 0, sizeof si); si.si_signo = s; pinfo[s] = si;
++        jsync_in(c); deliver_sig(c, s); jsync_out(c);
++    }
++    void (*enter)(CPU*, u8*, void*) = (void (*)(CPU*, u8*, void*)) (void*) jenter;
++    for (;;) {
++        if (c->jflag) { c->jflag = 0; if (pend) { jsync_in(c); check_pending(c); jsync_out(c); } }
++        u64 pc = c->pc;
++        u8 *code = jfind(pc);
++        if (!code) code = jtranslate(pc);
++        if (c->patch) { s32 d = (s32)(code - ((u8*) c->patch + 4)); memcpy((void*) c->patch, &d, 4); c->patch = 0; }
++        u32 h = (u32)(pc >> 2) & ((1u << JIC_BITS) - 1);
++        jic[h].pc = pc; jic[h].code = code;
++        enter(c, code, jic);
++    }
++}
++
+ static void run(CPU*c) {
+     if (sigsetjmp(g_jb, 1)) {                                  /* host fault with a guest handler */
+         int s = g_fault; sigset_t ss; sigemptyset(&ss); sigaddset(&ss, s); sigprocmask(SIG_UNBLOCK, &ss, NULL);
+@@ -872,7 +1594,7 @@
+ static u64 push_str(u64*sp, const char*s) { size_t n = strlen(s) + 1; *sp -= n; memcpy((void*)*sp, s, n); return *sp; }
+ 
+ int main(int argc, char**argv, char**envp) {
+-    const char*argv0 = NULL; int a = 1;
++    const char*argv0 = NULL; int a = 1, nojit = getenv("PEMU_JIT") && !strcmp(getenv("PEMU_JIT"), "0");
+     for (; a < argc && argv[a][0] == '-' && argv[a][1]; a++) {
+         const char*o = argv[a];
+         if (!strcmp(o, "--")) { a++; break; }
+@@ -881,7 +1603,9 @@
+         else if (!strcmp(o, "-E") && a + 1 < argc) { char*v = strdup(argv[++a]); char*eq = strchr(v, '='); if (eq) { *eq = 0; setenv(v, eq + 1, 1); } }
+         else if (!strcmp(o, "-U") && a + 1 < argc) unsetenv(argv[++a]);
+         else if (!strcmp(o, "-strace")) g_trace = 1;
+-        else if (!strcmp(o, "--version") || !strcmp(o, "-version")) { puts("pemu 0.1 (aarch64 user-mode emulator, qemu-user alternative for prx)"); return 0; }
++        else if (!strcmp(o, "-nojit")) nojit = 1;
++        else if (!strcmp(o, "-jit")) nojit = 0;
++        else if (!strcmp(o, "--version") || !strcmp(o, "-version")) { puts("pemu 0.2 (aarch64 user-mode emulator with x86_64 JIT, qemu-user alternative for prx)"); return 0; }
+         else { fprintf(stderr, "pemu: unknown option %s\n", o); return 2; }
+     }
+     if (a >= argc) { fprintf(stderr, "usage: pemu [-0 argv0] [-strace] program [args...]\n"); return 2; }
+@@ -935,6 +1659,7 @@
+     w[k++] = 0;
+     for (int j = 0; j < na; j++) { w[k++] = aux[j][0]; w[k++] = aux[j][1]; }
+     cpu.sp = sp; cpu.pc = entry;
+-    run(&cpu);
++    if (!nojit && jit_init() == 0) g_jit = 1;
++    if (g_jit) run_jit(&cpu); else run(&cpu);
+     return 0;
+ }
+Binary files orig/prx-main/tests/__pycache__/pemu_test.cpython-312.pyc and prx-main/tests/__pycache__/pemu_test.cpython-312.pyc differ
+diff -ruN orig/prx-main/tests/pemu_fuzz.py prx-main/tests/pemu_fuzz.py
+--- orig/prx-main/tests/pemu_fuzz.py	1970-01-01 00:00:00.000000000 +0000
++++ prx-main/tests/pemu_fuzz.py	2026-10-31 13:13:51.151530605 +0000
+@@ -0,0 +1,242 @@
++#!/usr/bin/env python3
++"""Differential fuzzer: random AArch64 programs run under the interpreter (PEMU_JIT=0) and the
++JIT; registers, NZCV and a memory window are dumped and compared.
++usage: pemu_fuzz.py [pemu] [count] [seed]"""
++import os, random, struct, subprocess, sys, tempfile, importlib.util
++here = os.path.dirname(os.path.abspath(__file__))
++PEMU = sys.argv[1] if len(sys.argv) > 1 else os.path.join(here, '..', 'pemu')
++COUNT = int(sys.argv[2]) if len(sys.argv) > 2 else 300
++SEED = int(sys.argv[3]) if len(sys.argv) > 3 else 1
++sys.argv = [sys.argv[0], PEMU]
++spec = importlib.util.spec_from_file_location('pt', os.path.join(here, 'pemu_test.py'))
++pt = importlib.util.module_from_spec(spec); spec.loader.exec_module(pt)
++
++R = random.Random()
++GP = list(range(0, 26))          # freely used registers (x26 loop counter, x27 index, x28/x29 bases)
++
++def reg(z=True): return R.choice(GP + ([31] if z else []))
++def dreg(): return R.choice(GP)
++
++def logimm(sf):
++    while True:
++        es = R.choice([2, 4, 8, 16, 32, 64] if sf else [2, 4, 8, 16, 32])
++        ones = R.randrange(1, es); rot = R.randrange(es)
++        N = 1 if es == 64 else 0
++        imms = ((-(es << 1)) | (ones - 1)) & 0x3f
++        return N, rot, imms
++
++def gen_one():
++    k = R.randrange(100)
++    sf = R.randrange(2)
++    rd, rn, rm = dreg(), reg(), reg()
++    if k < 8:                                                    # add/sub imm
++        S = R.randrange(2); op = R.randrange(2)
++        if not S and R.random() < .5: rd = dreg()
++        rd = rd if (S or rd != 31) else 0
++        return sf << 31 | op << 30 | S << 29 | 0x11000000 | R.randrange(2) << 22 | R.randrange(4096) << 10 | rn << 5 | rd
++    if k < 14:                                                   # logical imm
++        N, r_, s_ = logimm(sf); opc = R.randrange(4)
++        return sf << 31 | opc << 29 | 0x12000000 | N << 22 | r_ << 16 | s_ << 10 | rn << 5 | (rd if opc == 3 else dreg())
++    if k < 18:                                                   # move wide
++        opc = R.choice([0, 2, 3, 3]); hw = R.randrange(4 if sf else 2)
++        return sf << 31 | opc << 29 | 0x12800000 | hw << 21 | R.randrange(65536) << 5 | dreg()
++    if k < 21:                                                   # adr/adrp
++        return R.randrange(2) << 31 | R.randrange(4) << 29 | 0x10000000 | R.randrange(1 << 19) << 5 | dreg()
++    if k < 30:                                                   # logical shifted
++        amt = R.randrange(32 if not sf else 64)
++        return sf << 31 | R.randrange(4) << 29 | 0x0A000000 | R.randrange(4) << 22 | R.randrange(2) << 21 | rm << 16 | amt << 10 | rn << 5 | rd
++    if k < 38:                                                   # add/sub shifted
++        amt = R.randrange(32 if not sf else 64)
++        return sf << 31 | R.randrange(2) << 30 | R.randrange(2) << 29 | 0x0B000000 | R.randrange(3) << 22 | rm << 16 | amt << 10 | rn << 5 | rd
++    if k < 42:                                                   # add/sub extended
++        S = R.randrange(2); r2 = rd if S else dreg()
++        return sf << 31 | R.randrange(2) << 30 | S << 29 | 0x0B200000 | rm << 16 | R.randrange(8) << 13 | R.randrange(5) << 10 | rn << 5 | r2
++    if k < 45:                                                   # adc/sbc
++        return sf << 31 | R.randrange(2) << 30 | R.randrange(2) << 29 | 0x1A000000 | rm << 16 | rn << 5 | rd
++    if k < 49:                                                   # ccmp/ccmn
++        imm = R.randrange(2)
++        return sf << 31 | R.randrange(2) << 30 | 1 << 29 | 0x1A400000 | (R.randrange(32) if imm else rm) << 16 | R.randrange(16) << 12 | imm << 11 | rn << 5 | R.randrange(16)
++    if k < 56:                                                   # csel family
++        return sf << 31 | R.randrange(2) << 30 | 0x1A800000 | rm << 16 | R.randrange(16) << 12 | R.randrange(2) << 10 | rn << 5 | rd
++    if k < 60:                                                   # 2-source
++        return sf << 31 | 0x1AC00000 | rm << 16 | R.choice([2, 3, 8, 9, 10, 11]) << 10 | rn << 5 | rd
++    if k < 64:                                                   # 1-source
++        op = R.choice([0, 1, 2, 4, 5] + ([3] if sf else []))
++        return sf << 31 | 0x5AC00000 | op << 10 | rn << 5 | rd
++    if k < 68:                                                   # 3-source
++        op31 = R.choice([0, 0, 1, 2, 5, 6]); o0 = R.randrange(2); ra = reg()
++        if op31 in (2, 6): o0 = 0; ra = 31
++        s = 1 if op31 else sf
++        return s << 31 | 0x1B000000 | op31 << 21 | rm << 16 | o0 << 15 | ra << 10 | rn << 5 | rd
++    if k < 76:                                                   # bitfield
++        n = 64 if sf else 32
++        return sf << 31 | R.choice([0, 1, 2]) << 29 | 0x13000000 | sf << 22 | R.randrange(n) << 16 | R.randrange(n) << 10 | rn << 5 | rd
++    if k < 78:                                                   # extr
++        return sf << 31 | 0x13800000 | sf << 22 | rm << 16 | R.randrange(64 if sf else 32) << 10 | rn << 5 | rd
++    return gen_mem()
++
++def gen_mem():
++    k = R.randrange(100)
++    base = R.choice([29, 29, 28])
++    rt = R.choice(GP + [31]) if R.random() < .2 else dreg()
++    if k < 30:                                                   # unsigned imm
++        size = R.randrange(4)
++        opc = R.choice([0, 1, 1] + ([2] if size < 3 else []) + ([3] if size < 2 else []))
++        if size == 3 and opc > 1: opc = 1
++        return size << 30 | 0x39000000 | opc << 22 | R.randrange(0, 0x100 >> size) << 10 | base << 5 | (rt if opc != 0 or True else 0)
++    if k < 45:                                                   # pre/post/unscaled
++        size = R.randrange(4)
++        opc = R.choice([0, 1, 1] + ([2] if size < 3 else []) + ([3] if size < 2 else []))
++        m = R.choice([0, 1, 3]); imm9 = R.randrange(-64, 64) & 0x1ff
++        b = 28 if m else base
++        r = rt
++        if m and r == b: r = 0
++        return size << 30 | 0x38000000 | opc << 22 | imm9 << 12 | m << 10 | b << 5 | r
++    if k < 58:                                                   # register offset
++        size = R.randrange(4)
++        opc = R.choice([0, 1, 1] + ([2] if size < 3 else []))
++        return size << 30 | 0x38200800 | opc << 22 | 27 << 16 | R.choice([2, 3, 6, 7]) << 13 | R.randrange(2) << 12 | base << 5 | rt
++    if k < 74:                                                   # GPR pairs
++        opc = R.choice([0, 2, 2]); L = R.randrange(2); idx = R.choice([1, 2, 2, 3])
++        if L and R.random() < .15: opc = 1
++        b = 28 if idx != 2 else base
++        r1, r2 = dreg(), dreg()
++        if idx != 2 and L and b in (r1, r2): r1, r2 = 0, 1
++        imm = R.randrange(-8, 8) & 0x7f
++        if opc == 1 and not L: opc = 2
++        return opc << 30 | 0x28000000 | idx << 23 | L << 22 | imm << 15 | r2 << 10 | b << 5 | r1
++    if k < 84:                                                   # vector unsigned imm
++        size = R.randrange(4); q = R.random() < .4
++        if q: opc, size = R.choice([2, 3]), 0
++        else: opc = R.randrange(2)
++        sc = 4 if q else size
++        return size << 30 | 0x3D000000 | opc << 22 | R.randrange(0, 0x100 >> sc) << 10 | base << 5 | R.randrange(8)
++    if k < 94:                                                   # vector pairs
++        opc = R.randrange(3); L = R.randrange(2); idx = R.choice([1, 2, 2, 3])
++        b = 28 if idx != 2 else base
++        return opc << 30 | 0x2C000000 | idx << 23 | L << 22 | (R.randrange(-4, 4) & 0x7f) << 15 | R.randrange(8) << 10 | b << 5 | R.randrange(8)
++    # literal load (reads code words)
++    opc = R.randrange(3)
++    return opc << 30 | 0x18000000 | R.randrange(1, 12) << 5 | dreg()
++
++def gen_prog():
++    ins = []          # list of words / ('br', kind) items resolved after
++    # initial register state
++    for r in GP:
++        v = R.choice([0, 1, 0xffffffffffffffff, 0x8000000000000000, 0x7fffffffffffffff, 0xffffffff, 0x80000000, R.getrandbits(64), R.getrandbits(64), R.getrandbits(8), R.getrandbits(32)])
++        ins.append(0xD2800000 | (v & 0xffff) << 5 | r)
++        for hw in (1, 2, 3):
++            if (v >> 16 * hw) & 0xffff: ins.append(0xF2800000 | hw << 21 | ((v >> 16 * hw) & 0xffff) << 5 | r)
++    ins.append(0xD1200000 | 0 << 10 | 31 << 5 | 29)                  # placeholder, replaced below
++    ins.pop()
++    # x29 = sp - 0x20000 (bss-like region? use stack), x28 = x29 + 0x400, x27 = 8
++    ins += [0xD1400000 | 8 << 10 | 31 << 5 | 29]                     # sub x29, sp, #8, lsl 12 (-0x8000)
++    ins += [0x91000000 | 0 << 22 | 0x100 << 10 | 29 << 5 | 28]       # add x28, x29, #0x100
++    ins += [0xD2800000 | 8 << 5 | 27]
++    for k in range(12):                                              # seed memory
++        ins.append(0xF9000000 | k << 10 | 29 << 5 | R.randrange(26))
++    body = []
++    n = R.randrange(20, 90)
++    i = 0
++    while i < n:
++        t = R.random()
++        if t < .10:                                                  # forward branch
++            kind = R.randrange(5); skip = R.randrange(0, 5)
++            body.append(('fwd', kind, skip, R.randrange(2), dreg(), R.randrange(16), R.randrange(64)))
++        elif t < .13:                                                # indirect forward branch via adr/br
++            body.append(('ind', R.randrange(0, 4)))
++        elif t < .19:                                                # counted loop
++            cnt = R.randrange(2, 40)
++            body.append(('loop', cnt, [gen_one() for _ in range(R.randrange(1, 6))]))
++        else:
++            body.append(gen_one())
++        i += 1
++    # flatten with offsets
++    flat = []     # items: ('w', word) or ('fwd', ...) with positions
++    pos = len(ins)
++    out = list(ins)
++    sizes = []
++    for b in body:
++        if isinstance(b, tuple) and b[0] == 'ind': sizes.append(2)
++        elif isinstance(b, tuple) and b[0] == 'loop': sizes.append(len(b[2]) + 3)
++        else: sizes.append(1)
++    starts = []
++    p = pos
++    for s in sizes: starts.append(p); p += s
++    end = p
++    def target_idx(bi, skip):
++        j = min(bi + 1 + skip, len(body))
++        return starts[j] if j < len(body) else end
++    for bi, b in enumerate(body):
++        if isinstance(b, int): out.append(b); continue
++        if b[0] == 'fwd':
++            _, kind, skip, sf, rt, cc, bit = b
++            off = target_idx(bi, skip) - starts[bi]
++            if off <= 0: off = 1
++            if kind == 0: out.append(0x54000000 | off << 5 | cc)
++            elif kind == 1: out.append(sf << 31 | 0x34000000 | off << 5 | rt)
++            elif kind == 2: out.append(sf << 31 | 0x35000000 | off << 5 | rt)
++            elif kind == 3: out.append((bit >> 5) << 31 | 0x36000000 | ((bit >> 0) & 31) << 19 | off << 5 | rt)
++            else: out.append(0x14000000 | off)
++        elif b[0] == 'ind':
++            tgt = target_idx(bi, b[1]); off = (tgt - starts[bi]) * 4
++            if tgt - starts[bi] < 2: tgt = starts[bi] + 2; off = 8
++            out.append(((off & 3) << 29) | 0x10000000 | ((off >> 2) & 0x7ffff) << 5 | 25)       # adr x25, target
++            out.append(0xD61F0000 | 25 << 5)                                                    # br x25
++        else:
++            _, cnt, lb = b
++            out.append(0xD2800000 | cnt << 5 | 26)
++            out += lb
++            out.append(0xF1000400 | 26 << 5 | 26)                                              # subs x26,x26,#1
++            out.append(0x54000000 | ((-(len(lb) + 1)) & 0x7ffff) << 5 | 1)                      # b.ne loop
++    # epilogue: save regs and write window
++    out.append(0xD53B4200 | 27)                                                                 # mrs x27, nzcv
++    for r in range(0, 31, 1):
++        out.append(0xF9000000 | (0x900 // 8 + r) << 10 | 29 << 5 | r)                           # str xr,[x29,#0x900+8r]
++    for q in range(8):
++        out.append(0x3D800000 | (0x980 // 16 + q) << 10 | 29 << 5 | q)                           # str qN
++    out += [0xD2800000 | 1 << 5 | 0, 0xAA0003E0 | 29 << 16 | 1]                                 # x0=1, x1=x29
++    out += [0xD2800000 | 0xa80 << 5 | 2, 0xD2800000 | 64 << 5 | 8, 0xD4000001]
++    out += [0xD2800000 | 0, 0xD2800000 | 93 << 5 | 8, 0xD4000001]
++    out[-3] = 0xD2800000 | 0
++    return out
++
++def run(words, jit):
++    img, _ = pt.elf(b''.join(struct.pack('<I', w & 0xffffffff) for w in words), b'')
++    f = tempfile.NamedTemporaryFile(delete=False, suffix='.elf'); f.write(img); f.close(); os.chmod(f.name, 0o755)
++    try:
++        p = subprocess.run(['setarch', os.uname().machine, '-R', PEMU, f.name], capture_output=True, timeout=5, env=dict(os.environ, PEMU_JIT='1' if jit else '0'))
++    except subprocess.TimeoutExpired:
++        return -999, b'timeout', b''
++    finally:
++        os.unlink(f.name)
++    return p.returncode, p.stdout, p.stderr
++
++def differs(w):
++    a = run(w, False); b = run(w, True)
++    return (a[0] != b[0] or a[1] != b[1]) and a[0] != -999 and b[0] != -999
++
++def minimize(w):
++    NOP = 0xD503201F
++    w = list(w)
++    for i in range(len(w)):
++        if w[i] == NOP: continue
++        keep = w[i]; w[i] = NOP
++        if not differs(w): w[i] = keep
++    return [(i, '%08x' % x) for i, x in enumerate(w) if x != NOP]
++
++bad = 0
++for n in range(COUNT):
++    R.seed(SEED * 1000003 + n)
++    w = gen_prog()
++    a = run(w, False); b = run(w, True)
++    if a[0] != b[0] or a[1] != b[1]:
++        bad += 1
++        print(f'MISMATCH seed={SEED} n={n} rc {a[0]} vs {b[0]} len(out) {len(a[1])} vs {len(b[1])} err={b[2][:120]!r}')
++        if a[1] and b[1]:
++            for off in range(0, min(len(a[1]), len(b[1])), 8):
++                if a[1][off:off + 8] != b[1][off:off + 8]: print('   first diff at window offset 0x%x: int=%s jit=%s' % (off, a[1][off:off+8].hex(), b[1][off:off+8].hex())); break
++        if os.environ.get('FUZZ_MIN'): print('   minimal:', minimize(w))
++        if bad >= 5: break
++print(f'fuzz: {COUNT if bad < 5 else n + 1} programs, {bad} mismatches')
++sys.exit(1 if bad else 0)
+diff -ruN orig/prx-main/tests/pemu_test.py prx-main/tests/pemu_test.py
+--- orig/prx-main/tests/pemu_test.py	2026-10-31 08:42:24.000000000 +0000
++++ prx-main/tests/pemu_test.py	2026-10-31 13:15:32.598866761 +0000
+@@ -345,6 +345,33 @@
+     a.mov(0, 21); a.mov_imm(8, 93); a.svc()
+ 
+ 
++def t_smc(a):
++    # self-modifying code: write "movz x0,#7; ret", call it, rewrite as "movz x0,#9; ret", call again (needs IC invalidation)
++    a.adr(9, 'buf')
++    a.mov_imm(1, 0xD28000E0); a.str_w(1, 9, 0); a.mov_imm(1, 0xD65F03C0); a.str_w(1, 9, 4)
++    a.emit(0xD50B7520 | 9); a.emit(0xD5033B9F); a.emit(0xD5033FDF)        # ic ivau,x9 ; dsb ish ; isb
++    a.blr(9); a.mov(20, 0)
++    a.mov_imm(1, 0xD2800120); a.str_w(1, 9, 0)
++    a.emit(0xD50B7520 | 9); a.emit(0xD5033B9F); a.emit(0xD5033FDF)
++    a.blr(9); a.add(0, 0, 20)                                               # 9 + 7 = 16
++    a.mov_imm(8, 93); a.svc()
++    a.label('buf'); a.emit(0); a.emit(0)
++
++
++def t_async(a):
++    # SIGALRM from setitimer must interrupt a tight polling loop (needs signal polling on backward branches)
++    a.sub_i(31, 31, 64)
++    a.adr(1, 'handler'); a.str(1, 31, 0); a.mov_imm(2, 0); a.str(2, 31, 8); a.str(2, 31, 16)
++    a.mov_imm(0, 14); a.add_i(1, 31, 0); a.mov_imm(2, 0); a.mov_imm(3, 8); a.mov_imm(8, 134); a.svc()
++    a.mov_imm(2, 0); a.str(2, 31, 32); a.str(2, 31, 40); a.str(2, 31, 48); a.mov_imm(2, 30000); a.str(2, 31, 56)
++    a.mov_imm(0, 0); a.add_i(1, 31, 32); a.mov_imm(2, 0); a.mov_imm(8, 103); a.svc()
++    a.adr(5, 'flag')
++    a.label('spin'); a.ldr(2, 5, 0); a.cbz(2, 'spin')
++    a.mov_imm(0, 0); a.mov_imm(8, 93); a.svc()
++    a.label('handler'); a.adr(5, 'flag'); a.mov_imm(6, 1); a.str(6, 5, 0); a.ret()
++    a.label('flag'); a.emit(0); a.emit(0)
++
++
+ def main():
+     ok = True
+     ok &= run(t_hello, 'hello', 0, b'Hello, pemu!\n')
+@@ -352,6 +379,8 @@
+     ok &= run(t_syscalls, 'syscalls (uname, stat, open/read, brk, mmap)')
+     ok &= run(t_fork_wait, 'fork + wait4')
+     ok &= run(t_signal, 'signal delivery + sigreturn')
++    ok &= run(t_smc, 'self-modifying code + IC invalidation', 16)
++    ok &= run(t_async, 'async signal interrupts tight loop')
+     # argv test: program path is last; extra args follow it
+     a = Asm(); t_hello_args(a)
+     img, _ = elf(a.assemble(), a.data)
