@@ -345,6 +345,33 @@ def t_hello_args(a):
     a.mov(0, 21); a.mov_imm(8, 93); a.svc()
 
 
+def t_smc(a):
+    # self-modifying code: write "movz x0,#7; ret", call it, rewrite as "movz x0,#9; ret", call again (needs IC invalidation)
+    a.adr(9, 'buf')
+    a.mov_imm(1, 0xD28000E0); a.str_w(1, 9, 0); a.mov_imm(1, 0xD65F03C0); a.str_w(1, 9, 4)
+    a.emit(0xD50B7520 | 9); a.emit(0xD5033B9F); a.emit(0xD5033FDF)        # ic ivau,x9 ; dsb ish ; isb
+    a.blr(9); a.mov(20, 0)
+    a.mov_imm(1, 0xD2800120); a.str_w(1, 9, 0)
+    a.emit(0xD50B7520 | 9); a.emit(0xD5033B9F); a.emit(0xD5033FDF)
+    a.blr(9); a.add(0, 0, 20)                                               # 9 + 7 = 16
+    a.mov_imm(8, 93); a.svc()
+    a.label('buf'); a.emit(0); a.emit(0)
+
+
+def t_async(a):
+    # SIGALRM from setitimer must interrupt a tight polling loop (needs signal polling on backward branches)
+    a.sub_i(31, 31, 64)
+    a.adr(1, 'handler'); a.str(1, 31, 0); a.mov_imm(2, 0); a.str(2, 31, 8); a.str(2, 31, 16)
+    a.mov_imm(0, 14); a.add_i(1, 31, 0); a.mov_imm(2, 0); a.mov_imm(3, 8); a.mov_imm(8, 134); a.svc()
+    a.mov_imm(2, 0); a.str(2, 31, 32); a.str(2, 31, 40); a.str(2, 31, 48); a.mov_imm(2, 30000); a.str(2, 31, 56)
+    a.mov_imm(0, 0); a.add_i(1, 31, 32); a.mov_imm(2, 0); a.mov_imm(8, 103); a.svc()
+    a.adr(5, 'flag')
+    a.label('spin'); a.ldr(2, 5, 0); a.cbz(2, 'spin')
+    a.mov_imm(0, 0); a.mov_imm(8, 93); a.svc()
+    a.label('handler'); a.adr(5, 'flag'); a.mov_imm(6, 1); a.str(6, 5, 0); a.ret()
+    a.label('flag'); a.emit(0); a.emit(0)
+
+
 def main():
     ok = True
     ok &= run(t_hello, 'hello', 0, b'Hello, pemu!\n')
@@ -352,6 +379,8 @@ def main():
     ok &= run(t_syscalls, 'syscalls (uname, stat, open/read, brk, mmap)')
     ok &= run(t_fork_wait, 'fork + wait4')
     ok &= run(t_signal, 'signal delivery + sigreturn')
+    ok &= run(t_smc, 'self-modifying code + IC invalidation', 16)
+    ok &= run(t_async, 'async signal interrupts tight loop')
     # argv test: program path is last; extra args follow it
     a = Asm(); t_hello_args(a)
     img, _ = elf(a.assemble(), a.data)

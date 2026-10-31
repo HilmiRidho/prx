@@ -54,7 +54,7 @@ lint:
 check: lint
 	bash tests/smoke.sh
 	@if [ "$$(uname -m)" = x86_64 ]; then \
-		if command -v python3 >/dev/null 2>&1; then $(MAKE) --no-print-directory pemu && python3 tests/pemu_test.py ./pemu; fi; \
+		if command -v python3 >/dev/null 2>&1; then $(MAKE) --no-print-directory pemu && python3 tests/pemu_test.py ./pemu && python3 tests/pemu_fuzz.py ./pemu 200 1; fi; \
 		$(MAKE) --no-print-directory pemu-x64 && bash tests/pemu_x64_test.sh ./pemu-x64; \
 	elif [ "$$(uname -m)" = aarch64 ]; then \
 		$(MAKE) --no-print-directory pemu && bash tests/pemu_x64_test.sh ./pemu; \

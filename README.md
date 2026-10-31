@@ -110,7 +110,7 @@ qemu stays the default; pemu is only used when you ask for it.
 
 | host | guest rootfs | source | notes |
 |------|--------------|--------|-------|
-| x86_64  | aarch64 | `src/pemu.c`     | integer ISA, scalar FP, tiny NEON subset |
+| x86_64  | aarch64 | `src/pemu.c`     | JIT + interpreter; integer ISA, scalar FP, tiny NEON subset |
 | aarch64 | x86_64  | `src/pemu_x64.c` | integer ISA, SSE2, x87 subset; runs real glibc programs |
 
     prx build                       # also builds $PRX_HOME/lib/pemu for your host
@@ -120,7 +120,9 @@ qemu stays the default; pemu is only used when you ask for it.
 `pemu_x64` was validated against native runs of static and dynamic glibc programs, bash, python3,
 perl, gcc and common coreutils (on an x86_64 host); the aarch64-host build is the same code using the
 generic syscall ABI, but has not been executed on a real aarch64 machine or on Android/Termux.
-It is an interpreter (no JIT): expect it to be 50-1000x slower than native. Arithmetic flags are evaluated lazily, which makes it a little faster, but it is still far slower than `qemu-user` (a JIT).
+`pemu_x64` is an interpreter (no JIT): expect it to be 50-1000x slower than native. Arithmetic flags are evaluated lazily, which makes it a little faster, but it is still far slower than `qemu-user` (a JIT).
+
+`pemu` (aarch64 guest on an x86_64 host) has a block-translating **JIT** that is on by default: guest basic blocks are compiled to x86_64 code, direct branches are chained, indirect branches go through an inline cache, and x86 flags are used directly (a compare followed by a branch/`csel` costs one `cmp` + `jcc`). Integer ALU, bitfield, multiply/divide, conditional select/compare, branches, scalar and vector (`ldr q`, `ldp q`) loads/stores are translated natively; everything else (FP arithmetic, NEON ALU, exclusives, ...) runs through the interpreter from inside the translated block, so behaviour is identical. Roughly 20x faster than the interpreter on integer / memory loops. The code cache is flushed when the guest unmaps, re-protects or `MAP_FIXED`-overwrites translated pages, and on `ic` instructions, so self-modifying code and `dlopen` work. Disable it with `PEMU_JIT=0` or `pemu -nojit` (the JIT also switches itself off if an executable mapping can't be created). `tests/pemu_fuzz.py` runs random programs under both engines and compares all registers, NZCV and memory.
 
 Threads (`CLONE_THREAD`, so pthreads / futex / `pthread_join`) work in `pemu_x64`: every guest thread runs on its own host pthread.
 
