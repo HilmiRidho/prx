@@ -111,10 +111,6 @@ as before. `prx source` prints the modules expanded into one file.
 
 ## Changelog
 
-### Unreleased
-
-- The shim source is split into modules under `src/shim/` (same single-file build, identical generated code). `prx source` still prints the complete shim.
-
 ### 1.0.1
 
 **Safer**
@@ -132,11 +128,6 @@ as before. `prx source` prints the modules expanded into one file.
 - The library cache refreshes after the guest installs or removes packages, and the shim is rebuilt when only `src/ldpatch.c` changes.
 - `/etc/passwd`, `/etc/group` and `/etc/hosts` are read in full, and groups can have any number of members.
 - DNS: IPv6 nameservers now work and can be mixed with IPv4 in `PRX_DNS`; invalid entries are dropped with a warning.
-
-**Faster**
-
-- Cleaning up guest processes when `prx login` exits is about 5x faster on a busy host, and `prx list` is quicker too.
-
 
 ## License
 
