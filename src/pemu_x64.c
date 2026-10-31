@@ -516,6 +516,7 @@ static long gsys(CPU*c, int*noset) {
         if (a0 >= brk_base && a0 <= brk_end) brk_cur = a0;
         return (long) brk_cur;
     case 131: return 0;
+    case 111: return hs(SYS_getpgid, 0, 0, 0, 0, 0, 0);
     case 158:                                         /* arch_prctl */
         switch (a0) {
         case 0x1002: c->fs = a1; return 0;
