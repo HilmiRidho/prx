@@ -61,6 +61,8 @@ shim is built with clang + lld, i686-linux-gnu-gcc, or gcc -m32 (gcc-multilib).
   Termux:        pkg install qemu-user-x86-64 qemu-user-aarch64 qemu-user-i386 clang
   Debian/Ubuntu: apt install qemu-user-static clang lld
   PRX_QEMU=/path/to/qemu-ARCH        Use a specific qemu-user binary
+  PRX_QEMU=pemu                      Use the built-in experimental aarch64 emulator
+                                     (x86_64 host only; built by 'prx build', see README)
   QEMU_CPU=max                       Extra QEMU_* variables are passed to qemu
 EOF
 }
@@ -120,6 +122,15 @@ fi
 info "Shim built successfully: $SHIM"
 "$cc" -O2 -o "$PRX_HOME/lib/ldpatch" "$SRCDIR/ldpatch.c" || die "Failed to build ldpatch"
 info "Loader patch tool built successfully: $PRX_HOME/lib/ldpatch"
+# Optional: built-in aarch64 emulator (qemu-user alternative), x86_64 hosts only.
+if [ "$HARCH" = x86_64 ] && [ -f "$SRCDIR/pemu.c" ]; then
+if "$cc" -O2 -o "$PRX_HOME/lib/pemu.tmp.$$" "$SRCDIR/pemu.c" -lm 2>/dev/null && mv -f "$PRX_HOME/lib/pemu.tmp.$$" "$PRX_HOME/lib/pemu"; then
+info "Built-in aarch64 emulator built: $PRX_HOME/lib/pemu (use PRX_QEMU=pemu)"
+else
+rm -f "$PRX_HOME/lib/pemu.tmp.$$"
+info "Note: optional aarch64 emulator (pemu) could not be built; continuing."
+fi
+fi
 }
 set_arch() {
 case "$1" in
@@ -142,6 +153,7 @@ local garch="$1" q
 if [ -n "${PRX_QEMU:-}" ]; then
 q="$PRX_QEMU"
 [ -x "$q" ] || q="$(command -v "$q" 2>/dev/null || true)"
+[ -n "$q" ] || [ ! -x "$PRX_HOME/lib/$PRX_QEMU" ] || q="$PRX_HOME/lib/$PRX_QEMU"
 [ -n "$q" ] && [ -x "$q" ] && { readlink -f "$q" 2>/dev/null || echo "$q"; return 0; }
 return 1
 fi

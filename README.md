@@ -101,6 +101,22 @@ as before. `prx source` prints the modules expanded into one file.
 | `net_unix.h`, `resolve.h` | AF_UNIX path translation, DNS and `/etc/hosts` |
 | `proc.h`, `cred.h`, `pwdb.h`, `exec.h` | Capabilities and signals, virtual credentials, passwd/group, exec and spawn |
 
+## pemu: built-in aarch64 emulator (experimental)
+
+`src/pemu.c` is a small, self-written user-mode AArch64 interpreter that can stand in for `qemu-aarch64`
+on **x86_64 hosts**. It maps the guest 1:1 into the host address space and translates guest syscalls
+(including `stat`, `open` flags, `epoll`, `uname`, `brk`, `fork`/`execve`, signal frames) to the host kernel.
+
+    prx build                         # also builds $PRX_HOME/lib/pemu when the host is x86_64
+    PRX_QEMU=pemu prx login debian    # aarch64 rootfs on an x86_64 host
+    make pemu && python3 tests/pemu_test.py ./pemu
+
+Status: the integer ISA, loads/stores, scalar FP, exclusives, signals and fork are covered by
+`tests/pemu_test.py` (hand-assembled static ELF programs). Not implemented yet: threads (`CLONE_THREAD`),
+LSE atomics, most of NEON/AdvSIMD (so glibc's optimised string routines will stop with an
+"unsupported instruction" message), SVE. It has not been validated against a real glibc rootfs;
+use `qemu-user` for anything serious. Not a security boundary.
+
 ## Known limits (by design)
 
 - Not a security boundary (LD_PRELOAD + loader patching; static/raw-syscall binaries can bypass it). This cannot be fixed within an LD_PRELOAD design; it would need a ptrace / seccomp-unotify supervisor or user namespaces.
