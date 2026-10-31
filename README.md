@@ -101,21 +101,30 @@ as before. `prx source` prints the modules expanded into one file.
 | `net_unix.h`, `resolve.h` | AF_UNIX path translation, DNS and `/etc/hosts` |
 | `proc.h`, `cred.h`, `pwdb.h`, `exec.h` | Capabilities and signals, virtual credentials, passwd/group, exec and spawn |
 
-## pemu: built-in aarch64 emulator (experimental)
+## pemu: built-in emulator (experimental)
 
-`src/pemu.c` is a small, self-written user-mode AArch64 interpreter that can stand in for `qemu-aarch64`
-on **x86_64 hosts**. It maps the guest 1:1 into the host address space and translates guest syscalls
-(including `stat`, `open` flags, `epoll`, `uname`, `brk`, `fork`/`execve`, signal frames) to the host kernel.
+A small, self-written user-mode emulator that can stand in for `qemu-user` when running a rootfs of
+the *other* architecture. It maps the guest 1:1 into the host address space and translates guest
+syscalls to the host kernel (stat/open-flag/epoll layouts, `brk`, `fork`/`execve`, signal frames).
+qemu stays the default; pemu is only used when you ask for it.
 
-    prx build                         # also builds $PRX_HOME/lib/pemu when the host is x86_64
-    PRX_QEMU=pemu prx login debian    # aarch64 rootfs on an x86_64 host
-    make pemu && python3 tests/pemu_test.py ./pemu
+| host | guest rootfs | source | notes |
+|------|--------------|--------|-------|
+| x86_64  | aarch64 | `src/pemu.c`     | integer ISA, scalar FP, tiny NEON subset |
+| aarch64 | x86_64  | `src/pemu_x64.c` | integer ISA, SSE2, x87 subset; runs real glibc programs |
 
-Status: the integer ISA, loads/stores, scalar FP, exclusives, signals and fork are covered by
-`tests/pemu_test.py` (hand-assembled static ELF programs). Not implemented yet: threads (`CLONE_THREAD`),
-LSE atomics, most of NEON/AdvSIMD (so glibc's optimised string routines will stop with an
-"unsupported instruction" message), SVE. It has not been validated against a real glibc rootfs;
-use `qemu-user` for anything serious. Not a security boundary.
+    prx build                       # also builds $PRX_HOME/lib/pemu for your host
+    PRX_QEMU=pemu prx login debian
+    make check                      # runs the emulator self-tests too
+
+`pemu_x64` was validated against native runs of static and dynamic glibc programs, bash, python3,
+perl, gcc and common coreutils (on an x86_64 host); the aarch64-host build is the same code using the
+generic syscall ABI, but has not been executed on a real aarch64 machine or on Android/Termux.
+It is an interpreter (no JIT): expect it to be 50-1000x slower than native.
+
+Not implemented: threads (`CLONE_THREAD`), AVX/SSE3+/BMI (cpuid reports a baseline x86-64 CPU), most
+NEON/SVE/LSE for `pemu.c`, 32-bit guests. On aarch64 hosts x87 long double is computed in IEEE quad
+(slightly more precise than real x87). Not a security boundary. Use `qemu-user` for anything serious.
 
 ## Known limits (by design)
 

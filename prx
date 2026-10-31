@@ -61,8 +61,8 @@ shim is built with clang + lld, i686-linux-gnu-gcc, or gcc -m32 (gcc-multilib).
   Termux:        pkg install qemu-user-x86-64 qemu-user-aarch64 qemu-user-i386 clang
   Debian/Ubuntu: apt install qemu-user-static clang lld
   PRX_QEMU=/path/to/qemu-ARCH        Use a specific qemu-user binary
-  PRX_QEMU=pemu                      Use the built-in experimental aarch64 emulator
-                                     (x86_64 host only; built by 'prx build', see README)
+  PRX_QEMU=pemu                      Use the built-in experimental emulator (aarch64 rootfs on
+                                     x86_64 hosts, x86_64 rootfs on aarch64 hosts; see README)
   QEMU_CPU=max                       Extra QEMU_* variables are passed to qemu
 EOF
 }
@@ -122,13 +122,16 @@ fi
 info "Shim built successfully: $SHIM"
 "$cc" -O2 -o "$PRX_HOME/lib/ldpatch" "$SRCDIR/ldpatch.c" || die "Failed to build ldpatch"
 info "Loader patch tool built successfully: $PRX_HOME/lib/ldpatch"
-# Optional: built-in aarch64 emulator (qemu-user alternative), x86_64 hosts only.
-if [ "$HARCH" = x86_64 ] && [ -f "$SRCDIR/pemu.c" ]; then
-if "$cc" -O2 -o "$PRX_HOME/lib/pemu.tmp.$$" "$SRCDIR/pemu.c" -lm 2>/dev/null && mv -f "$PRX_HOME/lib/pemu.tmp.$$" "$PRX_HOME/lib/pemu"; then
-info "Built-in aarch64 emulator built: $PRX_HOME/lib/pemu (use PRX_QEMU=pemu)"
+# Optional: built-in experimental emulator (qemu-user alternative):
+#   x86_64 host -> pemu.c     (runs aarch64 rootfs)
+#   aarch64 host -> pemu_x64.c (runs x86_64 rootfs)
+case "$HARCH" in x86_64) PEMU_SRC=pemu.c ;; aarch64) PEMU_SRC=pemu_x64.c ;; *) PEMU_SRC= ;; esac
+if [ -n "$PEMU_SRC" ] && [ -f "$SRCDIR/$PEMU_SRC" ]; then
+if "$cc" -O2 -o "$PRX_HOME/lib/pemu.tmp.$$" "$SRCDIR/$PEMU_SRC" -lm 2>/dev/null && mv -f "$PRX_HOME/lib/pemu.tmp.$$" "$PRX_HOME/lib/pemu"; then
+info "Built-in emulator built: $PRX_HOME/lib/pemu (use PRX_QEMU=pemu)"
 else
 rm -f "$PRX_HOME/lib/pemu.tmp.$$"
-info "Note: optional aarch64 emulator (pemu) could not be built; continuing."
+info "Note: optional emulator (pemu) could not be built; continuing."
 fi
 fi
 }
