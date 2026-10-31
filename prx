@@ -127,11 +127,16 @@ info "Loader patch tool built successfully: $PRX_HOME/lib/ldpatch"
 #   aarch64 host -> pemu_x64.c (runs x86_64 rootfs)
 case "$HARCH" in x86_64) PEMU_SRC=pemu.c ;; aarch64) PEMU_SRC=pemu_x64.c ;; *) PEMU_SRC= ;; esac
 if [ -n "$PEMU_SRC" ] && [ -f "$SRCDIR/$PEMU_SRC" ]; then
-if "$cc" -O2 -o "$PRX_HOME/lib/pemu.tmp.$$" "$SRCDIR/$PEMU_SRC" -lm -pthread 2>/dev/null && mv -f "$PRX_HOME/lib/pemu.tmp.$$" "$PRX_HOME/lib/pemu"; then
+pemu_tmp="$PRX_HOME/lib/pemu.tmp.$$"; pemu_log="$PRX_HOME/lib/pemu-build.log"
+# Try with -pthread first (guest threads), then without it (libcs where -pthread is unsupported).
+if "$cc" -O2 -o "$pemu_tmp" "$SRCDIR/$PEMU_SRC" -lm -pthread 2>"$pemu_log" \
+   || "$cc" -O2 -o "$pemu_tmp" "$SRCDIR/$PEMU_SRC" -lm 2>>"$pemu_log"; then
+mv -f "$pemu_tmp" "$PRX_HOME/lib/pemu"; rm -f "$pemu_log"
 info "Built-in emulator built: $PRX_HOME/lib/pemu (use PRX_QEMU=pemu)"
 else
-rm -f "$PRX_HOME/lib/pemu.tmp.$$"
-info "Note: optional emulator (pemu) could not be built; continuing."
+rm -f "$pemu_tmp"
+info "Note: optional emulator (pemu) could not be built; continuing. Compiler errors:"
+head -n 8 "$pemu_log" >&2
 fi
 fi
 }
