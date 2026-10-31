@@ -23,11 +23,11 @@ PEMU_SRC = src/pemu.c
 endif
 
 pemu: $(PEMU_SRC)
-	$(CC) -O2 -Wall -o pemu $(PEMU_SRC) -lm
+	$(CC) -O2 -Wall -o pemu $(PEMU_SRC) -lm -pthread
 
 # x86_64 guest emulator on any host (on x86_64 hosts it is only useful for testing).
 pemu-x64: src/pemu_x64.c
-	$(CC) -O2 -Wall -o pemu-x64 src/pemu_x64.c -lm
+	$(CC) -O2 -Wall -o pemu-x64 src/pemu_x64.c -lm -pthread
 
 install:
 	install -Dm755 prx          $(DESTDIR)$(BINDIR)/prx

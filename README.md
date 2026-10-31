@@ -120,9 +120,11 @@ qemu stays the default; pemu is only used when you ask for it.
 `pemu_x64` was validated against native runs of static and dynamic glibc programs, bash, python3,
 perl, gcc and common coreutils (on an x86_64 host); the aarch64-host build is the same code using the
 generic syscall ABI, but has not been executed on a real aarch64 machine or on Android/Termux.
-It is an interpreter (no JIT): expect it to be 50-1000x slower than native.
+It is an interpreter (no JIT): expect it to be 50-1000x slower than native. Arithmetic flags are evaluated lazily, which makes it a little faster, but it is still far slower than `qemu-user` (a JIT).
 
-Not implemented: threads (`CLONE_THREAD`), AVX/SSE3+/BMI (cpuid reports a baseline x86-64 CPU), most
+Threads (`CLONE_THREAD`, so pthreads / futex / `pthread_join`) work in `pemu_x64`: every guest thread runs on its own host pthread.
+
+Not implemented: threads in `pemu.c` (aarch64 guest), AVX/SSE3+/BMI (cpuid reports a baseline x86-64 CPU), most
 NEON/SVE/LSE for `pemu.c`, 32-bit guests. On aarch64 hosts x87 long double is computed in IEEE quad
 (slightly more precise than real x87). Not a security boundary. Use `qemu-user` for anything serious.
 

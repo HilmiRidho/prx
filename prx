@@ -127,7 +127,7 @@ info "Loader patch tool built successfully: $PRX_HOME/lib/ldpatch"
 #   aarch64 host -> pemu_x64.c (runs x86_64 rootfs)
 case "$HARCH" in x86_64) PEMU_SRC=pemu.c ;; aarch64) PEMU_SRC=pemu_x64.c ;; *) PEMU_SRC= ;; esac
 if [ -n "$PEMU_SRC" ] && [ -f "$SRCDIR/$PEMU_SRC" ]; then
-if "$cc" -O2 -o "$PRX_HOME/lib/pemu.tmp.$$" "$SRCDIR/$PEMU_SRC" -lm 2>/dev/null && mv -f "$PRX_HOME/lib/pemu.tmp.$$" "$PRX_HOME/lib/pemu"; then
+if "$cc" -O2 -o "$PRX_HOME/lib/pemu.tmp.$$" "$SRCDIR/$PEMU_SRC" -lm -pthread 2>/dev/null && mv -f "$PRX_HOME/lib/pemu.tmp.$$" "$PRX_HOME/lib/pemu"; then
 info "Built-in emulator built: $PRX_HOME/lib/pemu (use PRX_QEMU=pemu)"
 else
 rm -f "$PRX_HOME/lib/pemu.tmp.$$"

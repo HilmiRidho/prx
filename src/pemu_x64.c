@@ -10,9 +10,11 @@
  *     pemu [-0 argv0] [-L prefix] [-E VAR=val] [-U VAR] [-cpu x] [-strace] prog [args...]
  * Environment: QEMU_SET_ENV, QEMU_UNSET_ENV, QEMU_STRACE.
  *
+ * Arithmetic flags are evaluated lazily (see mat()/RF()), and jcc/setcc/cmov after cmp/test read the operands directly.
  * CPU model: baseline x86-64 (SSE2) with a small x87 stub. cpuid reports only
  * what is implemented, so glibc selects its SSE2 code paths.
- * NOT supported: threads (CLONE_THREAD), AVX/SSE3+/BMI, most x87, 32-bit code.
+ * Threads (CLONE_THREAD) are supported: each guest thread runs on its own host pthread with its own CPU state.
+ * NOT supported: AVX/SSE3+/BMI, most x87, 32-bit code.
  * Not a security boundary. */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -23,6 +25,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sched.h>
 #include <setjmp.h>
 #include <math.h>
 #include <elf.h>
@@ -36,6 +39,8 @@
 #include <sys/wait.h>
 #include <sys/time.h>
 #include <sys/random.h>
+#include <pthread.h>
+#include <linux/futex.h>
 
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
 typedef int8_t s8; typedef int16_t s16; typedef int32_t s32; typedef int64_t s64;
@@ -57,12 +62,16 @@ enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI };
 typedef struct {
     u64 r[16];
     u64 rip, rf, fs, gs;
+    u64 la, lb, lr; u32 lcin; int lop, lsz;           /* lazy arithmetic flags: operands/result of the last add/sub/logic op */
     V x[16];
     u32 mxcsr; u16 fcw, fsw;
     long double st[8]; int top;
 } CPU;
 
 static CPU cpu;
+static __thread CPU *g_cur = &cpu;        /* CPU of the calling host thread (one host thread per guest thread) */
+static __thread int g_is_thread;           /* set in threads created by CLONE_THREAD */
+static __thread u64 g_clear_tid;           /* CLONE_CHILD_CLEARTID address of this thread */
 static int g_trace;
 static char g_self[4096];
 static u64 g_tramp;
@@ -82,39 +91,65 @@ static void mwr(u64 a, u64 v, int n) {
     switch (n) { case 1: *(u8*) a = (u8) v; break; case 2: *(u16u*) a = (u16) v; break; case 4: *(u32u*) a = (u32) v; break; default: *(u64u*) a = v; }
 }
 
-static void szp(CPU*c, u64 r, int sz) {
-    c->rf &= ~(u64)(ZF_ | SF_ | PF_);
-    if (!(r & mskz(sz))) c->rf |= ZF_;
-    if (sgn(r, sz)) c->rf |= SF_;
-    if (!(__builtin_popcount((u8) r) & 1)) c->rf |= PF_;
+/* ---- lazy flags: add/sub/logic only record their operands; CF/OF/AF/ZF/SF/PF are computed when somebody reads them.
+ * RF(c) is an lvalue that first materialises any pending flags, so every other use of the flags stays unchanged. */
+enum { LZ_NONE, LZ_ADD, LZ_SUB, LZ_LOGIC };
+static const u8 g_par[256] = {
+#define PT2(n) n, n ^ 1, n ^ 1, n
+#define PT4(n) PT2(n), PT2(n ^ 1), PT2(n ^ 1), PT2(n)
+#define PT6(n) PT4(n), PT4(n ^ 1), PT4(n ^ 1), PT4(n)
+    PT6(1), PT6(0), PT6(0), PT6(1)
+};
+#undef PT2
+#undef PT4
+#undef PT6
+static void mat(CPU*c) {
+    int sz = c->lsz, sb = sz * 8 - 1; u64 m = mskz(sz), a = c->la, b = c->lb, r = c->lr;
+    u64 f = c->rf & ~(u64)(CF_ | OF_ | AF_ | ZF_ | SF_ | PF_);
+    switch (c->lop) {
+    case LZ_ADD:
+        if (c->lcin ? r <= a : r < a) f |= CF_;
+        if (((a ^ r) & (b ^ r)) >> sb & 1) f |= OF_;
+        if ((a ^ b ^ r) & 0x10) f |= AF_;
+        break;
+    case LZ_SUB:
+        if (c->lcin ? a <= b : a < b) f |= CF_;
+        if (((a ^ b) & (a ^ r)) >> sb & 1) f |= OF_;
+        if ((a ^ b ^ r) & 0x10) f |= AF_;
+        break;
+    default: break;
+    }
+    (void) m;
+    if (!r) f |= ZF_;
+    if (r >> sb & 1) f |= SF_;
+    if (g_par[(u8) r]) f |= PF_;
+    c->rf = f; c->lop = LZ_NONE;
 }
-static u64 f_add(CPU*c, u64 a, u64 b, u64 cin, int sz) {
+static inline u64*flagsp(CPU*c) { if (__builtin_expect(c->lop != LZ_NONE, 0)) mat(c); return &c->rf; }
+#define RF(c) (*flagsp(c))
+
+static void szp(CPU*c, u64 r, int sz) {
+    u64*f = &RF(c);
+    *f &= ~(u64)(ZF_ | SF_ | PF_);
+    if (!(r & mskz(sz))) *f |= ZF_;
+    if (sgn(r, sz)) *f |= SF_;
+    if (g_par[(u8) r]) *f |= PF_;
+}
+static inline u64 f_add(CPU*c, u64 a, u64 b, u64 cin, int sz) {
     u64 m = mskz(sz); a &= m; b &= m;
-    unsigned __int128 t = (unsigned __int128) a + b + cin;
-    u64 r = (u64) t & m;
-    int cf = (int)((t >> (sz * 8)) & 1), of = (int)((((a ^ r) & (b ^ r)) >> (sz * 8 - 1)) & 1);
-    c->rf &= ~(u64)(CF_ | OF_ | AF_);
-    if (cf) c->rf |= CF_;
-    if (of) c->rf |= OF_;
-    if ((a ^ b ^ r) & 0x10) c->rf |= AF_;
-    szp(c, r, sz);
+    u64 r = (a + b + cin) & m;
+    c->la = a; c->lb = b; c->lr = r; c->lcin = (u32) cin; c->lsz = sz; c->lop = LZ_ADD;
     return r;
 }
-static u64 f_sub(CPU*c, u64 a, u64 b, u64 bin, int sz) {
+static inline u64 f_sub(CPU*c, u64 a, u64 b, u64 bin, int sz) {
     u64 m = mskz(sz); a &= m; b &= m;
     u64 r = (a - b - bin) & m;
-    int cf = a < b || (bin && a == b), of = (int)((((a ^ b) & (a ^ r)) >> (sz * 8 - 1)) & 1);
-    c->rf &= ~(u64)(CF_ | OF_ | AF_);
-    if (cf) c->rf |= CF_;
-    if (of) c->rf |= OF_;
-    if ((a ^ b ^ r) & 0x10) c->rf |= AF_;
-    szp(c, r, sz);
+    c->la = a; c->lb = b; c->lr = r; c->lcin = (u32) bin; c->lsz = sz; c->lop = LZ_SUB;
     return r;
 }
-static u64 f_logic(CPU*c, u64 r, int sz) {
+static inline u64 f_logic(CPU*c, u64 r, int sz) {
     r &= mskz(sz);
-    c->rf &= ~(u64)(CF_ | OF_ | AF_);
-    szp(c, r, sz);
+    c->la = c->lb = 0; c->lr = r; c->lcin = 0; c->lsz = sz; c->lop = LZ_LOGIC;
     return r;
 }
 /* type: 0 add 1 or 2 adc 3 sbb 4 and 5 sub 6 xor 7 cmp */
@@ -122,15 +157,35 @@ static u64 alu(CPU*c, int t, u64 a, u64 b, int sz) {
     switch (t) {
     case 0: return f_add(c, a, b, 0, sz);
     case 1: return f_logic(c, a | b, sz);
-    case 2: return f_add(c, a, b, c->rf & CF_, sz);
-    case 3: return f_sub(c, a, b, c->rf & CF_, sz);
+    case 2: return f_add(c, a, b, RF(c) & CF_, sz);
+    case 3: return f_sub(c, a, b, RF(c) & CF_, sz);
     case 4: return f_logic(c, a & b, sz);
     case 5: case 7: return f_sub(c, a, b, 0, sz);
     default: return f_logic(c, a ^ b, sz);
     }
 }
-static int cond(CPU*c, int cc) {
-    u64 f = c->rf; int r;
+static inline int cond(CPU*c, int cc) {
+    int r;
+    int lop = c->lop;
+    if (lop == LZ_LOGIC || (lop == LZ_SUB && !c->lcin)) {          /* decide directly from the operands, no flag computation */
+        int sz = c->lsz, sb = sz * 8 - 1; u64 res = c->lr;
+        if (lop == LZ_LOGIC) {
+            switch (cc >> 1) {
+            case 0: case 1: r = 0; break; case 2: case 3: r = !res; break;
+            case 4: case 6: r = (int)(res >> sb & 1); break; case 5: r = g_par[(u8) res]; break;
+            default: r = !res || (int)(res >> sb & 1); }
+        } else {
+            u64 a = c->la, b = c->lb;
+            switch (cc >> 1) {
+            case 0: r = (int)((((a ^ b) & (a ^ res)) >> sb) & 1); break;
+            case 1: r = a < b; break; case 2: r = !res; break; case 3: r = a <= b; break;
+            case 4: r = (int)(res >> sb & 1); break; case 5: r = g_par[(u8) res]; break;
+            case 6: r = sx(a, sz) < sx(b, sz); break;
+            default: r = sx(a, sz) <= sx(b, sz); }
+        }
+        return (cc & 1) ? !r : r;
+    }
+    u64 f = RF(c);
     int cf = !!(f & CF_), zf = !!(f & ZF_), sf = !!(f & SF_), of = !!(f & OF_), pf = !!(f & PF_);
     switch (cc >> 1) {
     case 0: r = of; break; case 1: r = cf; break; case 2: r = zf; break; case 3: r = cf || zf; break;
@@ -145,26 +200,26 @@ static u64 shiftop(CPU*c, int t, u64 v, unsigned n, int sz) {
     switch (t) {
     case 4: case 6:
         r = n >= (unsigned) bits ? 0 : (v << n) & m; cf = n > (unsigned) bits ? 0 : (int)((v >> (bits - n)) & 1);
-        of = sgn(r, sz) ^ cf; szp(c, r, sz); c->rf &= ~(u64)AF_; break;
+        of = sgn(r, sz) ^ cf; szp(c, r, sz); RF(c) &= ~(u64)AF_; break;
     case 5:
         r = n >= (unsigned) bits ? 0 : v >> n; cf = n > (unsigned) bits ? 0 : (int)((v >> (n - 1)) & 1);
-        of = sgn(v, sz); szp(c, r, sz); c->rf &= ~(u64)AF_; break;
+        of = sgn(v, sz); szp(c, r, sz); RF(c) &= ~(u64)AF_; break;
     case 7: {
         s64 sv = sx(v, sz); unsigned k = n >= (unsigned) bits ? (unsigned) bits - 1 : n;
-        r = (u64)(sv >> k) & m; cf = (int)((sv >> (k ? k - 1 : 0)) & 1); of = 0; szp(c, r, sz); c->rf &= ~(u64)AF_; break; }
+        r = (u64)(sv >> k) & m; cf = (int)((sv >> (k ? k - 1 : 0)) & 1); of = 0; szp(c, r, sz); RF(c) &= ~(u64)AF_; break; }
     case 0: { unsigned k = n % bits; r = k ? ((v << k) | (v >> (bits - k))) & m : v; cf = (int)(r & 1); of = sgn(r, sz) ^ cf; break; }
     case 1: { unsigned k = n % bits; r = k ? ((v >> k) | (v << (bits - k))) & m : v; cf = sgn(r, sz); of = cf ^ (int)((r >> (bits - 2)) & 1); break; }
     case 2: case 3: {
-        int cc = !!(c->rf & CF_); r = v;
+        int cc = !!(RF(c) & CF_); r = v;
         for (unsigned i = 0; i < n % (bits + 1); i++) {
             if (t == 2) { int o = sgn(r, sz); r = ((r << 1) | (u64) cc) & m; cc = o; }
             else { int o = (int)(r & 1); r = (r >> 1) | ((u64) cc << (bits - 1)); cc = o; }
         }
         cf = cc; of = t == 2 ? sgn(r, sz) ^ cf : sgn(r, sz) ^ (int)((r >> (bits - 2)) & 1); break; }
     }
-    c->rf &= ~(u64)(CF_ | OF_);
-    if (cf) c->rf |= CF_;
-    if (of) c->rf |= OF_;
+    RF(c) &= ~(u64)(CF_ | OF_);
+    if (cf) RF(c) |= CF_;
+    if (of) RF(c) |= OF_;
     return r;
 }
 
@@ -173,14 +228,14 @@ struct gsa { u64 handler, flags, restorer, mask; };
 static struct gsa gsa[65];
 static volatile u64 pend;
 static siginfo_t pinfo[65];
-static sigjmp_buf g_jb;
-static volatile int g_fault; static volatile u64 g_faddr;
+static __thread sigjmp_buf g_jb;
+static __thread volatile int g_fault; static __thread volatile u64 g_faddr;
 
 static void hsig(int s, siginfo_t*si, void*u) { (void) u; if (si) pinfo[s] = *si; __atomic_or_fetch(&pend, 1ULL << s, __ATOMIC_SEQ_CST); }
 static void hsegv(int s, siginfo_t*si, void*u) {
     (void) u;
     if (gsa[s].handler > 1) { g_fault = s; g_faddr = (u64) si->si_addr; pinfo[s] = *si; siglongjmp(g_jb, 1); }
-    fprintf(stderr, "pemu: guest fault (signal %d) at addr=%p rip=%#llx\n", s, si->si_addr, (unsigned long long) cpu.rip);
+    fprintf(stderr, "pemu: guest fault (signal %d) at addr=%p rip=%#llx\n", s, si->si_addr, (unsigned long long) g_cur->rip);
     signal(s, SIG_DFL); raise(s);
     _exit(128 + s);
 }
@@ -197,7 +252,7 @@ static void deliver_sig(CPU*c, int s) {
     *(u64*)(uc + 296) = old;
     u64 mc = uc + 40;
     for (int i = 0; i < 16; i++) *(u64*)(mc + 8 * (u64) i) = c->r[gidx[i]];
-    *(u64*)(mc + 8 * 16) = c->rip; *(u64*)(mc + 8 * 17) = c->rf;
+    *(u64*)(mc + 8 * 16) = c->rip; *(u64*)(mc + 8 * 17) = RF(c);
     *(u64*)(mc + 8 * 22) = g_fault == s ? g_faddr : 0;
     *(u64*)(mc + 8 * 23) = fp;
     memcpy((void*)(fp + 160), c->x, 256); *(u32*)(fp + 24) = c->mxcsr;
@@ -205,14 +260,14 @@ static void deliver_sig(CPU*c, int s) {
     syscall(SYS_rt_sigprocmask, SIG_SETMASK, &nm, NULL, 8);
     *(u64*) sp = (h->flags & 0x04000000) ? h->restorer : g_tramp;
     c->r[RSP] = sp; c->r[RDI] = (u64) s; c->r[RSI] = info; c->r[RDX] = uc; c->r[RAX] = 0;
-    c->rip = h->handler; c->rf &= ~(u64)DF_;
+    c->rip = h->handler; RF(c) &= ~(u64)DF_;
     if (h->flags & 0x80000000u) h->handler = 0;
     g_fault = 0;
 }
 static void g_sigreturn(CPU*c) {
     u64 sp = c->r[RSP] - 8, uc = sp + 8, mc = uc + 40, fp = *(u64*)(mc + 8 * 23);
     for (int i = 0; i < 16; i++) c->r[gidx[i]] = *(u64*)(mc + 8 * (u64) i);
-    c->rip = *(u64*)(mc + 8 * 16); c->rf = *(u64*)(mc + 8 * 17);
+    c->rip = *(u64*)(mc + 8 * 16); RF(c) = *(u64*)(mc + 8 * 17);
     if (fp) { memcpy(c->x, (void*)(fp + 160), 256); c->mxcsr = *(u32*)(fp + 24); }
     u64 m = *(u64*)(uc + 296);
     syscall(SYS_rt_sigprocmask, SIG_SETMASK, &m, NULL, 8);
@@ -354,11 +409,55 @@ static long pass_nr(u64 n) {
     }
 }
 
+/* ---- threads: every guest thread is one host pthread running its own interpreter loop ---- */
+static void run(CPU*c);
+typedef struct { CPU cpu; u64 flags, ptid, ctid; volatile int*tidout; } ThArg;
+static void thread_exit(CPU*c) {
+    if (g_clear_tid) {
+        __atomic_store_n((u32*) g_clear_tid, 0, __ATOMIC_SEQ_CST);
+        syscall(SYS_futex, g_clear_tid, FUTEX_WAKE, 1, NULL, NULL, 0);
+    }
+    free(c);                                              /* c is the ThArg (cpu is its first member) */
+    pthread_exit(NULL);
+}
+static void*thread_main(void*p) {
+    ThArg*t = p; CPU*c = &t->cpu;
+    g_cur = c; g_is_thread = 1;
+    int tid = (int) syscall(SYS_gettid);
+    if (t->flags & 0x00100000) *(u32*) t->ptid = (u32) tid;            /* PARENT_SETTID, before the guest runs */
+    if (t->flags & 0x01000000) *(u32*) t->ctid = (u32) tid;            /* CHILD_SETTID */
+    if (t->flags & 0x00200000) g_clear_tid = t->ctid;                  /* CHILD_CLEARTID */
+    __atomic_store_n(t->tidout, tid, __ATOMIC_SEQ_CST);                 /* t may be freed once the thread exits: do not touch it after run() */
+    run(c);
+    return NULL;
+}
+static long clone_thread(CPU*c, u64 flags, u64 stack, u64 ptid, u64 ctid, u64 tls) {
+    if ((flags & 0x100) == 0 || (flags & 0x800) == 0) return -EINVAL;   /* threads need CLONE_VM | CLONE_SIGHAND */
+    ThArg*t = malloc(sizeof *t);
+    if (!t) return -ENOMEM;
+    t->cpu = *c; t->flags = flags; t->ptid = ptid; t->ctid = ctid; volatile int tidv = 0; t->tidout = &tidv;
+    if (stack) t->cpu.r[RSP] = stack;
+    if (flags & 0x00080000) t->cpu.fs = tls;                            /* SETTLS */
+    t->cpu.r[RAX] = 0;
+    pthread_attr_t at; pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&at, 1UL << 20);
+    pthread_t th; int e = pthread_create(&th, &at, thread_main, t);
+    pthread_attr_destroy(&at);
+    if (e) { free(t); return -e; }
+    int tid;
+    while (!(tid = __atomic_load_n(&tidv, __ATOMIC_SEQ_CST))) sched_yield();
+    return tid;
+}
+
 static long gsys(CPU*c, int*noset) {
     u64 n = c->r[RAX], a0 = c->r[RDI], a1 = c->r[RSI], a2 = c->r[RDX], a3 = c->r[10], a4 = c->r[8], a5 = c->r[9];
     long r, nr;
     switch (n) {
-    case 60: case 231: return hs(SYS_exit_group, (long) a0, 0, 0, 0, 0, 0);
+    case 231: return hs(SYS_exit_group, (long) a0, 0, 0, 0, 0, 0);
+    case 60:
+        if (g_is_thread) thread_exit(c);                /* does not return */
+        return hs(SYS_exit_group, (long) a0, 0, 0, 0, 0, 0);
     case 2: return hs(SYS_openat, AT_FDCWD, (long) a0, fl_g2h((long) a1), (long) a2, 0, 0);
     case 85: return hs(SYS_openat, AT_FDCWD, (long) a0, O_CREAT | O_WRONLY | O_TRUNC, (long) a1, 0, 0);
     case 257: return hs(SYS_openat, (long) a0, (long) a1, fl_g2h((long) a2), (long) a3, 0, 0);
@@ -437,9 +536,9 @@ static long gsys(CPU*c, int*noset) {
     case 213: return hs(SYS_epoll_create1, 0, 0, 0, 0, 0, 0);
     case 284: return hs(SYS_eventfd2, (long) a0, 0, 0, 0, 0, 0);
     case 22 + 1000: return 0;
-    case 56: case 57: case 58: {                      /* clone / fork / vfork: fork-style only */
+    case 56: case 57: case 58: {                      /* clone / fork / vfork */
         u64 flags = n == 56 ? a0 : SIGCHLD;
-        if (flags & 0x10000 /*CLONE_THREAD*/) return -ENOSYS;
+        if (flags & 0x10000 /*CLONE_THREAD*/) return clone_thread(c, flags, a1, a2, a3, a4);
         long pid = fork();
         if (pid < 0) return -errno;
         if (pid == 0) {
@@ -653,8 +752,8 @@ static int sse(CPU*c, I*in, int op) {
     case 0x2E: case 0x2F: {
         double a, b;
         if (pf == 0) { SRC(4); a = d->f[0]; b = s->f[0]; } else if (pf == 1) { SRC(8); a = d->df[0]; b = s->df[0]; } else return -1;
-        c->rf &= ~(u64)(OF_ | SF_ | AF_ | ZF_ | PF_ | CF_);
-        if (isnan(a) || isnan(b)) c->rf |= ZF_ | PF_ | CF_; else if (a < b) c->rf |= CF_; else if (a == b) c->rf |= ZF_;
+        RF(c) &= ~(u64)(OF_ | SF_ | AF_ | ZF_ | PF_ | CF_);
+        if (isnan(a) || isnan(b)) RF(c) |= ZF_ | PF_ | CF_; else if (a < b) RF(c) |= CF_; else if (a == b) RF(c) |= ZF_;
         break; }
     case 0x50: { if (m.ismem) return -1; V*r = &c->x[m.rm]; u64 v = 0;
         if (pf == 0) { for (int i = 0; i < 4; i++) v |= (u64)(r->d[i] >> 31) << i; } else { for (int i = 0; i < 2; i++) v |= (r->q[i] >> 63) << i; }
@@ -773,8 +872,8 @@ static void x_cc(CPU*c, long double a, long double b) {
     if (isnan(a) || isnan(b)) c->fsw |= 0x4500; else if (a < b) c->fsw |= 0x0100; else if (a == b) c->fsw |= 0x4000;
 }
 static void x_flags(CPU*c, long double a, long double b) {
-    c->rf &= ~(u64)(OF_ | SF_ | AF_ | ZF_ | PF_ | CF_);
-    if (isnan(a) || isnan(b)) c->rf |= ZF_ | PF_ | CF_; else if (a < b) c->rf |= CF_; else if (a == b) c->rf |= ZF_;
+    RF(c) &= ~(u64)(OF_ | SF_ | AF_ | ZF_ | PF_ | CF_);
+    if (isnan(a) || isnan(b)) RF(c) |= ZF_ | PF_ | CF_; else if (a < b) RF(c) |= CF_; else if (a == b) RF(c) |= ZF_;
 }
 static u64 x_toint(CPU*c, long double v, int sz) {
     long double r = xround(c, v), lim = sz == 2 ? 32768.0L : sz == 4 ? 2147483648.0L : 9223372036854775808.0L;
@@ -886,10 +985,10 @@ static int x87(CPU*c, I*in, u8 op) {
         return -1;
     case 0xDA:
         if (r == 5 && i == 1) { x_cc(c, ST(0), ST(1)); xpop(c); xpop(c); return 0; }                 /* fucompp */
-        if (r < 4) { int cc = r == 0 ? (c->rf & CF_) : r == 1 ? (c->rf & ZF_) : r == 2 ? (c->rf & (CF_ | ZF_)) : (c->rf & PF_); if (cc) ST(0) = ST(i); return 0; }
+        if (r < 4) { int cc = r == 0 ? (RF(c) & CF_) : r == 1 ? (RF(c) & ZF_) : r == 2 ? (RF(c) & (CF_ | ZF_)) : (RF(c) & PF_); if (cc) ST(0) = ST(i); return 0; }
         return -1;
     case 0xDB:
-        if (r < 4) { int cc = r == 0 ? (c->rf & CF_) : r == 1 ? (c->rf & ZF_) : r == 2 ? (c->rf & (CF_ | ZF_)) : (c->rf & PF_); if (!cc) ST(0) = ST(i); return 0; }
+        if (r < 4) { int cc = r == 0 ? (RF(c) & CF_) : r == 1 ? (RF(c) & ZF_) : r == 2 ? (RF(c) & (CF_ | ZF_)) : (RF(c) & PF_); if (!cc) ST(0) = ST(i); return 0; }
         if (r == 4 && i == 2) { c->fsw = 0; return 0; }
         if (r == 4 && i == 3) { c->fcw = 0x37f; c->fsw = 0; c->top = 0; return 0; }
         if (r == 5 || r == 6) { x_flags(c, ST(0), ST(i)); return 0; }
@@ -999,7 +1098,7 @@ static void step(CPU*c) {
         s64 a = sx(rdm(c, &in, &m, opsz), opsz), b = op == 0x69 ? (s64) immz(&in, opsz) : (s64)(s8) *in.ip++;
         __int128 p = (__int128) a * b; u64 r = (u64) p & mskz(opsz);
         int ov = p != (__int128) sx(r, opsz);
-        c->rf &= ~(u64)(CF_ | OF_); if (ov) c->rf |= CF_ | OF_;
+        RF(c) &= ~(u64)(CF_ | OF_); if (ov) RF(c) |= CF_ | OF_;
         setr(c, m.reg, opsz, in.rex, r); break; }
     case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76: case 0x77:
     case 0x78: case 0x79: case 0x7A: case 0x7B: case 0x7C: case 0x7D: case 0x7E: case 0x7F: {
@@ -1027,20 +1126,20 @@ static void step(CPU*c) {
     case 0x98: if (opsz == 8) c->r[RAX] = (u64)(s64)(s32) c->r[RAX]; else if (opsz == 4) c->r[RAX] = (u32)(s32)(s16) c->r[RAX]; else setr(c, RAX, 2, 0, (u64)(s64)(s8) c->r[RAX]); break;
     case 0x99: if (opsz == 8) c->r[RDX] = (s64) c->r[RAX] < 0 ? ~0ULL : 0; else if (opsz == 4) c->r[RDX] = (s32) c->r[RAX] < 0 ? 0xffffffffULL : 0; else setr(c, RDX, 2, 0, (s16) c->r[RAX] < 0 ? 0xffff : 0); break;
     case 0x9B: break;                                         /* fwait */
-    case 0x9C: push(c, c->rf | 2); break;
-    case 0x9D: { u64 v = pop(c); c->rf = (v & (CF_ | PF_ | AF_ | ZF_ | SF_ | DF_ | OF_)) | 0x202; break; }
-    case 0x9E: { u64 ah = (c->r[RAX] >> 8) & 0xff; c->rf = (c->rf & ~(u64)(CF_ | PF_ | AF_ | ZF_ | SF_)) | (ah & (CF_ | PF_ | AF_ | ZF_ | SF_)); break; }
-    case 0x9F: setr(c, 4, 1, 0, (c->rf & (CF_ | PF_ | AF_ | ZF_ | SF_)) | 2); break;
+    case 0x9C: push(c, RF(c) | 2); break;
+    case 0x9D: { u64 v = pop(c); RF(c) = (v & (CF_ | PF_ | AF_ | ZF_ | SF_ | DF_ | OF_)) | 0x202; break; }
+    case 0x9E: { u64 ah = (c->r[RAX] >> 8) & 0xff; RF(c) = (RF(c) & ~(u64)(CF_ | PF_ | AF_ | ZF_ | SF_)) | (ah & (CF_ | PF_ | AF_ | ZF_ | SF_)); break; }
+    case 0x9F: setr(c, 4, 1, 0, (RF(c) & (CF_ | PF_ | AF_ | ZF_ | SF_)) | 2); break;
     case 0xA4: case 0xA5: case 0xA6: case 0xA7: case 0xAA: case 0xAB: case 0xAC: case 0xAD: case 0xAE: case 0xAF: {
-        int sz = (op & 1) ? opsz : 1; s64 dl = (c->rf & DF_) ? -sz : sz;
+        int sz = (op & 1) ? opsz : 1; s64 dl = (RF(c) & DF_) ? -sz : sz;
         int isrep = in.rep || in.repne, kind = op >= 0xAE ? 4 : op >= 0xAC ? 3 : op >= 0xAA ? 2 : op >= 0xA6 ? 1 : 0;
         u64 cnt = isrep ? c->r[RCX] : 1;
-        if (kind == 0 && isrep && !(c->rf & DF_) && cnt) {
+        if (kind == 0 && isrep && !(RF(c) & DF_) && cnt) {
             u64 n = cnt * (u64) sz, dst = c->r[RDI], src = c->r[RSI];
             if (dst > src && dst < src + n) { for (u64 i = 0; i < n; i++) *(u8*)(dst + i) = *(u8*)(src + i); } else memmove((void*) dst, (void*) src, n);
             c->r[RDI] += n; c->r[RSI] += n; c->r[RCX] = 0; break;
         }
-        if (kind == 2 && isrep && !(c->rf & DF_) && sz == 1 && cnt) { memset((void*) c->r[RDI], (int)(c->r[RAX] & 0xff), cnt); c->r[RDI] += cnt; c->r[RCX] = 0; break; }
+        if (kind == 2 && isrep && !(RF(c) & DF_) && sz == 1 && cnt) { memset((void*) c->r[RDI], (int)(c->r[RAX] & 0xff), cnt); c->r[RDI] += cnt; c->r[RCX] = 0; break; }
         while (cnt) {
             switch (kind) {
             case 0: mwr(c->r[RDI], mrd(c->r[RSI], sz), sz); c->r[RSI] += (u64) dl; c->r[RDI] += (u64) dl; break;
@@ -1050,7 +1149,7 @@ static void step(CPU*c) {
             default: f_sub(c, getr(c, RAX, sz, 0), mrd(c->r[RDI], sz), 0, sz); c->r[RDI] += (u64) dl;
             }
             cnt--; if (isrep) c->r[RCX]--;
-            if (isrep && (kind == 1 || kind == 4)) { int zf = !!(c->rf & ZF_); if ((in.rep && !zf) || (in.repne && zf)) break; }
+            if (isrep && (kind == 1 || kind == 4)) { int zf = !!(RF(c) & ZF_); if ((in.rep && !zf) || (in.repne && zf)) break; }
         }
         break; }
     case 0xA8: { u64 imm = (u64)(u8) *in.ip++; f_logic(c, c->r[RAX] & imm, 1); break; }
@@ -1082,11 +1181,11 @@ static void step(CPU*c) {
     case 0xEB: { s8 rel = (s8) *in.ip++; c->rip = (u64) in.ip + (u64)(s64) rel; return; }
     case 0xE3: { s8 rel = (s8) *in.ip++; c->rip = (u64) in.ip + (u64)(s64)(c->r[RCX] == 0 ? rel : 0); return; }
     case 0xF4: goto bad;
-    case 0xF5: c->rf ^= CF_; break;
-    case 0xF8: c->rf &= ~(u64)CF_; break;
-    case 0xF9: c->rf |= CF_; break;
-    case 0xFC: c->rf &= ~(u64)DF_; break;
-    case 0xFD: c->rf |= DF_; break;
+    case 0xF5: RF(c) ^= CF_; break;
+    case 0xF8: RF(c) &= ~(u64)CF_; break;
+    case 0xF9: RF(c) |= CF_; break;
+    case 0xFC: RF(c) &= ~(u64)DF_; break;
+    case 0xFD: RF(c) |= DF_; break;
     case 0xF6: case 0xF7: {
         int sz = op & 1 ? opsz : 1, ext = (*in.ip >> 3) & 7;
         modrm(c, &in, &m, ext < 2 ? (sz == 1 ? 1 : (opsz == 2 ? 2 : 4)) : 0);
@@ -1094,14 +1193,14 @@ static void step(CPU*c) {
         switch (ext) {
         case 0: case 1: { u64 imm = sz == 1 ? *in.ip++ : immz(&in, opsz); f_logic(c, v & imm, sz); break; }
         case 2: wrm(c, &in, &m, sz, ~v & mk); break;
-        case 3: { u64 r = f_sub(c, 0, v, 0, sz); c->rf &= ~(u64)CF_; if (v & mk) c->rf |= CF_; wrm(c, &in, &m, sz, r); break; }
+        case 3: { u64 r = f_sub(c, 0, v, 0, sz); RF(c) &= ~(u64)CF_; if (v & mk) RF(c) |= CF_; wrm(c, &in, &m, sz, r); break; }
         case 4: case 5: {
             unsigned __int128 p; int ov;
             if (ext == 4) { p = (unsigned __int128)(getr(c, RAX, sz, 0)) * v; ov = (p >> (sz * 8)) != 0; }
             else { __int128 sp = (__int128) sx(getr(c, RAX, sz, 0), sz) * sx(v, sz); p = (unsigned __int128) sp; ov = sp != (__int128) sx((u64) sp & mk, sz); }
             if (sz == 1) setr(c, RAX, 2, 0, (u64) p);
             else { setr(c, RAX, sz, 0, (u64) p); setr(c, RDX, sz, 0, (u64)(p >> (sz * 8))); }
-            c->rf &= ~(u64)(CF_ | OF_); if (ov) c->rf |= CF_ | OF_;
+            RF(c) &= ~(u64)(CF_ | OF_); if (ov) RF(c) |= CF_ | OF_;
             break; }
         default: c->rip = (u64) in.ip; do_div(c, sz, v, ext == 7, start);
         }
@@ -1110,8 +1209,8 @@ static void step(CPU*c) {
         int sz = op & 1 ? opsz : 1, ext = (*in.ip >> 3) & 7;
         modrm(c, &in, &m, 0);
         if (ext < 2) {
-            u64 v = rdm(c, &in, &m, sz), keep = c->rf & CF_, r = ext == 0 ? f_add(c, v, 1, 0, sz) : f_sub(c, v, 1, 0, sz);
-            c->rf = (c->rf & ~(u64)CF_) | keep; wrm(c, &in, &m, sz, r);
+            u64 v = rdm(c, &in, &m, sz), keep = RF(c) & CF_, r = ext == 0 ? f_add(c, v, 1, 0, sz) : f_sub(c, v, 1, 0, sz);
+            RF(c) = (RF(c) & ~(u64)CF_) | keep; wrm(c, &in, &m, sz, r);
         } else if (op == 0xFF && (ext == 2 || ext == 4)) {
             u64 t = rdm(c, &in, &m, 8);
             if (ext == 2) push(c, (u64) in.ip);
@@ -1125,7 +1224,7 @@ static void step(CPU*c) {
     case 0x0F: {
         u8 o2 = *in.ip++;
         switch (o2) {
-        case 0x05: { c->rip = (u64) in.ip; c->r[RCX] = c->rip; c->r[11] = c->rf; do_syscall(c); return; }
+        case 0x05: { c->rip = (u64) in.ip; c->r[RCX] = c->rip; c->r[11] = RF(c); do_syscall(c); return; }
         case 0x0B: goto bad;
         case 0x0D: case 0x18: case 0x19: case 0x1A: case 0x1B: case 0x1C: case 0x1D: case 0x1E: case 0x1F:
             modrm(c, &in, &m, 0); break;
@@ -1154,7 +1253,7 @@ static void step(CPU*c) {
                 s64 q = off >= 0 ? off / bits : -((-off + bits - 1) / bits);
                 ea = m.ea + (u64)(q * opsz); bit = (int)(off - q * bits); val = mrd(ea, opsz);
             } else { bit = (int)(getr(c, m.reg, opsz, in.rex) & (u64)(bits - 1)); val = rdm(c, &in, &m, opsz); }
-            c->rf &= ~(u64)CF_; if ((val >> bit) & 1) c->rf |= CF_;
+            RF(c) &= ~(u64)CF_; if ((val >> bit) & 1) RF(c) |= CF_;
             if (kind) {
                 val = kind == 1 ? val | (1ULL << bit) : kind == 2 ? val & ~(1ULL << bit) : val ^ (1ULL << bit);
                 if (m.ismem) mwr(ea, val, opsz); else wrm(c, &in, &m, opsz, val);
@@ -1169,8 +1268,8 @@ static void step(CPU*c) {
                 int bits = opsz * 8; u64 r, mk = mskz(opsz); int cf;
                 if (o2 < 0xA8) { r = ((dv << n) | (sr >> (bits - n))) & mk; cf = (int)((dv >> (bits - n)) & 1); }
                 else { r = ((dv >> n) | (sr << (bits - n))) & mk; cf = (int)((dv >> (n - 1)) & 1); }
-                c->rf &= ~(u64)(CF_ | OF_); if (cf) c->rf |= CF_;
-                if (sgn(r, opsz) != sgn(dv, opsz)) c->rf |= OF_;
+                RF(c) &= ~(u64)(CF_ | OF_); if (cf) RF(c) |= CF_;
+                if (sgn(r, opsz) != sgn(dv, opsz)) RF(c) |= OF_;
                 szp(c, r, opsz); wrm(c, &in, &m, opsz, r);
             }
             break; }
@@ -1189,7 +1288,7 @@ static void step(CPU*c) {
             modrm(c, &in, &m, 0);
             s64 a = sx(getr(c, m.reg, opsz, in.rex), opsz), b = sx(rdm(c, &in, &m, opsz), opsz);
             __int128 p = (__int128) a * b; u64 r = (u64) p & mskz(opsz);
-            c->rf &= ~(u64)(CF_ | OF_); if (p != (__int128) sx(r, opsz)) c->rf |= CF_ | OF_;
+            RF(c) &= ~(u64)(CF_ | OF_); if (p != (__int128) sx(r, opsz)) RF(c) |= CF_ | OF_;
             setr(c, m.reg, opsz, in.rex, r); break; }
         case 0xB0: case 0xB1: {
             int sz = o2 & 1 ? opsz : 1; modrm(c, &in, &m, 0);
@@ -1207,15 +1306,15 @@ static void step(CPU*c) {
             if (o2 >= 0xBE) v = (u64) sx(v, ssz);
             setr(c, m.reg, opsz, in.rex, v); break; }
         case 0xB8: if (!in.rep) goto bad; { modrm(c, &in, &m, 0); u64 v = rdm(c, &in, &m, opsz); u64 r = (u64) __builtin_popcountll(v & mskz(opsz));
-            c->rf &= ~(u64)(CF_ | OF_ | AF_ | SF_ | PF_ | ZF_); if (!v) c->rf |= ZF_; setr(c, m.reg, opsz, in.rex, r); } break;
+            RF(c) &= ~(u64)(CF_ | OF_ | AF_ | SF_ | PF_ | ZF_); if (!v) RF(c) |= ZF_; setr(c, m.reg, opsz, in.rex, r); } break;
         case 0xBC: case 0xBD: {
             modrm(c, &in, &m, 0); u64 v = rdm(c, &in, &m, opsz) & mskz(opsz); int bits = opsz * 8;
             if (in.rep) {                                   /* tzcnt / lzcnt */
                 u64 r = !v ? (u64) bits : o2 == 0xBC ? (u64) __builtin_ctzll(v) : (u64)(__builtin_clzll(v) - (64 - bits));
-                c->rf &= ~(u64)(CF_ | ZF_); if (!v) c->rf |= CF_; if (!r) c->rf |= ZF_;
+                RF(c) &= ~(u64)(CF_ | ZF_); if (!v) RF(c) |= CF_; if (!r) RF(c) |= ZF_;
                 setr(c, m.reg, opsz, in.rex, r);
-            } else if (!v) c->rf |= ZF_;
-            else { c->rf &= ~(u64)ZF_; setr(c, m.reg, opsz, in.rex, o2 == 0xBC ? (u64) __builtin_ctzll(v) : (u64)(63 - __builtin_clzll(v))); }
+            } else if (!v) RF(c) |= ZF_;
+            else { RF(c) &= ~(u64)ZF_; setr(c, m.reg, opsz, in.rex, o2 == 0xBC ? (u64) __builtin_ctzll(v) : (u64)(63 - __builtin_clzll(v))); }
             break; }
         case 0xC8: case 0xC9: case 0xCA: case 0xCB: case 0xCC: case 0xCD: case 0xCE: case 0xCF: {
             int r = (o2 & 7) | rexB;
