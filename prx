@@ -30,7 +30,8 @@ Usage:
   prx list                           List installed containers
   prx fixperm NAME                   Repair permissions and clear the library cache
   prx remove NAME                    Delete a container
-  prx help | version                 Show this help / the version
+  prx help | -h | --help             Show this help
+  prx --version | -V | version       Show the version
 
 login options:
   -b, --bind PATH|HOST:GUEST         Bind a host path into the guest (GUEST absolute; max 50;
@@ -58,8 +59,8 @@ Environment:
   PRX_DNS=LIST      IPv4/IPv6 DNS servers for the guest (separated by ',', ';' or blanks)
   PRX_KEEP=1        Leave guest processes running after 'prx login' exits (default: kill them)
   PRX_NO_ARGV0=1    Never pass --argv0 to the loader (auto-detected; glibc < 2.33 lacks it)
-  PRX_QEMU=PATH     Specific qemu-user binary for a cross-arch rootfs, or 'pemu' for the
-                    built-in experimental emulator
+  PRX_QEMU=PATH     Use a specific qemu-user binary for a cross-arch rootfs
+  PRX_QEMU=pemu     Use the built-in experimental emulator
   GLIBC_TUNABLES    Passed to the guest (default: glibc.pthread.rseq=0)
   PEMU_JIT=0        Disable the pemu JIT (pass into the guest with -e PEMU_JIT=0)
   PEMU_JIT_STATS=1  Print pemu_x64 JIT statistics at exit (use -e PEMU_JIT_STATS=1)
