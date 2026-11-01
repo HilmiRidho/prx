@@ -16,8 +16,11 @@ run() {  # name, expected_rc, build-args...; program args via ARGS
     local n="$1" rc="$2"; shift 2
     if ! "$CC" "$@" -o "$T/$n" 2>"$T/$n.cc"; then echo "SKIP $n (does not build: $(head -1 "$T/$n.cc"))"; return; fi
     timeout 60 "$PEMU" "$T/$n" $ARGS >"$T/$n.out" 2>"$T/$n.err"; local got=$?
-    if [ "$got" = "$rc" ] && cmp -s "$T/$n.out" "$D/$n.expect"; then echo "PASS $n"
-    else echo "FAIL $n (rc=$got, want $rc)"; head -3 "$T/$n.err"; diff "$T/$n.out" "$D/$n.expect" | head -5; fail=1; fi
+    local exp="$D/$n.expect"
+    # x87 is computed in IEEE quad on aarch64 hosts (see README), so a few last digits and the sign of a NaN differ
+    [ -f "$exp.$(uname -m)" ] && exp="$exp.$(uname -m)"
+    if [ "$got" = "$rc" ] && cmp -s "$T/$n.out" "$exp"; then echo "PASS $n"
+    else echo "FAIL $n (rc=$got, want $rc)"; head -3 "$T/$n.err"; diff "$T/$n.out" "$exp" | head -5; fail=1; fi
 }
 ARGS="" run nolibc 0 -O0 -static -nostdlib -fno-stack-protector -fno-builtin "$D/nolibc.c"
 ARGS="arg1" run hello 3 -O1 -static "$D/hello.c" -lm
