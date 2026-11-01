@@ -211,6 +211,22 @@ Threads in `pemu.c` (aarch64 guest), AVX/SSE3+/BMI (cpuid reports a baseline x86
 
 ## Changelog
 
+### Unreleased
+
+**Fixed (`pemu_x64`)**
+
+- Lock-prefixed instructions (`lock add/sub/and/or/xor/adc/sbb/inc/dec/neg/not`, `lock cmpxchg`, `lock xadd`, `lock bts/btr/btc`) and `xchg` with a memory operand were not atomic: the `lock` prefix was ignored, so guest threads could lose updates and pthread mutexes could deadlock. They now use host compare-and-swap. Misaligned (split-lock) operands still fall back to a plain read-modify-write.
+- `lfence`/`mfence`/`sfence` are real barriers now (they were no-ops).
+- Once the guest has created a second thread, interpreted loads and stores carry acquire/release barriers so that an aarch64 host gives guest threads the x86 (TSO) memory ordering. SSE/x87 accesses are not covered.
+- `sigaltstack` is implemented (it used to return success without doing anything), `SA_ONSTACK` is honoured and `uc_stack` is filled in the signal frame.
+- A signal that arrives on a guest thread is now delivered in that thread (pending signals and `siginfo` are per-thread); before, any thread could pick it up.
+- `epoll_wait` checks its allocation, and a dead syscall case was removed.
+
+**Added**
+
+- `tests/pemu_x64/atomic.c` and `tests/pemu_x64/sigalt.c` regression tests.
+- CI job `make check on aarch64` (non-blocking) on a native arm64 runner.
+
 ### 1.0.1
 
 **Added**

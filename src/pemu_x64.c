@@ -103,10 +103,19 @@ static long hs(long nr, long a, long b, long c_, long d, long e, long f) {
 static inline u64 mskz(int sz) { return sz == 8 ? ~0ULL : (1ULL << (sz * 8)) - 1; }
 static inline int sgn(u64 v, int sz) { return (int)((v >> (sz * 8 - 1)) & 1); }
 static inline s64 sx(u64 v, int sz) { return sz == 8 ? (s64) v : (s64)(v << (64 - sz * 8)) >> (64 - sz * 8); }
+/* Set once the guest has created a second thread. x86 is TSO, aarch64 is weakly ordered: from then on every interpreted
+ * load is followed by an acquire barrier and every store is preceded by a release barrier, which gives the x86 ordering
+ * (only store->load may be reordered). Free on x86 hosts (compiler barrier only). SSE/x87 accesses do not go through
+ * mrd/mwr and are not covered. */
+static int g_mt;
 static u64 mrd(u64 a, int n) {
-    switch (n) { case 1: return *(u8*) a; case 2: return *(u16u*) a; case 4: return *(u32u*) a; default: return *(u64u*) a; }
+    u64 v;
+    switch (n) { case 1: v = *(u8*) a; break; case 2: v = *(u16u*) a; break; case 4: v = *(u32u*) a; break; default: v = *(u64u*) a; }
+    if (__builtin_expect(__atomic_load_n(&g_mt, __ATOMIC_RELAXED), 0)) __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return v;
 }
 static void mwr(u64 a, u64 v, int n) {
+    if (__builtin_expect(__atomic_load_n(&g_mt, __ATOMIC_RELAXED), 0)) __atomic_thread_fence(__ATOMIC_RELEASE);
     switch (n) { case 1: *(u8*) a = (u8) v; break; case 2: *(u16u*) a = (u16) v; break; case 4: *(u32u*) a = (u32) v; break; default: *(u64u*) a = v; }
 }
 
@@ -245,8 +254,12 @@ static u64 shiftop(CPU*c, int t, u64 v, unsigned n, int sz) {
 /* ------------------------------------------------------------ signals */
 struct gsa { u64 handler, flags, restorer, mask; };
 static struct gsa gsa[65];
-static volatile u64 pend;
-static siginfo_t pinfo[65];
+static volatile u64 pend;                          /* signals received by the main thread (the JIT polls this word) */
+static __thread volatile u64 tpend;                /* signals received by a CLONE_THREAD thread: delivered to that same thread, like the kernel does */
+static __thread siginfo_t pinfo[65];
+#define PENDP() (g_is_thread ? &tpend : &pend)
+/* sigaltstack state of the calling guest thread (a new thread starts without one) */
+static __thread u64 g_ss_sp, g_ss_size;
 static __thread sigjmp_buf g_jb;
 static __thread volatile int g_fault; static __thread volatile u64 g_faddr;
 
@@ -268,7 +281,7 @@ static void hsys(int s, siginfo_t*si, void*u) {
     (void) uc;
 #endif
 }
-static void hsig(int s, siginfo_t*si, void*u) { (void) u; if (si) pinfo[s] = *si; __atomic_or_fetch(&pend, 1ULL << s, __ATOMIC_SEQ_CST); }
+static void hsig(int s, siginfo_t*si, void*u) { (void) u; if (si) pinfo[s] = *si; __atomic_or_fetch(PENDP(), 1ULL << s, __ATOMIC_SEQ_CST); }
 static void hsegv(int s, siginfo_t*si, void*u) {
 #ifdef HAVE_JIT
     if (g_jit_on) { u64 r = jit_pc2rip(u); if (r) g_cur->rip = r; }       /* fault inside translated code: recover the guest rip */
@@ -284,13 +297,16 @@ static const int gidx[16] = {8, 9, 10, 11, 12, 13, 14, 15, 7, 6, 5, 3, 2, 0, 1, 
 #define SFRAME 1088
 static void deliver_sig(CPU*c, int s) {
     struct gsa*h = &gsa[s];
-    u64 sp = ((c->r[RSP] - 128 - SFRAME) & ~15ULL) - 8;
+    int on_alt = g_ss_size && c->r[RSP] >= g_ss_sp && c->r[RSP] - g_ss_sp < g_ss_size;     /* interrupted code already runs on the alternate stack */
+    u64 top = ((h->flags & 0x08000000u /*SA_ONSTACK*/) && g_ss_size && !on_alt) ? g_ss_sp + g_ss_size : c->r[RSP] - 128;
+    u64 sp = ((top - SFRAME) & ~15ULL) - 8;
     memset((void*) sp, 0, SFRAME);
     u64 uc = sp + 8, info = sp + 8 + 424, fp = sp + 568;
     memcpy((void*) info, &pinfo[s], 128);
     u64 old = 0;
     syscall(SYS_rt_sigprocmask, SIG_BLOCK, NULL, &old, 8);
     *(u64*)(uc + 296) = old;
+    *(u64*)(uc + 16) = g_ss_sp; *(u32*)(uc + 24) = !g_ss_size ? 2 /*SS_DISABLE*/ : on_alt ? 1 /*SS_ONSTACK*/ : 0; *(u64*)(uc + 32) = g_ss_size;   /* uc_stack */
     u64 mc = uc + 40;
     for (int i = 0; i < 16; i++) *(u64*)(mc + 8 * (u64) i) = c->r[gidx[i]];
     *(u64*)(mc + 8 * 16) = c->rip; *(u64*)(mc + 8 * 17) = RF(c);
@@ -314,9 +330,10 @@ static void g_sigreturn(CPU*c) {
     syscall(SYS_rt_sigprocmask, SIG_SETMASK, &m, NULL, 8);
 }
 static void check_pending(CPU*c) {
-    while (pend) {
-        u64 p = pend; int s = __builtin_ctzll(p);
-        __atomic_and_fetch(&pend, ~(1ULL << s), __ATOMIC_SEQ_CST);
+    volatile u64 *pp = PENDP();
+    while (*pp) {
+        u64 p = *pp; int s = __builtin_ctzll(p);
+        __atomic_and_fetch(pp, ~(1ULL << s), __ATOMIC_SEQ_CST);
         if (gsa[s].handler > 1) deliver_sig(c, s);
     }
 }
@@ -479,6 +496,7 @@ static long clone_thread(CPU*c, u64 flags, u64 stack, u64 ptid, u64 ctid, u64 tl
 #ifdef HAVE_JIT
     if (g_jit_on) jit_disable();                          /* the code cache is not shared safely between threads: go back to the interpreter */
 #endif
+    __atomic_store_n(&g_mt, 1, __ATOMIC_SEQ_CST);        /* from now on emulate x86 memory ordering (see mrd/mwr) */
     t->cpu = *c; t->flags = flags; t->ptid = ptid; t->ctid = ctid; volatile int tidv = 0; t->tidout = &tidv;
     if (stack) t->cpu.r[RSP] = stack;
     if (flags & 0x00080000) t->cpu.fs = tls;                            /* SETTLS */
@@ -548,7 +566,18 @@ static long gsys(CPU*c, int*noset) {
     case 12:
         if (a0 >= brk_base && a0 <= brk_end) brk_cur = a0;
         return (long) brk_cur;
-    case 131: return 0;
+    case 131: {                                       /* sigaltstack(const stack_t *ss, stack_t *old): sp@0 flags@8 size@16 */
+        int on = g_ss_size && c->r[RSP] >= g_ss_sp && c->r[RSP] - g_ss_sp < g_ss_size;
+        u64 osp = g_ss_sp, osz = g_ss_size; u32 ofl = !g_ss_size ? 2 : on ? 1 : 0;
+        if (a0) {
+            u64 nsp = *(u64u*) a0, nsz = *(u64u*)(a0 + 16); u32 nfl = *(u32u*)(a0 + 8);
+            if (on) return -EPERM;                                    /* cannot change it while running on it */
+            if (nfl & ~(u32)(2 | 0x80000000u)) return -EINVAL;        /* SS_DISABLE, SS_AUTODISARM */
+            if (nfl & 2) { g_ss_sp = 0; g_ss_size = 0; }
+            else { if (nsz < 2048 /*MINSIGSTKSZ*/) return -ENOMEM; g_ss_sp = nsp; g_ss_size = nsz; }
+        }
+        if (a1) { *(u64u*) a1 = osp; *(u32u*)(a1 + 8) = ofl; *(u32u*)(a1 + 12) = 0; *(u64u*)(a1 + 16) = osz; }
+        return 0; }
     case 111: return hs(SYS_getpgid, 0, 0, 0, 0, 0, 0);
     case 158:                                         /* arch_prctl */
         switch (a0) {
@@ -584,13 +613,13 @@ static long gsys(CPU*c, int*noset) {
     case 232: case 281: {                             /* epoll_wait / epoll_pwait: guest events are packed (12 bytes) */
         int max = (int) a2; if (max <= 0 || max > 4096) return -EINVAL;
         struct epoll_event*ev = malloc(sizeof *ev * (size_t) max);
+        if (!ev) return -ENOMEM;
         r = hs(SYS_epoll_pwait, (long) a0, (long) ev, max, (long) a3, n == 281 ? (long) a4 : 0, 8);
         for (long i = 0; i < r; i++) { u8*g = (u8*) a1 + 12 * i; *(u32*) g = ev[i].events; *(u64u*)(g + 4) = ev[i].data.u64; }
         free(ev); return r;
     }
     case 213: return hs(SYS_epoll_create1, 0, 0, 0, 0, 0, 0);
     case 284: return hs(SYS_eventfd2, (long) a0, 0, 0, 0, 0, 0);
-    case 22 + 1000: return 0;
     case 56: case 57: case 58: {                      /* clone / fork / vfork */
         u64 flags = n == 56 ? a0 : SIGCHLD;
         if (flags & 0x10000 /*CLONE_THREAD*/) return clone_thread(c, flags, a1, a2, a3, a4);
@@ -627,7 +656,7 @@ static void do_syscall(CPU*c) {
 }
 
 /* ------------------------------------------------------------ decoder */
-typedef struct { u8*ip; int rex, w, p66, rep, repne, addr32; u64 seg; } I;
+typedef struct { u8*ip; int rex, w, p66, rep, repne, addr32, lock; u64 seg; } I;
 typedef struct { int mod, reg, rm, ismem; u64 ea; } M;
 
 static u64 getr(CPU*c, int n, int sz, int rex) {
@@ -671,6 +700,17 @@ static void modrm(CPU*c, I*in, M*m, int immbytes) {
 }
 static inline u64 rdm(CPU*c, I*in, M*m, int sz) { return m->ismem ? mrd(m->ea, sz) : getr(c, m->rm, sz, in->rex); }
 static inline void wrm(CPU*c, I*in, M*m, int sz, u64 v) { if (m->ismem) mwr(m->ea, v, sz); else setr(c, m->rm, sz, in->rex, v); }
+/* ---- atomic read-modify-write on guest memory, for lock-prefixed instructions and xchg with a memory operand.
+ * ARMW re-evaluates EXPR (which may set flags in c and may read `oldv`) until the compare-and-swap succeeds, so the
+ * flags always come from the successful iteration. Misaligned operands (split locks) cannot be atomic on aarch64:
+ * ATOMIC_OK is false for them and the caller falls back to the plain read-modify-write. */
+#define ARMW_T(T, ea_, oldv, EXPR) do { T *armw_p = (T*)(ea_); T armw_cur = __atomic_load_n(armw_p, __ATOMIC_RELAXED); \
+    for (;;) { u64 oldv = armw_cur; u64 armw_new = (EXPR); \
+        if (__atomic_compare_exchange_n(armw_p, &armw_cur, (T) armw_new, 1, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) break; } } while (0)
+#define ARMW(ea_, sz_, oldv, EXPR) do { switch (sz_) { \
+    case 1: ARMW_T(u8, ea_, oldv, EXPR); break; case 2: ARMW_T(u16, ea_, oldv, EXPR); break; \
+    case 4: ARMW_T(u32, ea_, oldv, EXPR); break; default: ARMW_T(u64, ea_, oldv, EXPR); } } while (0)
+#define ATOMIC_OK(in_, m_, sz_) ((in_)->lock && (m_)->ismem && !((m_)->ea & ((u64)(sz_) - 1)))
 static inline s32 imm32(I*in) { s32 v = (s32) *(u32u*) in->ip; in->ip += 4; return v; }
 static inline u64 immz(I*in, int sz) {                       /* Iz sign-extended to 64 */
     if (sz == 2) { u64 v = (u64)(s64)(s16) *(u16u*) in->ip; in->ip += 2; return v; }
@@ -1133,7 +1173,8 @@ static void step(CPU*c) {
         u8 b = *ip;
         if (b == 0x66) in.p66 = 1; else if (b == 0xF3) in.rep = 1; else if (b == 0xF2) in.repne = 1;
         else if (b == 0x64) in.seg = c->fs; else if (b == 0x65) in.seg = c->gs; else if (b == 0x67) in.addr32 = 1;
-        else if (b == 0x2E || b == 0x3E || b == 0x26 || b == 0x36 || b == 0xF0) { }
+        else if (b == 0xF0) in.lock = 1;
+        else if (b == 0x2E || b == 0x3E || b == 0x26 || b == 0x36) { }
         else break;
         ip++;
     }
@@ -1148,7 +1189,8 @@ static void step(CPU*c) {
         if (f < 4) {
             int sz = (f & 1) ? opsz : 1;
             modrm(c, &in, &m, 0);
-            if (f < 2) { u64 r = alu(c, t, rdm(c, &in, &m, sz), getr(c, m.reg, sz, in.rex), sz); if (t != 7) wrm(c, &in, &m, sz, r); }
+            if (f < 2 && t != 7 && ATOMIC_OK(&in, &m, sz)) { u64 s_ = getr(c, m.reg, sz, in.rex), rf0 = RF(c); ARMW(m.ea, sz, o_, (RF(c) = rf0, alu(c, t, o_, s_, sz))); }
+            else if (f < 2) { u64 r = alu(c, t, rdm(c, &in, &m, sz), getr(c, m.reg, sz, in.rex), sz); if (t != 7) wrm(c, &in, &m, sz, r); }
             else { u64 r = alu(c, t, getr(c, m.reg, sz, in.rex), rdm(c, &in, &m, sz), sz); if (t != 7) setr(c, m.reg, sz, in.rex, r); }
         } else {
             int sz = f == 4 ? 1 : opsz;
@@ -1181,11 +1223,14 @@ static void step(CPU*c) {
         int sz = op == 0x80 ? 1 : opsz;
         modrm(c, &in, &m, op == 0x81 ? (opsz == 2 ? 2 : 4) : 1);
         u64 imm = op == 0x81 ? immz(&in, opsz) : (u64)(s64)(s8) *in.ip++;
+        if ((m.reg & 7) != 7 && ATOMIC_OK(&in, &m, sz)) { int t_ = m.reg & 7; u64 rf0 = RF(c); ARMW(m.ea, sz, o_, (RF(c) = rf0, alu(c, t_, o_, imm, sz))); break; }
         u64 r = alu(c, m.reg & 7, rdm(c, &in, &m, sz), imm, sz);
         if ((m.reg & 7) != 7) wrm(c, &in, &m, sz, r);
         break; }
     case 0x84: case 0x85: { int sz = op & 1 ? opsz : 1; modrm(c, &in, &m, 0); f_logic(c, rdm(c, &in, &m, sz) & getr(c, m.reg, sz, in.rex), sz); break; }
-    case 0x86: case 0x87: { int sz = op & 1 ? opsz : 1; modrm(c, &in, &m, 0); u64 a = rdm(c, &in, &m, sz), b = getr(c, m.reg, sz, in.rex); wrm(c, &in, &m, sz, b); setr(c, m.reg, sz, in.rex, a); break; }
+    case 0x86: case 0x87: { int sz = op & 1 ? opsz : 1; modrm(c, &in, &m, 0);
+        if (m.ismem && !(m.ea & ((u64) sz - 1))) { u64 b = getr(c, m.reg, sz, in.rex), a = 0; ARMW(m.ea, sz, o_, (a = o_, b)); setr(c, m.reg, sz, in.rex, a); break; }
+        u64 a = rdm(c, &in, &m, sz), b = getr(c, m.reg, sz, in.rex); wrm(c, &in, &m, sz, b); setr(c, m.reg, sz, in.rex, a); break; }
     case 0x88: case 0x89: { int sz = op & 1 ? opsz : 1; modrm(c, &in, &m, 0); wrm(c, &in, &m, sz, getr(c, m.reg, sz, in.rex)); break; }
     case 0x8A: case 0x8B: { int sz = op & 1 ? opsz : 1; modrm(c, &in, &m, 0); setr(c, m.reg, sz, in.rex, rdm(c, &in, &m, sz)); break; }
     case 0x8D: { in.seg = 0; modrm(c, &in, &m, 0); if (!m.ismem) goto bad; setr(c, m.reg, opsz, in.rex, m.ea); break; }
@@ -1266,8 +1311,9 @@ static void step(CPU*c) {
         u64 v = rdm(c, &in, &m, sz), mk = mskz(sz);
         switch (ext) {
         case 0: case 1: { u64 imm = sz == 1 ? *in.ip++ : immz(&in, opsz); f_logic(c, v & imm, sz); break; }
-        case 2: wrm(c, &in, &m, sz, ~v & mk); break;
-        case 3: { u64 r = f_sub(c, 0, v, 0, sz); RF(c) &= ~(u64)CF_; if (v & mk) RF(c) |= CF_; wrm(c, &in, &m, sz, r); break; }
+        case 2: if (ATOMIC_OK(&in, &m, sz)) { ARMW(m.ea, sz, o_, ~o_); break; } wrm(c, &in, &m, sz, ~v & mk); break;
+        case 3: if (ATOMIC_OK(&in, &m, sz)) { u64 ov = 0; ARMW(m.ea, sz, o_, (ov = o_, f_sub(c, 0, o_, 0, sz))); RF(c) &= ~(u64)CF_; if (ov & mk) RF(c) |= CF_; break; }
+                { u64 r = f_sub(c, 0, v, 0, sz); RF(c) &= ~(u64)CF_; if (v & mk) RF(c) |= CF_; wrm(c, &in, &m, sz, r); break; }
         case 4: case 5: {
             unsigned __int128 p; int ov;
             if (ext == 4) { p = (unsigned __int128)(getr(c, RAX, sz, 0)) * v; ov = (p >> (sz * 8)) != 0; }
@@ -1282,7 +1328,11 @@ static void step(CPU*c) {
     case 0xFE: case 0xFF: {
         int sz = op & 1 ? opsz : 1, ext = (*in.ip >> 3) & 7;
         modrm(c, &in, &m, 0);
-        if (ext < 2) {
+        if (ext < 2 && ATOMIC_OK(&in, &m, sz)) {
+            u64 keep = RF(c) & CF_;
+            ARMW(m.ea, sz, o_, (ext == 0 ? f_add(c, o_, 1, 0, sz) : f_sub(c, o_, 1, 0, sz)));
+            RF(c) = (RF(c) & ~(u64)CF_) | keep;
+        } else if (ext < 2) {
             u64 v = rdm(c, &in, &m, sz), keep = RF(c) & CF_, r = ext == 0 ? f_add(c, v, 1, 0, sz) : f_sub(c, v, 1, 0, sz);
             RF(c) = (RF(c) & ~(u64)CF_) | keep; wrm(c, &in, &m, sz, r);
         } else if (op == 0xFF && (ext == 2 || ext == 4)) {
@@ -1328,7 +1378,11 @@ static void step(CPU*c) {
                 ea = m.ea + (u64)(q * opsz); bit = (int)(off - q * bits); val = mrd(ea, opsz);
             } else { bit = (int)(getr(c, m.reg, opsz, in.rex) & (u64)(bits - 1)); val = rdm(c, &in, &m, opsz); }
             RF(c) &= ~(u64)CF_; if ((val >> bit) & 1) RF(c) |= CF_;
-            if (kind) {
+            if (kind && in.lock && m.ismem && !(ea & ((u64) opsz - 1))) {
+                u64 bm = 1ULL << bit, ov = 0;
+                ARMW(ea, opsz, o_, (ov = o_, kind == 1 ? (o_ | bm) : kind == 2 ? (o_ & ~bm) : (o_ ^ bm)));
+                RF(c) &= ~(u64)CF_; if ((ov >> bit) & 1) RF(c) |= CF_;
+            } else if (kind) {
                 val = kind == 1 ? val | (1ULL << bit) : kind == 2 ? val & ~(1ULL << bit) : val ^ (1ULL << bit);
                 if (m.ismem) mwr(ea, val, opsz); else wrm(c, &in, &m, opsz, val);
             }
@@ -1350,7 +1404,7 @@ static void step(CPU*c) {
         case 0xAE: {
             modrm(c, &in, &m, 0);
             int ext = m.reg & 7;
-            if (!m.ismem) { if (ext >= 5) break; goto bad; }
+            if (!m.ismem) { if (ext >= 5) { __atomic_thread_fence(__ATOMIC_SEQ_CST); break; } goto bad; }   /* lfence/mfence/sfence */
             if (ext == 0) { memset((void*) m.ea, 0, 512); *(u16u*) m.ea = c->fcw; *(u32u*)(m.ea + 24) = c->mxcsr; *(u32u*)(m.ea + 28) = 0xffff; memcpy((void*)(m.ea + 160), c->x, 256); }
             else if (ext == 1) { c->fcw = *(u16u*) m.ea; c->mxcsr = *(u32u*)(m.ea + 24); memcpy(c->x, (void*)(m.ea + 160), 256); }
             else if (ext == 2) c->mxcsr = *(u32u*) m.ea;
@@ -1366,12 +1420,20 @@ static void step(CPU*c) {
             setr(c, m.reg, opsz, in.rex, r); break; }
         case 0xB0: case 0xB1: {
             int sz = o2 & 1 ? opsz : 1; modrm(c, &in, &m, 0);
+            if (ATOMIC_OK(&in, &m, sz)) {
+                u64 acc = getr(c, RAX, sz, 0), nv = getr(c, m.reg, sz, in.rex), seen = 0, mk = mskz(sz);
+                ARMW(m.ea, sz, o_, (seen = o_, o_ == (acc & mk) ? nv : o_));     /* a failed compare rewrites the old value, like the hardware */
+                f_sub(c, acc, seen, 0, sz);
+                if ((acc & mk) != (seen & mk)) setr(c, RAX, sz, 0, seen);
+                break;
+            }
             u64 dv = rdm(c, &in, &m, sz), acc = getr(c, RAX, sz, 0);
             f_sub(c, acc, dv, 0, sz);
             if ((acc & mskz(sz)) == (dv & mskz(sz))) wrm(c, &in, &m, sz, getr(c, m.reg, sz, in.rex)); else setr(c, RAX, sz, 0, dv);
             break; }
         case 0xC0: case 0xC1: {
             int sz = o2 & 1 ? opsz : 1; modrm(c, &in, &m, 0);
+            if (ATOMIC_OK(&in, &m, sz)) { u64 sr = getr(c, m.reg, sz, in.rex), ov = 0; ARMW(m.ea, sz, o_, (ov = o_, f_add(c, o_, sr, 0, sz))); setr(c, m.reg, sz, in.rex, ov); break; }
             u64 dv = rdm(c, &in, &m, sz), sr = getr(c, m.reg, sz, in.rex), r = f_add(c, dv, sr, 0, sz);
             setr(c, m.reg, sz, in.rex, dv); wrm(c, &in, &m, sz, r); break; }
         case 0xB6: case 0xB7: case 0xBE: case 0xBF: {
@@ -2391,7 +2453,7 @@ static void run(CPU*c) {
 #ifdef HAVE_JIT
         if (g_jit_on) { if (pend) { c->patch = 0; check_pending(c); } jit_dispatch(c); continue; }
 #endif
-        if (pend) check_pending(c);
+        if (*PENDP()) check_pending(c);
         step(c);
     }
 }

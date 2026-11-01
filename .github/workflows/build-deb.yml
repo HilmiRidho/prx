@@ -25,6 +25,25 @@ jobs:
       - name: make check
         run: make check
 
+  check-arm64:
+    # pemu_x64 (the JIT in particular) has so far only been tested through the AArch64-interpreter harness on x86_64.
+    # This job runs the same checks on a real aarch64 machine. It is informational for now (does not block the build).
+    name: make check on aarch64
+    runs-on: ubuntu-24.04-arm
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc make gcc-x86-64-linux-gnu python3
+      - name: Make scripts executable
+        run: chmod +x prx packaging/build-deb.sh tests/smoke.sh examples/debian
+      - name: make check
+        env:
+          PEMU_X64_CC: x86_64-linux-gnu-gcc
+        run: make check
+
   build:
     name: Build ${{ matrix.target }} package
     needs: check
