@@ -517,14 +517,14 @@ static long gsys(CPU*c, int*noset) {
     long r, nr;
     switch (n) {
 #ifdef HAVE_JIT
-    case 231: if (g_jit_on) jit_report(); return hs(SYS_exit_group, (long) a0, 0, 0, 0, 0, 0);
+    case 231: jit_report(); return hs(SYS_exit_group, (long) a0, 0, 0, 0, 0, 0);
 #else
     case 231: return hs(SYS_exit_group, (long) a0, 0, 0, 0, 0, 0);
 #endif
     case 60:
         if (g_is_thread) thread_exit(c);                /* does not return */
 #ifdef HAVE_JIT
-        if (g_jit_on) jit_report();
+        jit_report();
 #endif
         return hs(SYS_exit_group, (long) a0, 0, 0, 0, 0, 0);
     case 2: return hs(SYS_openat, AT_FDCWD, (long) a0, fl_g2h((long) a1), (long) a2, 0, 0);
@@ -1534,6 +1534,7 @@ static u64 jrwx[JRWX_MAX][2]; static int jrwx_over;
 static volatile int g_jflush_req;
 static unsigned long long jst_blocks, jst_flush, jst_chain, jst_ins, jst_words;
 static int g_jstats;
+static unsigned long long jdyn[512], jst_dyn;                     /* statistics: interpreter fallbacks EXECUTED, by opcode (jfbh below counts translated sites) */
 static unsigned jfbh[512], jst_fb;                               /* statistics: interpreter fallbacks by opcode (0x100 + x for 0F xx) */
 #ifdef PEMU_JIT_EMBED
 static u64 jemb_stack[8192];
@@ -1995,7 +1996,15 @@ static int jdecode(JI *j, u64 ip) {
 
 /* ------------------------------------------------------------ flag state and code generation */
 static struct { int nz, pend, kind, sz; } fl;        /* nz: host NZCV and x9-x11 hold the flags of kind/sz; pend: lazy fields not written yet */
-static void jh_step(CPU *c) { step(c); }
+static int jfb_idx(const u8 *q) {                               /* statistics: opcode of the instruction at q (0x100 + x for 0F xx) */
+    while (*q == 0x66 || *q == 0xF3 || *q == 0xF2 || *q == 0x64 || *q == 0x65 || *q == 0x67 || *q == 0xF0 || (*q & 0xE7) == 0x26) q++;
+    if ((*q & 0xF0) == 0x40) q++;
+    return *q == 0x0F ? 256 + q[1] : *q;
+}
+static void jh_step(CPU *c) {
+    if (__builtin_expect(g_jstats, 0)) { jdyn[jfb_idx((const u8*) c->rip)]++; jst_dyn++; }
+    step(c);
+}
 
 static void fl_spill(void) {
     if (fl.kind == LZ_LOGIC) a_stp(31, 31, RCPU, (int) OFF_LA); else a_stp(9, 10, RCPU, (int) OFF_LA);
@@ -2310,10 +2319,7 @@ static u32 *jtranslate(u64 pc) {
     if (g_jstats)
         for (int i = 0; i < n; i++)
             if (ji[i].op == JO_FB || ji[i].op == JO_FBT) {
-                const u8 *q = (const u8*) ji[i].ip;
-                while (*q == 0x66 || *q == 0xF3 || *q == 0xF2 || *q == 0x64 || *q == 0x65 || *q == 0x67 || *q == 0xF0 || (*q & 0xE7) == 0x26) q++;
-                if ((*q & 0xF0) == 0x40) q++;
-                jfbh[*q == 0x0F ? 256 + q[1] : *q]++; jst_fb++;
+                jfbh[jfb_idx((const u8*) ji[i].ip)]++; jst_fb++;
             }
     for (int i = 0; i < n; i++) {                                 /* pages that now hold translated code */
         jpg_add(ji[i].ip >> 12);
@@ -2405,11 +2411,19 @@ static void jit_report(void) {
     g_jstats = 0;
     fprintf(stderr, "pemu jit: %llu blocks, %llu guest instructions translated (%.1f AArch64 instructions each), %llu chained exits, %llu cache flushes\n",
             jst_blocks, jst_ins, jst_ins ? (double) jst_words / (double) jst_ins : 0.0, jst_chain, jst_flush);
-    fprintf(stderr, "pemu jit: %u of those run through the interpreter; most frequent opcodes:", jst_fb);
+    if (!g_jit_on) fprintf(stderr, "pemu jit: switched off before exit (the guest created a thread): dynamic counts below are incomplete\n");
+    fprintf(stderr, "pemu jit: %u translated instructions fall back to the interpreter; opcodes by number of sites:", jst_fb);
     for (int k = 0; k < 8; k++) {
         int b = -1; for (int i = 0; i < 512; i++) if (jfbh[i] && (b < 0 || jfbh[i] > jfbh[b])) b = i;
         if (b < 0) break;
         fprintf(stderr, " %s%02x x%u", b >= 256 ? "0f " : "", b & 255, jfbh[b]); jfbh[b] = 0;
+    }
+    fprintf(stderr, "\n");
+    fprintf(stderr, "pemu jit: %llu interpreter fallbacks executed; most executed opcodes (count):", jst_dyn);
+    for (int k = 0; k < 12; k++) {
+        int b = -1; for (int i = 0; i < 512; i++) if (jdyn[i] && (b < 0 || jdyn[i] > jdyn[b])) b = i;
+        if (b < 0) break;
+        fprintf(stderr, " %s%02x x%llu", b >= 256 ? "0f " : "", b & 255, jdyn[b]); jdyn[b] = 0;
     }
     fprintf(stderr, "\n");
 }

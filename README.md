@@ -104,8 +104,8 @@ Unknown options are an error, not a command; put the command after `--`.
 | `PRX_NO_ARGV0` | Set to `1` to never pass `--argv0` to the loader (detected automatically; glibc < 2.33 lacks it). |
 | `PRX_KEEP` | Set to `1` to leave guest processes running after `prx login` exits (by default they are cleaned up). |
 | `GLIBC_TUNABLES` | Defaults to `glibc.pthread.rseq=0` inside the guest unless you set it yourself. |
-| `PEMU_JIT` | Set to `0` to disable the JIT of the built-in emulator (same as `pemu -nojit`). |
-| `PEMU_JIT_STATS` | Set to `1` to print JIT block counts and the most frequent interpreter fallbacks at exit (`pemu_x64`). |
+| `PEMU_JIT` | Set to `0` to disable the JIT of the built-in emulator (same as `pemu -nojit`). `prx login` starts the emulator with a clean environment, so pass it as `prx login NAME -e PEMU_JIT=0`. |
+| `PEMU_JIT_STATS` | Set to `1` to print JIT statistics at exit (`pemu_x64`): translated blocks, the opcodes that fall back to the interpreter (by number of code sites) and the ones executed most often. Pass it as `prx login NAME -e PEMU_JIT_STATS=1 -- cmd`; the report goes to stderr, once per guest process. |
 | `CC` | C compiler used to build the shim. |
 
 ## Layout
@@ -221,6 +221,7 @@ Threads in `pemu.c` (aarch64 guest), AVX/SSE3+/BMI (cpuid reports a baseline x86
 - `sigaltstack` is implemented (it used to return success without doing anything), `SA_ONSTACK` is honoured and `uc_stack` is filled in the signal frame.
 - A signal that arrives on a guest thread is now delivered in that thread (pending signals and `siginfo` are per-thread); before, any thread could pick it up.
 - `epoll_wait` checks its allocation, and a dead syscall case was removed.
+- `PEMU_JIT_STATS` now also counts how often each interpreter fallback is *executed* (the old per-opcode list only counted code sites, which says little about what is hot), and the report is printed for guests that created a thread too (the JIT is off then, which the report says).
 
 **Added**
 
