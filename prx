@@ -19,57 +19,57 @@ esac
 HARCH="$ARCH"
 usage() {
 cat <<EOF
-prx $PRX_VERSION - User-space container and path-translation engine
+prx $PRX_VERSION - user-space container and path-translation engine (glibc rootfs, no root)
 
 Usage:
-  prx build                          Compile the C runtime shim, loader patcher and
-                                     (if it compiles) the built-in emulator pemu
+  prx build                          Compile the shim, loader patcher and (if possible) pemu
   prx install NAME FILE|URL [--sha256 HEX]
-                                     Install a glibc rootfs archive as container NAME
-                                     (--sha256 verifies it before extraction; strongly advised)
-  prx login NAME [options] [-- cmd]  Execute shell or command inside guest rootfs
-        -b, --bind PATH              Bind host path to identical path in guest
-        -b, --bind HOST:GUEST        Bind host path to custom path inside guest (GUEST must be absolute)
-                                     (paths < 1024 bytes, no ':' or '=' inside, max 50 binds)
-        -w, --workdir DIR            Initial working directory, absolute guest path (default: /root)
-        -e, --env KEY=VAL            Pass custom environment variable (repeatable)
-        --no-root-id                 Run as the host user (host name/UID/GID); sudo/su still work
-        --no-seccomp                 Skip the host-seccomp workarounds (loader/libc patch, SIGSYS handler)
-        --trace                      Enable debug syscall & seccomp tracing
-        --                           End of options; the rest is the command to run
-  prx list                           List all installed rootfs containers
-  prx fixperm NAME                   Fix file permissions & clear library cache
-  prx remove NAME                    Completely remove a container
-  prx help | -h | --help             Show this help
-  prx --version | -V | version       Show version
+                                     Install a rootfs archive as container NAME
+                                     (--sha256 is verified before extraction; strongly advised)
+  prx login NAME [options] [-- cmd]  Start a shell, or run cmd, inside the container
+  prx list                           List installed containers
+  prx fixperm NAME                   Repair permissions and clear the library cache
+  prx remove NAME                    Delete a container
+  prx help | version                 Show this help / the version
 
-NAME may contain only letters, digits, '.', '_' and '-' (not starting with '-').
+login options:
+  -b, --bind PATH|HOST:GUEST         Bind a host path into the guest (GUEST absolute; max 50;
+                                     paths < 1024 bytes, no ':' or '=')
+  -w, --workdir DIR                  Initial guest directory, absolute (default: /root)
+  -e, --env KEY=VAL                  Set an environment variable (repeatable)
+  --no-root-id                       Run as the host user instead of fake root
+  --no-seccomp                       Skip host-seccomp workarounds (same as PRX_SECCOMP=0)
+  --trace                            Debug syscall and seccomp tracing
+  --                                 End of options; put cmd after it if it starts with '-'
+
+Examples:
+  prx install debian rootfs.tar.gz --sha256 <HEX>
+  prx login debian -- uname -a
+  prx login debian --no-root-id -b /sdcard -e LANG=C.UTF-8
+
+NAME: letters, digits, '.', '_' and '-' only; must not start with '-'.
+The shim is built automatically on the first login.
 
 Environment:
   PRX_HOME=DIR      Data directory (default: \$XDG_DATA_HOME/prx, i.e. ~/.local/share/prx)
   PRX_SRCDIR=DIR    Directory holding prx.c, ldpatch.c and shim/
   PRX_SECCOMP=0|1   0 = same as --no-seccomp (default 1)
-  PRX_SHIM_CFLAGS   Extra compiler flags for the shim, e.g. -DPRX_NO_SECCOMP (run 'prx build' afterwards)
+  PRX_SHIM_CFLAGS   Extra shim compiler flags, e.g. -DPRX_NO_SECCOMP (run 'prx build' afterwards)
   PRX_DNS=LIST      IPv4/IPv6 DNS servers for the guest (separated by ',', ';' or blanks)
   PRX_KEEP=1        Leave guest processes running after 'prx login' exits (default: kill them)
   PRX_NO_ARGV0=1    Never pass --argv0 to the loader (auto-detected; glibc < 2.33 lacks it)
-  CC=PROGRAM        C compiler used to build the shim
-
-Cross-arch rootfs is detected automatically and run through qemu-user, in both
-directions: x86_64 rootfs on an aarch64 host (needs qemu-x86_64) and aarch64 rootfs
-on an x86_64 host (needs qemu-aarch64). To cross-build the shim you also need
-clang + lld, or a cross gcc (aarch64-linux-gnu-gcc / x86_64-linux-gnu-gcc).
-An i386 (32-bit x86) rootfs is supported on both host types, but only through
-qemu-user (qemu-i386): there is no native i386 mode, even on an x86_64 host. Its
-shim is built with clang + lld, i686-linux-gnu-gcc, or gcc -m32 (gcc-multilib).
-  Termux:        pkg install qemu-user-x86-64 qemu-user-aarch64 qemu-user-i386 clang
-  Debian/Ubuntu: apt install qemu-user-static clang lld
-  PRX_QEMU=/path/to/qemu-ARCH        Use a specific qemu-user binary
-  PRX_QEMU=pemu                      Use the built-in experimental emulator (aarch64 rootfs on
-                                     x86_64 hosts, x86_64 rootfs on aarch64 hosts; see README)
-  PEMU_JIT=0                         Disable the JIT of the built-in emulator
+  PRX_QEMU=PATH     Specific qemu-user binary for a cross-arch rootfs, or 'pemu' for the
+                    built-in experimental emulator
+  GLIBC_TUNABLES    Passed to the guest (default: glibc.pthread.rseq=0)
+  PEMU_JIT=0        Disable the pemu JIT (pass into the guest with -e PEMU_JIT=0)
+  PEMU_JIT_STATS=1  Print pemu_x64 JIT statistics at exit (use -e PEMU_JIT_STATS=1)
   QEMU_CPU, QEMU_STRACE, QEMU_LOG, QEMU_RESERVED_VA, QEMU_GUEST_BASE, QEMU_PAGESIZE
-                                     Passed through to the emulator
+                    Passed through to the emulator
+  CC=PROGRAM        C compiler used by 'prx build'
+
+Cross-arch rootfs (x86_64 <-> aarch64, and i386 via qemu-i386) is detected and run
+through qemu-user, e.g. Debian/Ubuntu: apt install qemu-user-static clang lld
+Termux: pkg install qemu-user-x86-64 qemu-user-aarch64 qemu-user-i386 clang
 EOF
 }
 prx_srcdir() {
