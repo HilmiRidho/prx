@@ -471,7 +471,7 @@ static long pass_nr(u64 n) {
     case 200: return SYS_tkill; case 202: return SYS_futex; case 203: return SYS_sched_setaffinity;
     case 204: return SYS_sched_getaffinity; case 217: return SYS_getdents64; case 218: return SYS_set_tid_address;
     case 221: return SYS_fadvise64; case 228: return SYS_clock_gettime; case 229: return SYS_clock_getres;
-    case 230: return SYS_clock_nanosleep; case 233: return SYS_epoll_ctl; case 234: return SYS_tgkill;
+    case 230: return SYS_clock_nanosleep; case 234: return SYS_tgkill;
     case 258: return SYS_mkdirat; case 259: return SYS_mknodat; case 260: return SYS_fchownat; case 263: return SYS_unlinkat;
     case 264: return SYS_renameat; case 265: return SYS_linkat; case 266: return SYS_symlinkat;
     case 267: return SYS_readlinkat; case 268: return SYS_fchmodat; case 269: return SYS_faccessat;
@@ -641,6 +641,11 @@ static long gsys(CPU*c, int*noset) {
         for (long i = 0; i < r; i++) { u8*g = (u8*) a1 + 12 * i; *(u32*) g = ev[i].events; *(u64u*)(g + 4) = ev[i].data.u64; }
         free(ev); return r;
     }
+    case 233: {                                       /* epoll_ctl(epfd, op, fd, event): the guest's struct epoll_event is packed (events@0, data@4);
+                                                       * the host's is 16 bytes on aarch64 (data@8), so passing the pointer through hands the kernel a wrong, garbage data word */
+        struct epoll_event ev, *evp = NULL;
+        if (a3 && (int) a1 != EPOLL_CTL_DEL) { memset(&ev, 0, sizeof ev); ev.events = *(u32u*) a3; ev.data.u64 = *(u64u*)(a3 + 4); evp = &ev; }
+        return hs(SYS_epoll_ctl, (long) a0, (long) a1, (long) a2, (long) evp, 0, 0); }
     case 213: return hs(SYS_epoll_create1, 0, 0, 0, 0, 0, 0);
     case 284: return hs(SYS_eventfd2, (long) a0, 0, 0, 0, 0, 0);
     case 56: case 57: case 58: {                      /* clone / fork / vfork */
