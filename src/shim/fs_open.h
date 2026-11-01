@@ -28,8 +28,7 @@ static int do_open(int dfd, const char*p, int fl, int mode) {
         }
         if (strcmp(p, "/proc/stat") == 0) {
             if ((fl&O_ACCMODE_) != O_RDONLY) return (int) fail(EACCES);
-            const char st[] = "cpu  21200 450 12300 954000 3200 120 80 0 0 0\n""intr 1234567 10 20 0 0 0\nctxt 5678901\nbtime 1680000000\nprocesses 25000\nprocs_running 1\nprocs_blocked 0\n";
-            int mfd = fake_proc_file(st, sizeof (st)-1);
+            int mfd = fake_proc_stat();
             if (mfd >= 0) return mfd;
         }
         if (strcmp(p, "/proc/sys/kernel/osrelease") == 0) {
