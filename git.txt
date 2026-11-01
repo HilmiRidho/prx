@@ -1,5 +1,0 @@
-git apply --check pemu_x64.patch
-git apply pemu_x64.patch
-git add .
-git commit -m "improve pemu performance"
-git push
