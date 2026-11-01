@@ -1,0 +1,5 @@
+git apply --check pemu-neon-copy.patch
+git apply pemu-neon-copy.patch
+git add .
+git commit -m "fix pemu x64 host"
+git push
