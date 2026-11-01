@@ -576,7 +576,10 @@ static long gsys(CPU*c, int*noset) {
         if (a2) *(struct gsa*) a2 = old;
         return 0;
     }
-    case 14: return hs(SYS_rt_sigprocmask, (long) a0, (long) a1, (long) a2, 8, 0, 0);
+    case 14: {                                        /* rt_sigprocmask: never let the guest block SIGSYS on the host, or a seccomp kill cannot be turned into ENOSYS (see hsys) */
+        long set = (long) a1; u64 nm;
+        if (a1 && (int) a0 != 1) { nm = *(u64*) a1 & ~(1ULL << (SIGSYS - 1)); set = (long) &nm; }
+        return hs(SYS_rt_sigprocmask, (long) a0, set, (long) a2, 8, 0, 0); }
     case 15: g_sigreturn(c); *noset = 1; return 0;
     case 232: case 281: {                             /* epoll_wait / epoll_pwait: guest events are packed (12 bytes) */
         int max = (int) a2; if (max <= 0 || max > 4096) return -EINVAL;
@@ -603,6 +606,7 @@ static long gsys(CPU*c, int*noset) {
     }
     case 59: return do_execve((const char*) a0, (char**) a1, (char**) a2);
     case 322: case 435: case 334: case 317: return -ENOSYS;
+    case 273: case 274: return -ENOSYS;               /* set/get_robust_list: blocked by Android seccomp; glibc ignores the error */
     default:
         nr = pass_nr(n);
         if (nr >= 0) return hs(nr, (long) a0, (long) a1, (long) a2, (long) a3, (long) a4, (long) a5);
