@@ -476,9 +476,7 @@ static long clone_thread(CPU*c, u64 flags, u64 stack, u64 ptid, u64 ctid, u64 tl
     if ((flags & 0x100) == 0 || (flags & 0x800) == 0) return -EINVAL;   /* threads need CLONE_VM | CLONE_SIGHAND */
     ThArg*t = malloc(sizeof *t);
     if (!t) return -ENOMEM;
-#ifdef HAVE_JIT
-    if (g_jit_on) jit_disable();                          /* the code cache is not shared safely between threads: go back to the interpreter */
-#endif
+/* Multi-threaded JIT enabled */
     t->cpu = *c; t->flags = flags; t->ptid = ptid; t->ctid = ctid; volatile int tidv = 0; t->tidout = &tidv;
     if (stack) t->cpu.r[RSP] = stack;
     if (flags & 0x00080000) t->cpu.fs = tls;                            /* SETTLS */
@@ -1465,6 +1463,11 @@ extern void pemu_embed_clear(void);
 
 typedef struct { u64 pc; u32 *code; } JEnt;
 static u32 *jbase, *jcur, *jlim, *jenter, *jepi;
+static u32 *jbase_rw, *jbase_rx, *jenter_rx, *jepi_rx;
+static ptrdiff_t j_rw_to_rx;
+static int j_dual_mapped;
+static pthread_mutex_t j_compile_mutex = PTHREAD_MUTEX_INITIALIZER;
+static __thread JEnt *t_jic;
 static JEnt *jh, *jic;
 static u32 jhn, jmapn, jpgn, jrwxn;
 static u32 *jm_off; static u64 *jm_pc, *jpg;
@@ -1645,7 +1648,7 @@ static void jit_note_rwx(u64 start, u64 len) {
 /* ------------------------------------------------------------ decoder (static, no guest state) */
 enum { OT_NONE, OT_REG, OT_MEM, OT_IMM };
 enum { JO_FB, JO_FBT, JO_NOP, JO_MOV, JO_MOVX, JO_LEA, JO_PUSH, JO_POP, JO_ALU, JO_NOT, JO_NEG, JO_SHIFT, JO_IMUL,
-       JO_SETCC, JO_CMOV, JO_CWDE, JO_CDQ, JO_LEAVE, JO_XLD, JO_XST, JO_XLOG, JO_XMOVDLD, JO_XMOVDST, JO_JMP, JO_JCC, JO_CALL, JO_RET, JO_JMPI, JO_CALLI };
+       JO_SETCC, JO_CMOV, JO_CWDE, JO_CDQ, JO_LEAVE, JO_XLD, JO_XST, JO_XLOG, JO_XMOVDLD, JO_XMOVDST, JO_XARITH, JO_JMP, JO_JCC, JO_CALL, JO_RET, JO_JMPI, JO_CALLI };
 typedef struct {
     u64 ip, imm, target; s64 disp;
     u8 len, op, sz, sz2, t, fr, fw, at, bt, ar, br, rex, lva, lvb, scale, seg, sx, cnt, nost;
@@ -1885,16 +1888,28 @@ static int jdecode(JI *j, u64 ip) {
             j->op = JO_MOVX; j->sz = (u8) opsz; j->sz2 = (o2 & 1) ? 2 : 1; j->sx = o2 >= 0xBE; j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break;
         case 0x10: case 0x28: case 0x6F: case 0x11: case 0x29: case 0x7F: {
             int pf = pf3 ? 3 : pf2 ? 2 : p66 ? 1 : 0, st = o2 == 0x11 || o2 == 0x29 || o2 == 0x7F;
-            if ((o2 == 0x10 || o2 == 0x11) ? pf > 1 : (o2 == 0x6F || o2 == 0x7F) ? pf == 0 : 0) FB();
+            if ((o2 == 0x6F || o2 == 0x7F) ? pf == 0 : 0) FB();
             jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
             j->op = st ? JO_XST : JO_XLD;
+            j->sz = (u8) pf;
             if (st) { SETRM(m, 0); j->bt = OT_REG; j->br = (u8) m.reg; } else { j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); }
             break; }
+        case 0x54: case 0x55: case 0x56: case 0x57:
         case 0xEF: case 0xEB: case 0xDB: case 0xDF:
-            if (!(p66 && !pf3 && !pf2)) FB();
             jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
-            j->op = JO_XLOG; j->t = o2 == 0xEF ? 0 : o2 == 0xEB ? 1 : o2 == 0xDB ? 2 : 3;
+            j->op = JO_XLOG;
+            if (o2 == 0xEF || o2 == 0x57) j->t = 0;
+            else if (o2 == 0xEB || o2 == 0x56) j->t = 1;
+            else if (o2 == 0xDB || o2 == 0x54) j->t = 2;
+            else j->t = 3;
             j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break;
+        case 0x58: case 0x59: case 0x5C: case 0x5E: case 0x51: {
+            int pf = pf3 ? 3 : pf2 ? 2 : p66 ? 1 : 0;
+            jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
+            j->op = JO_XARITH;
+            j->t = (o2 == 0x58) ? 0 : (o2 == 0x59) ? 1 : (o2 == 0x5C) ? 2 : (o2 == 0x5E) ? 3 : 4;
+            j->sz = (u8) pf;
+            j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break; }
         case 0x6E: case 0x7E:
             if (!(p66 && !pf3 && !pf2)) FB();
             jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
@@ -1985,9 +2000,10 @@ static void jx_direct(u64 from, u64 target) {
     }
     u32 *tc = jfind(target);
     if (tc) { a_b(tc); return; }
-    u32 *site = jcur; E(0x14000001u);                  /* b .+4: patched to "b target" once the target is translated */
-    a_adr(0, site); c_st(0, OFF_PATCH);
-    a_movi(0, target); c_st(0, OFF_RIP); a_b(jepi);
+    u32 *site_rx = (u32*)((u8*)jcur + j_rw_to_rx);
+    E(0x14000001u);
+    a_movi(0, (u64)site_rx); c_st(0, OFF_PATCH);
+    a_movi(0, target); c_st(0, OFF_RIP); a_b(jepi_rx);
 }
 static void jx_indirect(void) {                        /* guest target in x0 */
     a_ldst_u(3, 1, 1, RPEND, 0);
@@ -2031,6 +2047,25 @@ static void alu_core(int t, int sz, int nf) {
         fl.kind = LZ_LOGIC; break;
     }
     fl.sz = sz; fl.nz = 1; fl.pend = 1;
+}
+
+static void a_fpop(int size, int op, int scalar, int rd, int rn, int rm) {
+    if (op == 4) {
+        u32 base = scalar ? ((size & 1) ? 0x1E61C000u : 0x1E21C000u)
+                          : ((size & 1) ? 0x6EE1F800u : 0x6EA1F800u);
+        E(base | ((u32)rn << 5) | (u32)rd);
+        return;
+    }
+    static const u32 sc_ops[2][4] = {
+        { 0x1E202800u, 0x1E200800u, 0x1E203800u, 0x1E201800u },
+        { 0x1E602800u, 0x1E600800u, 0x1E603800u, 0x1E601800u }
+    };
+    static const u32 vec_ops[2][4] = {
+        { 0x4E20D400u, 0x6E20DC00u, 0x4E60D400u, 0x6E20FC00u },
+        { 0x4EA0D400u, 0x6EA0DC00u, 0x4EE0D400u, 0x6EE0FC00u }
+    };
+    u32 base = scalar ? sc_ops[size & 1][op & 3] : vec_ops[size & 1][op & 3];
+    E(base | ((u32)rm << 16) | ((u32)rn << 5) | (u32)rd);
 }
 
 static void jemit(const JI *j) {
@@ -2138,12 +2173,53 @@ static void jemit(const JI *j) {
         if (m == 0) a_csel(sf, cc, 0, 1, 0); else if (m == 1) a_mov(0, 1);
         g_st(0, j->ar, sz, 0); break; }
     case JO_XLD:
-        if (j->bt == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); q_ldm(0, rb, off); } else q_ldc(0, OFF_X(j->br));
-        q_stc(0, OFF_X(j->ar)); break;
-    case JO_XST:
-        q_ldc(0, OFF_X(j->br));
-        if (j->at == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); q_stm(0, rb, off); } else q_stc(0, OFF_X(j->ar));
+        if (j->sz <= 1) {
+            if (j->bt == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); q_ldm(0, rb, off); } else q_ldc(0, OFF_X(j->br));
+            q_stc(0, OFF_X(j->ar));
+        } else if (j->sz == 2) {
+            if (j->bt == OT_MEM) {
+                fl_flush(j->lvb); j_ea(j, &rb, &off); m_ld(8, 0, 0, 0, rb, off);
+                c_st(0, OFF_X(j->ar)); c_st(31, OFF_X(j->ar) + 8);
+            } else {
+                c_ld(0, OFF_X(j->br)); c_st(0, OFF_X(j->ar));
+            }
+        } else {
+            if (j->bt == OT_MEM) {
+                fl_flush(j->lvb); j_ea(j, &rb, &off); m_ld(4, 0, 0, 0, rb, off);
+                c_st(0, OFF_X(j->ar)); c_st(31, OFF_X(j->ar) + 8);
+            } else {
+                c_ld(0, OFF_X(j->br)); c_ld(1, OFF_X(j->ar));
+                a_bfm(1, 0, 1, 0, 0, 31);
+                c_st(1, OFF_X(j->ar));
+            }
+        }
         break;
+    case JO_XST:
+        if (j->sz <= 1) {
+            q_ldc(0, OFF_X(j->br));
+            if (j->at == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); q_stm(0, rb, off); } else q_stc(0, OFF_X(j->ar));
+        } else if (j->sz == 2) {
+            c_ld(0, OFF_X(j->br));
+            if (j->at == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); m_st(8, 0, rb, off); } else c_st(0, OFF_X(j->ar));
+        } else {
+            c_ld(0, OFF_X(j->br));
+            if (j->at == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); m_st(4, 0, rb, off); } else {
+                c_ld(1, OFF_X(j->ar)); a_bfm(1, 0, 1, 0, 0, 31); c_st(1, OFF_X(j->ar));
+            }
+        }
+        break;
+    case JO_XARITH: {
+        int scalar = (j->sz >= 2);
+        int is_double = (j->sz == 1 || j->sz == 2);
+        q_ldc(0, OFF_X(j->ar));
+        if (j->bt == OT_MEM) {
+            fl_flush(j->lvb); j_ea(j, &rb, &off);
+            if (scalar) { m_ld(is_double ? 8 : 4, 0, 0, 1, rb, off); c_st(1, OFF_X(15)); q_ldc(1, OFF_X(15)); }
+            else q_ldm(1, rb, off);
+        } else q_ldc(1, OFF_X(j->br));
+        a_fpop(is_double, j->t, scalar, 0, 0, 1);
+        q_stc(0, OFF_X(j->ar));
+        break; }
     case JO_XLOG:
         if (j->bt == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); q_ldm(1, rb, off); } else q_ldc(1, OFF_X(j->br));
         q_ldc(0, OFF_X(j->ar));
@@ -2216,17 +2292,18 @@ static u32 *jtranslate(u64 pc) {
         if (ji[i].fr) live = 1; else if (ji[i].fw) live = 0;
         ji[i].lvb = (u8) live;
     }
-    u32 *start = jcur;
-    jins(pc, start);
+    u32 *start_rw = jcur;
+    u32 *start_rx = (u32*)((u8*)start_rw + j_rw_to_rx);
+    jins(pc, start_rx);
     memset(&fl, 0, sizeof fl);
     for (int i = 0; i < n; i++) {
-        jm_off[jmapn] = (u32)((u8*) jcur - (u8*) jbase); jm_pc[jmapn++] = ji[i].ip;
+        jm_off[jmapn] = (u32)((u8*)jcur - (u8*)jbase_rw); jm_pc[jmapn++] = ji[i].ip;
         jemit(&ji[i]);
     }
     if (!jterm(&ji[n - 1])) { fl_flush(1); jx_direct(ji[n - 1].ip, ji[n - 1].ip + ji[n - 1].len); }
-    jst_blocks++; jst_ins += (unsigned) n; jst_words += (unsigned long long)(jcur - start);
-    j_sync_icache(start, jcur);
-    return start;
+    jst_blocks++; jst_ins += (unsigned) n; jst_words += (unsigned long long)(jcur - start_rw);
+    j_sync_icache(start_rx, (u32*)((u8*)jcur + j_rw_to_rx));
+    return start_rx;
 }
 
 #define JSTOP 0x1000ULL
@@ -2234,22 +2311,40 @@ static void jit_enter(CPU *c, u32 *code) {
 #ifdef PEMU_JIT_EMBED
     u64 x[32] = {0};
     x[0] = (u64) c; x[1] = (u64) code; x[2] = (u64)(void*) &pend; x[3] = (u64) jic; x[30] = JSTOP; x[31] = (u64)(jemb_stack + 8192);
-    pemu_embed_run(x, (u64) jenter, JSTOP);
+    pemu_embed_run(x, (u64) jenter_rx, JSTOP);
 #else
-    ((void (*)(CPU*, u32*, volatile u64*, JEnt*)) (void*) jenter)(c, code, &pend, jic);
+    ((void (*)(CPU*, u32*, volatile u64*, JEnt*)) (void*) jenter_rx)(c, code, &pend, t_jic);
 #endif
 }
 
 static void jit_dispatch(CPU *c) {
-    if (g_jflush_req) { g_jflush_req = 0; jflush(); }
+    if (__atomic_load_n(&g_jflush_req, __ATOMIC_RELAXED)) {
+        pthread_mutex_lock(&j_compile_mutex);
+        if (g_jflush_req) { g_jflush_req = 0; jflush(); }
+        pthread_mutex_unlock(&j_compile_mutex);
+    }
     u64 pc = c->rip;
     u32 *code = jfind(pc);
     if (!code) {
-        if ((pc & 0xfff) > 4096 - 16 || jit_is_rwx(pc)) { c->patch = 0; step(c); return; }     /* interpret: see header comment */
-        code = jtranslate(pc);
+        if ((pc & 0xfff) > 4096 - 16 || jit_is_rwx(pc)) { c->patch = 0; step(c); return; }
+        pthread_mutex_lock(&j_compile_mutex);
+        code = jfind(pc);
+        if (!code) {
+            code = jtranslate(pc);
+        }
+        pthread_mutex_unlock(&j_compile_mutex);
     }
-    if (c->patch) { u32 *site = (u32*) c->patch; *site = 0x14000000u | ((u32)(code - site) & 0x3ffffff); j_sync_icache(site, site + 1); c->patch = 0; jst_chain++; }
-    jic[icidx(pc)].pc = pc; jic[icidx(pc)].code = code;
+    if (c->patch) {
+        u32 *site_rx = (u32*) c->patch;
+        u32 *site_rw = (u32*)((u8*)site_rx - j_rw_to_rx);
+        __atomic_store_n(site_rw, 0x14000000u | ((u32)(code - site_rx) & 0x3ffffff), __ATOMIC_RELEASE);
+        j_sync_icache(site_rx, site_rx + 1);
+        c->patch = 0;
+        jst_chain++;
+    }
+    if (!t_jic) t_jic = calloc(1 << JIC_BITS, sizeof(JEnt));
+    u32 h = icidx(pc);
+    t_jic[h].pc = pc; t_jic[h].code = code;
     jit_enter(c, code);
 }
 
@@ -2260,8 +2355,8 @@ static u64 jit_pc2rip(void *u) {
 #else
     pc = (u64) ((ucontext_t*) u)->uc_mcontext.pc;
 #endif
-    if (!pc || !jbase || pc < (u64) jbase || pc >= (u64) jcur || !jmapn) return 0;
-    u32 off = (u32)(pc - (u64) jbase), lo = 0, hi = jmapn;
+    if (!pc || !jbase_rx || pc < (u64) jbase_rx || pc >= (u64)((u8*)jcur + j_rw_to_rx) || !jmapn) return 0;
+    u32 off = (u32)(pc - (u64) jbase_rx), lo = 0, hi = jmapn;
     while (hi - lo > 1) { u32 mid = (lo + hi) / 2; if (jm_off[mid] <= off) lo = mid; else hi = mid; }
     return jm_off[lo] <= off ? jm_pc[lo] : 0;
 }
@@ -2304,23 +2399,54 @@ static void *jmap(size_t n) {
     return p == MAP_FAILED ? NULL : p;
 }
 static int jit_init(void) {
-    void *m = mmap(NULL, JCACHE_SZ, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    if (m == MAP_FAILED) return -1;                               /* no executable memory: stay with the interpreter */
-    jbase = m; jlim = jbase + JCACHE_SZ / 4;
-    jh = jmap(sizeof(JEnt) << JH_BITS); jic = jmap(sizeof(JEnt) << JIC_BITS); jpg = jmap(sizeof(u64) << JPG_BITS);
+    int fd = syscall(SYS_memfd_create, "pemu_jit", 1 /* MFD_CLOEXEC */);
+    if (fd < 0) {
+        char tmppath[] = "/dev/shm/pemu_jit_XXXXXX";
+        fd = mkstemp(tmppath);
+        if (fd < 0) {
+            char tmppath2[] = "/tmp/pemu_jit_XXXXXX";
+            fd = mkstemp(tmppath2);
+            if (fd >= 0) unlink(tmppath2);
+        } else unlink(tmppath);
+    }
+    if (fd >= 0) {
+        if (ftruncate(fd, JCACHE_SZ) == 0) {
+            jbase_rw = mmap(NULL, JCACHE_SZ, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            jbase_rx = mmap(NULL, JCACHE_SZ, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0);
+            close(fd);
+            if (jbase_rw != MAP_FAILED && jbase_rx != MAP_FAILED) {
+                j_dual_mapped = 1;
+                j_rw_to_rx = (u8*)jbase_rx - (u8*)jbase_rw;
+            } else {
+                if (jbase_rw != MAP_FAILED) munmap(jbase_rw, JCACHE_SZ);
+                if (jbase_rx != MAP_FAILED) munmap(jbase_rx, JCACHE_SZ);
+                j_dual_mapped = 0;
+            }
+        } else close(fd);
+    }
+    if (!j_dual_mapped) {
+        void *m = mmap(NULL, JCACHE_SZ, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (m == MAP_FAILED) return -1;
+        jbase_rw = jbase_rx = m;
+        j_rw_to_rx = 0;
+    }
+    jbase = jbase_rw; jlim = jbase + JCACHE_SZ / 4;
+    jh = jmap(sizeof(JEnt) << JH_BITS); jpg = jmap(sizeof(u64) << JPG_BITS);
     jm_off = jmap(4ul * JMAP_CAP); jm_pc = jmap(8ul * JMAP_CAP);
-    if (!jh || !jic || !jpg || !jm_off || !jm_pc) return -1;
-    jcur = jbase;
-    jenter = jcur;                                                /* void jenter(CPU *c, void *code, volatile u64 *pend, JEnt *ic) */
-    E(0xA9800000u | (u32)(-6 & 0x7f) << 15 | 30u << 10 | 31u << 5 | 29u);            /* stp x29, x30, [sp, #-48]! */
+    if (!jh || !jpg || !jm_off || !jm_pc) return -1;
+    jcur = jbase_rw;
+    jenter = jcur;
+    jenter_rx = (u32*)((u8*)jenter + j_rw_to_rx);
+    E(0xA9800000u | (u32)(-6 & 0x7f) << 15 | 30u << 10 | 31u << 5 | 29u);
     a_stp(27, 28, 31, 16); a_stp(25, 26, 31, 32);
     a_mov(28, 0); a_mov(27, 2); a_mov(26, 3); a_br(1);
-    jepi = jcur;
+    jepi = (u32*)((u8*)jcur + j_rw_to_rx);
+    jepi_rx = jepi;
     a_ldp(25, 26, 31, 32); a_ldp(27, 28, 31, 16);
-    E(0xA8C00000u | 6u << 15 | 30u << 10 | 31u << 5 | 29u);                          /* ldp x29, x30, [sp], #48 */
-    E(0xD65F03C0u);                                               /* ret */
-    jcur = jbase + JTRAMP;
-    j_sync_icache(jbase, jcur);
+    E(0xA8C00000u | 6u << 15 | 30u << 10 | 31u << 5 | 29u);
+    E(0xD65F03C0u);
+    jcur = jbase_rw + JTRAMP;
+    j_sync_icache(jbase_rx, (u32*)((u8*)jcur + j_rw_to_rx));
     g_jstats = getenv("PEMU_JIT_STATS") != NULL;
     return 0;
 }
