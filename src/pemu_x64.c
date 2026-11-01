@@ -1450,6 +1450,7 @@ extern void pemu_embed_clear(void);
 
 #define RCPU  28
 #define RPEND 27
+#define RIC   26
 static pthread_mutex_t j_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Full Register Pinning: x86 GPRs (0..15) mapped directly to ARM64 physical registers */
