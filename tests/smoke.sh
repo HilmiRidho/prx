@@ -223,6 +223,17 @@ case "$r386" in
 *) ok "i386 shim native test skipped (no gcc -m32 or no 32-bit execution)" ;;
 esac
 
+# shim: libc calls that read config files internally must see the guest's files
+if [ -n "${CCB:-}" ] && [ -f "${SHIMSO:-}" ]; then
+FR="$T/fsroot"; mkdir -p "$FR/etc" "$FR/dev/shm" "$FR/tmp"
+printf 'prxsvc 4242/tcp prxalias\n' > "$FR/etc/services"; printf 'prxproto 250 PRXP\n' > "$FR/etc/protocols"
+printf '10.9.8.7 prxhost\n127.0.0.1 localhost\n' > "$FR/etc/hosts"; printf 'prxdev /m ext4 rw 0 0\n' > "$FR/etc/mtab"
+: > "$FR/etc/prxmarker"; chmod 1777 "$FR/dev/shm" "$FR/tmp"
+if "$CCB" -w -o "$T/shim_fs" "$HERE/tests/shim_fs.c" 2>"$T/err"; then
+env -i PRX_ROOTFS="$FR" PRX_SHIM="$SHIMSO" PRX_SECCOMP=0 LD_PRELOAD="$SHIMSO" "$T/shim_fs" "$FR" && ok "shim: services/protocols, hosts_r, shm_open, mkostemps, ftok, setmntent, scandirat use the guest's files" || fail "shim: guest file lookups (status $?)"
+else cat "$T/err" >&2; fail "shim_fs test compiles"; fi
+fi
+
 "$PRX" remove t1 >/dev/null 2>&1 && "$PRX" remove t2 >/dev/null 2>&1
 [ "$("$PRX" list)" = "(no rootfs installed yet)" ] || [ -z "$("$PRX" list | grep -E '^t[12]$')" ] && ok "remove"
 

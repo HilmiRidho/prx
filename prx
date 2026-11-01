@@ -841,6 +841,11 @@ runner=("$QEMU")
 else
 ldenv=(LD_LIBRARY_PATH="$LP" LD_PRELOAD="$SHIM")
 fi
+# glibc reads the time zone through internal calls that the shim cannot see, so
+# point it at the guest's files explicitly: TZDIR for named zones (TZ=Area/City)
+# and TZ=:FILE for /etc/localtime. A user -e TZ=... still wins (it comes later).
+local -a tz_envs=(TZDIR="$R/usr/share/zoneinfo") tzf
+if tzf="$(rpath "$R" /etc/localtime 2>/dev/null)" && [ -f "$tzf" ]; then tz_envs+=(TZ=":$tzf"); else tz_envs+=(TZ=UTC); fi
 env -i \
 HOME="$home_val" USER="$user_val" LOGNAME="$user_val" SHELL="$gshell" \
 TERM="${TERM:-xterm-256color}" LANG="$LANGV" \
@@ -853,6 +858,7 @@ PRX_TRACE="$trace" PRX_LOADER="$PL" PRX_NO_ARGV0="$NOARGV0" \
 PRX_SECCOMP="$seccomp" GLIBC_TUNABLES="$tun" \
 ${ldenv[@]+"${ldenv[@]}"} \
 ${term_envs[@]+"${term_envs[@]}"} \
+${tz_envs[@]+"${tz_envs[@]}"} \
 ${extra_envs[@]+"${extra_envs[@]}"} \
 ${runner[@]+"${runner[@]}"} "$LD" --library-path "$LP" ${argv0opt[@]+"${argv0opt[@]}"} "${prog[@]}" || rc=$?
 trap - INT

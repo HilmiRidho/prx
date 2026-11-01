@@ -221,6 +221,8 @@ Threads in `pemu.c` (aarch64 guest), AVX/SSE3+/BMI (cpuid reports a baseline x86
 
 **Fixed (shim)**
 
+- `getservby*`, `getprotoby*`, `gethostbyname_r`/`gethostbyname2_r`, `shm_open`/`shm_unlink`, `mkostemps`, `ftok`, `setmntent` and `scandirat` used the host's files or paths; they now use the guest's.
+- The time zone came from the host's `/etc/localtime`; `prx login` now sets `TZDIR` and `TZ` from the guest (a `-e TZ=...` still wins).
 - `faccessat`/`faccessat2` ignored `AT_SYMLINK_NOFOLLOW` and `AT_EACCESS`.
 - `tmpfile()` wrote to the host's `/tmp`; `inotify_add_watch`, `ftw` and `nftw` did not translate paths.
 - `getpwent`/`getgrent`/`getgrouplist` read the host's databases, and `getpw*`/`getgr*` fell back to the host for users missing in the guest.

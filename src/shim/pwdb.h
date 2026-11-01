@@ -515,3 +515,132 @@ EXP int getgrouplist(const char*user, u32 gid, u32*groups, int*ngroups) {
     for (int i = 0; i<c && i<room; i++) groups[i] = tmp[i];
     return room<c ? -1 : c;
 }
+/* getservby*() and getprotoby*() read /etc/services and /etc/protocols through
+   glibc-internal calls, so they would see the host's files (Android has none).
+   Parse the guest's files here; fall back to glibc when there is no match. */
+struct prx_servent { char*name; char**aliases; int port; char*proto; };
+struct prx_protoent { char*name; char**aliases; int proto; };
+static char sv_pool[1536], *sv_al[12];
+static struct prx_servent sv_se;
+static struct prx_protoent sv_pe;
+static char*sv_dup(const char*s, size_t n, size_t*used) {
+    if (*used+n+1 > sizeof sv_pool) return NULL;
+    char*d = sv_pool+*used;
+    memcpy(d, s, n);
+    d[n] = 0;
+    *used += n+1;
+    return d;
+}
+static int sv_num(const char*s, size_t n, int*out) {
+    if (!n || n>9) return 0;
+    int v = 0;
+    for (size_t i = 0; i<n; i++) {
+        if (s[i]<'0' || s[i]>'9') return 0;
+        v = v*10+(s[i]-'0');
+    }
+    *out = v;
+    return 1;
+}
+/* mode: 0 service by name, 1 service by port (host order), 2 protocol by name,
+   3 protocol by number. Returns 1 and fills sv_se / sv_pe on a match. */
+static int sv_find(int mode, const char*name, int num, const char*proto) {
+    long n;
+    char*buf = read_rel_all(mode<2 ? "/etc/services" : "/etc/protocols", &n);
+    if (!buf) return 0;
+    int found = 0;
+    for (char*l = buf; *l && !found; ) {
+        char*e = l;
+        while (*e && *e != '\n') e++;
+        char sv = *e;
+        *e = 0;
+        char*t[12];
+        size_t tl[12];
+        int k = 0;
+        for (char*c = l; *c && *c != '#' && k<12; ) {
+            while (*c == ' ' || *c == '\t' || *c == '\r') c++;
+            if (!*c || *c == '#') break;
+            t[k] = c;
+            while (*c && *c != ' ' && *c != '\t' && *c != '\r' && *c != '#') c++;
+            tl[k] = (size_t)(c-t[k]);
+            k++;
+        }
+        if (k >= 2) {
+            int port = 0, ok = 0;
+            size_t pl = tl[1];
+            const char*pr = NULL;
+            size_t prl = 0;
+            if (mode<2) {
+                size_t i = 0;
+                while (i<pl && t[1][i] != '/') i++;
+                if (i<pl && sv_num(t[1], i, &port)) {
+                    pr = t[1]+i+1;
+                    prl = pl-i-1;
+                    ok = 1;
+                }
+                if (ok && proto && (strlen(proto) != prl || memcmp(proto, pr, prl) != 0)) ok = 0;
+            } else ok = sv_num(t[1], pl, &port);
+            if (ok) {
+                int hit = 0;
+                if (mode == 1 || mode == 3) hit = (port == num);
+                else for (int i = 0; i<k && !hit; i++) {
+                    if (i == 1) continue;
+                    hit = (strlen(name) == tl[i] && memcmp(name, t[i], tl[i]) == 0);
+                }
+                if (hit) {
+                    size_t used = 0;
+                    char*nm = sv_dup(t[0], tl[0], &used);
+                    char*pp = mode<2 ? sv_dup(pr, prl, &used) : NULL;
+                    int na = 0, bad = !nm || (mode<2 && !pp);
+                    for (int i = 2; i<k && !bad; i++) {
+                        char*a = sv_dup(t[i], tl[i], &used);
+                        if (!a) bad = 1;
+                        else sv_al[na++] = a;
+                    }
+                    if (!bad) {
+                        sv_al[na] = NULL;
+                        if (mode<2) {
+                            sv_se.name = nm;
+                            sv_se.aliases = sv_al;
+                            sv_se.port = (int)(((port&0xff)<<8) | ((port>>8)&0xff));
+                            sv_se.proto = pp;
+                        } else {
+                            sv_pe.name = nm;
+                            sv_pe.aliases = sv_al;
+                            sv_pe.proto = port;
+                        }
+                        found = 1;
+                    }
+                }
+            }
+        }
+        *e = sv;
+        l = *e ? e+1 : e;
+    }
+    free(buf);
+    return found;
+}
+EXP void*getservbyname(const char*name, const char*proto) {
+    static void*(*real)(const char*, const char*);
+    if (name && g_rl && sv_find(0, name, 0, proto)) return &sv_se;
+    if (!real) real = nextsym("getservbyname");
+    return real(name, proto);
+}
+EXP void*getservbyport(int port, const char*proto) {
+    static void*(*real)(int, const char*);
+    int hp = ((port&0xff)<<8) | ((port>>8)&0xff);
+    if (g_rl && sv_find(1, 0, hp&0xffff, proto)) return &sv_se;
+    if (!real) real = nextsym("getservbyport");
+    return real(port, proto);
+}
+EXP void*getprotobyname(const char*name) {
+    static void*(*real)(const char*);
+    if (name && g_rl && sv_find(2, name, 0, 0)) return &sv_pe;
+    if (!real) real = nextsym("getprotobyname");
+    return real(name);
+}
+EXP void*getprotobynumber(int num) {
+    static void*(*real)(int);
+    if (g_rl && sv_find(3, 0, num, 0)) return &sv_pe;
+    if (!real) real = nextsym("getprotobynumber");
+    return real(num);
+}

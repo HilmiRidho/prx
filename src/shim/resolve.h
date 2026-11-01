@@ -304,3 +304,25 @@ EXP void*gethostbyname(const char*name) {
     if (resolve_name(name, ip)) return real(ip);
     return r;
 }
+/* Reentrant variants: same /etc/hosts and DNS fallback as gethostbyname. */
+static int ghbn_fallback(int rc, void**res, const char*name, char*ip) {
+    if (rc == 34 || (rc == 0 && *res)) return 0;
+    if (!g_rl || !name || is_numeric(name)) return 0;
+    return resolve_name(name, ip);
+}
+EXP int gethostbyname_r(const char*name, void*ret, char*buf, size_t len, void**res, int*herr) {
+    static int(*real)(const char*, void*, char*, size_t, void**, int*);
+    if (!real) real = nextsym("gethostbyname_r");
+    int rc = real(name, ret, buf, len, res, herr);
+    char ip[32];
+    if (ghbn_fallback(rc, res, name, ip)) return real(ip, ret, buf, len, res, herr);
+    return rc;
+}
+EXP int gethostbyname2_r(const char*name, int af, void*ret, char*buf, size_t len, void**res, int*herr) {
+    static int(*real)(const char*, int, void*, char*, size_t, void**, int*);
+    if (!real) real = nextsym("gethostbyname2_r");
+    int rc = real(name, af, ret, buf, len, res, herr);
+    char ip[32];
+    if (af == 2 && ghbn_fallback(rc, res, name, ip)) return real(ip, af, ret, buf, len, res, herr);
+    return rc;
+}

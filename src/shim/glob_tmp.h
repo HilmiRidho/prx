@@ -63,6 +63,22 @@ EXP int scandir64(const char*p, void*nl, void*flt, void*cmp) {
     if (!f) f = nextsym("scandir64");
     return f(h, nl, flt, cmp);
 }
+EXP int scandirat(int d, const char*p, void*nl, void*flt, void*cmp) {
+    static int(*f)(int, const char*, void*, void*, void*);
+    char bb[PM];
+    const char*h;
+    if (tr(d, p, bb, 1, &h)<0) return-1;
+    if (!f) f = nextsym("scandirat");
+    return f(d, h, nl, flt, cmp);
+}
+EXP int scandirat64(int d, const char*p, void*nl, void*flt, void*cmp) {
+    static int(*f)(int, const char*, void*, void*, void*);
+    char bb[PM];
+    const char*h;
+    if (tr(d, p, bb, 1, &h)<0) return-1;
+    if (!f) f = nextsym("scandirat64");
+    return f(d, h, nl, flt, cmp);
+}
 static int tmpgen(char*t, int suffix, int flags, int isdir) {
     size_t n = strlen(t);
     if ((size_t) suffix>n || n-(size_t) suffix<6 || memcmp(t+n-suffix-6, "XXXXXX", 6) != 0) return (int) fail(EINVAL);
@@ -107,6 +123,53 @@ EXP int mkstemps(char*t, int s) {
 }
 EXP int mkstemps64(char*t, int s) {
     return tmpgen(t, s, 0, 0);
+}
+EXP int mkostemps(char*t, int s, int f) {
+    return tmpgen(t, s, f, 0);
+}
+EXP int mkostemps64(char*t, int s, int f) {
+    return tmpgen(t, s, f, 0);
+}
+/* glibc's shm_open/shm_unlink open "/dev/shm/NAME" through internal calls that
+   bypass this shim and land in the host's /dev/shm (missing on Android); route
+   them through the translated open/unlink. Name rules follow glibc: leading
+   slashes are skipped, the rest must be non-empty and contain no '/'. */
+static int shm_path(const char*name, char*out) {
+    while (*name == '/') name++;
+    size_t n = strlen(name);
+    if (!n || (n == 1 && name[0] == '.') || (n == 2 && name[0] == '.' && name[1] == '.')) return (int) fail(EINVAL);
+    for (size_t i = 0; i<n; i++) if (name[i] == '/') return (int) fail(EINVAL);
+    if (n+10 >= PM) return (int) fail(ENAMETOOLONG);
+    memcpy(out, "/dev/shm/", 9);
+    memcpy(out+9, name, n+1);
+    return 0;
+}
+EXP int shm_open(const char*name, int oflag, int mode) {
+    char b[PM];
+    if (shm_path(name, b)<0) return-1;
+    return do_open(AT_FDCWD, b, oflag|O_NOFOLLOW|O_CLOEXEC, mode);
+}
+EXP int shm_unlink(const char*name) {
+    char b[PM];
+    if (shm_path(name, b)<0) return-1;
+    return unlink(b);
+}
+/* ftok and setmntent read a path through glibc-internal calls. */
+EXP int ftok(const char*p, int id) {
+    static int(*f)(const char*, int);
+    char bb[PM];
+    const char*h;
+    if (tr(AT_FDCWD, p, bb, 1, &h)<0) return-1;
+    if (!f) f = nextsym("ftok");
+    return f(h, id);
+}
+EXP void*setmntent(const char*p, const char*m) {
+    static void*(*f)(const char*, const char*);
+    char bb[PM];
+    const char*h;
+    if (tr(AT_FDCWD, p, bb, 1, &h)<0) return NULL;
+    if (!f) f = nextsym("setmntent");
+    return f(h, m);
 }
 /* glibc's own tmpfile() opens "/tmp" through an internal call that bypasses
    this shim and lands in the host's /tmp; build it from the translated mkstemp. */
