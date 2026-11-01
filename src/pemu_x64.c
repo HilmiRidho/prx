@@ -1593,6 +1593,10 @@ static void q_log(int op, int vd, int vn, int vm) {                      /* 0 eo
     static const u32 base[4] = { 0x6E201C00u, 0x4EA01C00u, 0x4E201C00u, 0x4E601C00u };
     E(base[op] | (u32) vm << 16 | (u32) vn << 5 | (u32) vd);
 }
+static void q_v3(int kind, int size, int vd, int vn, int vm) {          /* 0 add 1 sub 2 cmeq: vd = vn op vm, lanes of 1<<size bytes (16b vector) */
+    static const u32 base[3] = { 0x4E208400u, 0x6E208400u, 0x6E208C00u };
+    E(base[kind] | (u32) size << 22 | (u32) vm << 16 | (u32) vn << 5 | (u32) vd);
+}
 static void m_st(int sz, int rt, int rn, int off) {
     int size = sz == 1 ? 0 : sz == 2 ? 1 : sz == 4 ? 2 : 3;
     a_ldst_s(size, 0, rt, rn, off);
@@ -1645,7 +1649,7 @@ static void jit_note_rwx(u64 start, u64 len) {
 /* ------------------------------------------------------------ decoder (static, no guest state) */
 enum { OT_NONE, OT_REG, OT_MEM, OT_IMM };
 enum { JO_FB, JO_FBT, JO_NOP, JO_MOV, JO_MOVX, JO_LEA, JO_PUSH, JO_POP, JO_ALU, JO_NOT, JO_NEG, JO_SHIFT, JO_IMUL,
-       JO_SETCC, JO_CMOV, JO_CWDE, JO_CDQ, JO_LEAVE, JO_XLD, JO_XST, JO_XLOG, JO_XMOVDLD, JO_XMOVDST, JO_JMP, JO_JCC, JO_CALL, JO_RET, JO_JMPI, JO_CALLI };
+       JO_SETCC, JO_CMOV, JO_CWDE, JO_CDQ, JO_LEAVE, JO_XLD, JO_XST, JO_XLOG, JO_XMOVDLD, JO_XMOVDST, JO_XVEC, JO_PMOVMSKB, JO_XSHI, JO_JMP, JO_JCC, JO_CALL, JO_RET, JO_JMPI, JO_CALLI };
 typedef struct {
     u64 ip, imm, target; s64 disp;
     u8 len, op, sz, sz2, t, fr, fw, at, bt, ar, br, rex, lva, lvb, scale, seg, sx, cnt, nost;
@@ -1895,6 +1899,22 @@ static int jdecode(JI *j, u64 ip) {
             jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
             j->op = JO_XLOG; j->t = o2 == 0xEF ? 0 : o2 == 0xEB ? 1 : o2 == 0xDB ? 2 : 3;
             j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break;
+        case 0xFC: case 0xFD: case 0xFE: case 0xD4: case 0xF8: case 0xF9: case 0xFA: case 0xFB: case 0x74: case 0x75: case 0x76:
+            if (!(p66 && !pf3 && !pf2)) FB();
+            jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
+            j->op = JO_XVEC;
+            j->t = (o2 >= 0xF8 && o2 <= 0xFB) ? 1 : (o2 >= 0xFC || o2 == 0xD4) ? 0 : 2;   /* sub / add / cmpeq */
+            j->sz = (u8)(o2 == 0xD4 || o2 == 0xFB ? 3 : o2 == 0xFE || o2 == 0xFA || o2 == 0x76 ? 2 : o2 == 0xFD || o2 == 0xF9 || o2 == 0x75 ? 1 : 0);
+            j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break;
+        case 0xD7:
+            if (!(p66 && !pf3 && !pf2)) FB();
+            jmodrm(&p, j, &m, 0); if (m.ismem || lock) FB();
+            j->op = JO_PMOVMSKB; j->at = OT_REG; j->ar = (u8) m.reg; j->bt = OT_REG; j->br = (u8) m.rm; break;
+        case 0x73: {                                         /* psrlq/psllq/psrldq/pslldq xmm, imm8 */
+            if (!(p66 && !pf3 && !pf2)) FB();
+            jmodrm(&p, j, &m, 1); if (m.ismem || lock) FB();
+            int ext = m.reg & 7; if (ext != 2 && ext != 3 && ext != 6 && ext != 7) FB();
+            j->op = JO_XSHI; j->t = (u8) ext; j->imm = *p++; j->br = (u8) m.rm; break; }
         case 0x6E: case 0x7E:
             if (!(p66 && !pf3 && !pf2)) FB();
             jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
@@ -2149,6 +2169,39 @@ static void jemit(const JI *j) {
         q_ldc(0, OFF_X(j->ar));
         if (j->t == 3) q_log(3, 0, 1, 0); else q_log(j->t, 0, 0, 1);       /* pandn: ~dst & src */
         q_stc(0, OFF_X(j->ar)); break;
+    case JO_XVEC:
+        if (j->bt == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); q_ldm(1, rb, off); } else q_ldc(1, OFF_X(j->br));
+        q_ldc(0, OFF_X(j->ar));
+        q_v3(j->t, j->sz, 0, 0, 1);
+        q_stc(0, OFF_X(j->ar)); break;
+    case JO_PMOVMSKB:                                    /* bit i of the result = top bit of byte i: (x & 0x80..80) * 0x0002040810204081 >> 56 */
+        c_ld(0, OFF_X(j->br)); c_ld(1, OFF_X(j->br) + 8);
+        a_movi(2, 0x8080808080808080ULL); a_movi(3, 0x0002040810204081ULL);
+        a_log(1, 0, 0, 0, 0, 2); a_log(1, 0, 0, 1, 1, 2);
+        a_mul(1, 0, 0, 3); a_mul(1, 1, 1, 3);
+        a_lsr(1, 0, 0, 56); a_lsr(1, 1, 1, 56);
+        a_logsh(1, 0, 0, 1, 0, 8);                       /* orr x0, x0, x1, lsl #8 */
+        g_st(0, j->ar, 4, 0); break;
+    case JO_XSHI: {                                      /* the count is known: shift the two 64-bit halves with integer code (x0 = low, x1 = high) */
+        u32 o = OFF_X(j->br); unsigned n = (unsigned) j->imm;
+        if (j->t == 2 || j->t == 6) {                    /* psrlq / psllq */
+            if (n > 63) { c_st(31, o); c_st(31, o + 8); break; }
+            if (n == 0) break;
+            c_ld(0, o); c_ld(1, o + 8);
+            if (j->t == 2) { a_lsr(1, 0, 0, (int) n); a_lsr(1, 1, 1, (int) n); } else { a_lsl(1, 0, 0, (int) n); a_lsl(1, 1, 1, (int) n); }
+            c_st(0, o); c_st(1, o + 8); break;
+        }
+        if (n > 15) { c_st(31, o); c_st(31, o + 8); break; }       /* psrldq / pslldq: n bytes */
+        if (n == 0) break;
+        int b = (int) n * 8; c_ld(0, o); c_ld(1, o + 8);
+        if (j->t == 3) {                                 /* psrldq: whole xmm >> b */
+            if (n < 8) { a_lsr(1, 2, 0, b); a_logsh(1, 0, 2, 1, 0, 64 - b); a_lsr(1, 1, 1, b); c_st(0, o); c_st(1, o + 8); }
+            else { if (n == 8) a_mov(0, 1); else a_lsr(1, 0, 1, b - 64); c_st(0, o); c_st(31, o + 8); }
+        } else {                                         /* pslldq: whole xmm << b */
+            if (n < 8) { a_lsl(1, 2, 1, b); a_logsh(1, 1, 2, 0, 1, 64 - b); a_lsl(1, 0, 0, b); c_st(0, o); c_st(1, o + 8); }
+            else { if (n != 8) a_lsl(1, 0, 0, b - 64); c_st(31, o); c_st(0, o + 8); }
+        }
+        break; }
     case JO_XMOVDLD:
         if (j->bt == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); m_ld(sz, 0, 0, 0, rb, off); } else g_ld(0, j->br, sz, 0);
         c_st(0, OFF_X(j->ar)); c_st(31, OFF_X(j->ar) + 8); break;

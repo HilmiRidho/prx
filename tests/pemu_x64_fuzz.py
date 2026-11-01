@@ -233,9 +233,10 @@ def gen_one(a, depth=0):
         elif f in (4, 5): a.insn(bytes([0x0f, R.choice([0xef, 0xeb, 0xdb, 0xdf])]), x, reg_or_xmm_mem(a, y), p66=True)   # pxor/por/pand/pandn
         elif f == 6: a.insn(b'\x0f\x6e', x, reg_or_mem(a), w=R.randrange(2), p66=True)                                  # movd/movq xmm, r/m
         elif f == 7: a.insn(b'\x0f\x7e', x, reg_or_mem(a), w=R.randrange(2), p66=True)                                  # movd/movq r/m, xmm
-        elif f == 8: a.insn(b'\x0f\xfe', x, y, p66=True)                                                                 # paddd (fallback)
-        elif f == 9: a.insn(b'\x0f\x74', x, reg_or_xmm_mem(a, y), p66=True)                                              # pcmpeqb (fallback)
-        elif f == 10: a.insn(b'\x0f\xd7', R.choice(FREE), y, p66=True)                                                   # pmovmskb (fallback)
+        elif f == 8: a.insn(bytes([0x0f, R.choice([0xfc, 0xfd, 0xfe, 0xd4, 0xf8, 0xf9, 0xfa, 0xfb])]), x, reg_or_xmm_mem(a, y), p66=True)   # padd*/psub* (native in the JIT)
+        elif f == 9: a.insn(bytes([0x0f, R.choice([0x74, 0x75, 0x76])]), x, reg_or_xmm_mem(a, R.choice([x, y])), p66=True)                   # pcmpeqb/w/d (native in the JIT)
+        elif f == 10: a.insn(b'\x0f\xd7', R.choice(FREE), R.choice([x, y]), p66=True)                                      # pmovmskb (native in the JIT)
+        elif f == 11: a.insn(b'\x0f\x73', R.choice([2, 3, 6, 7]), y, imm=bytes([R.choice([0, 1, 3, 7, 8, 9, 15, 16, 31, 63, 64, 70, R.randrange(256)])]), p66=True)   # psrlq/psrldq/psllq/pslldq (native in the JIT)
         else: a.insn(b'\x0f\x7e', x, R.choice(FREE), w=1, p66=True)
     elif k < 92 and depth < 2:                                   # forward conditional branch over a few instructions
         saved = a.b; a.b = bytearray()

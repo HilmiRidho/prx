@@ -504,6 +504,17 @@ static int simd_insn(CPU*c, u32 i) {
         if (!q) c->v[rd][1] = 0;
         return 0;
     }
+    if ((i & 0x9F200400) == 0x0E200400 && (((i >> 11) & 31) == 16 || (((i >> 11) & 31) == 17 && ((i >> 29) & 1)))) {   /* 3-same: ADD, SUB, CMEQ */
+        int u = (i >> 29) & 1, sz = (i >> 22) & 3, op = (i >> 11) & 31, esz = 1 << sz;
+        if (sz == 3 && !q) return -1;
+        u8 *d = (u8*) c->v[rd], *n = (u8*) c->v[rn], *m = (u8*) c->v[rm], t[16] = {0};
+        for (int k = 0; k < (q ? 16 : 8) / esz; k++) {
+            u64 a = 0, b = 0, r; memcpy(&a, n + k * esz, (size_t) esz); memcpy(&b, m + k * esz, (size_t) esz);
+            r = op == 17 ? (a == b ? ~0ULL : 0) : u ? a - b : a + b;
+            memcpy(t + k * esz, &r, (size_t) esz);
+        }
+        memcpy(d, t, 16); return 0;
+    }
     if ((i & 0x9FE08400) == 0x0E000400) {                      /* copy: DUP (element/general), INS, SMOV, UMOV */
         int imm5 = (i >> 16) & 31, imm4 = (i >> 11) & 15, op = (i >> 29) & 1;
         if (!(imm5 & 15)) return -1;
