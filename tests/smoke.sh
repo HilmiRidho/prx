@@ -14,6 +14,15 @@ fail() { echo "FAIL - $1" >&2; exit 1; }
 bash -n "$PRX" && ok "bash -n prx"
 [ "$("$PRX" --version)" = "prx $(sed -n 's/^PRX_VERSION=//p' "$PRX")" ] && ok "--version"
 "$PRX" help | grep -q 'prx install NAME' && ok "help"
+[ "$("$PRX" -V)" = "$("$PRX" --version)" ] && [ "$("$PRX" version)" = "$("$PRX" --version)" ] && ok "-V and version match --version"
+for w in PRX_KEEP PRX_QEMU=pemu PEMU_JIT PRX_NO_ARGV0 PRX_DNS PRX_SRCDIR '\-\-sha256' '\-\-no-root-id' '\-\-trace' '\-V'; do
+  "$PRX" help | grep -q -e "$w" || fail "help does not mention $w"
+done
+ok "help documents every option and environment variable"
+for w in PRX_KEEP PEMU_JIT PRX_QEMU QEMU_CPU PRX_NO_ARGV0 PRX_DNS PRX_SRCDIR PRX_HOME; do
+  grep -q -e "$w" "$HERE/man/prx.1" || fail "man page does not mention $w"
+done
+ok "man page documents the environment variables"
 # `prx source` expands the shim modules into one self-contained file
 "$PRX" source > "$T/shim_all.c"
 if grep -q '^#include "shim/' "$T/shim_all.c"; then fail "prx source left a shim include unresolved"; fi
@@ -66,6 +75,12 @@ ok "login rejects -c/--cpus, -m/--memory, --hard-mem"
 # unknown option must not be run as a command
 if "$PRX" login t1 --bogus 2>"$T/err"; then fail "unknown login option accepted"; fi
 grep -q "Unknown option for 'login'" "$T/err" && ok "login rejects unknown option" || fail "login rejects unknown option"
+
+# relative -w and relative guest bind path are rejected
+if "$PRX" login t1 -w rel 2>"$T/err"; then fail "relative -w accepted"; fi
+grep -q 'absolute' "$T/err" && ok "login rejects relative -w"
+if "$PRX" login t1 -b "$T:rel" 2>"$T/err"; then fail "relative guest bind accepted"; fi
+grep -q 'absolute' "$T/err" && ok "login rejects relative guest bind path"
 
 # bind validation: too long / ambiguous ':'
 long="/$(printf 'x%.0s' $(seq 1 1100))"

@@ -77,7 +77,8 @@ Description: user-space container and path-translation engine
  without root, namespaces or ptrace. Paths are translated by an LD_PRELOAD
  shim that is compiled per user on first use.
  .
- It is a convenience tool, not a security boundary. Only glibc root
+ It ships an experimental built-in emulator (pemu) as a qemu-user
+ alternative. It is a convenience tool, not a security boundary. Only glibc root
  filesystems on x86_64 and aarch64 hosts are supported; foreign-architecture
  root filesystems run through qemu-user.
 C
