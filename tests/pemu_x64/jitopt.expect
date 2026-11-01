@@ -1,6 +1,0 @@
-fib(20)=6765 deep(500)=500
-longjmp=7 after=610 200
-partial=0x112233445566f00f
-fault rbx=1005 rdi=77
-alarm interrupted=1
-threads sum=698000 flusher=11325
