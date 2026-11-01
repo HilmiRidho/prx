@@ -1,5 +1,5 @@
-git apply --check pemu-neon-copy.patch
-git apply pemu-neon-copy.patch
+git apply --check docs-tests-update.patch
+git apply docs-tests-update.patch
 git add .
-git commit -m "fix pemu x64 host"
+git commit -m "docs update"
 git push
