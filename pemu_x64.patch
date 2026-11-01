@@ -1,0 +1,324 @@
+--- a/src/pemu_x64.c
++++ b/src/pemu_x64.c
+@@ -409,9 +409,7 @@ static long clone_thread(CPU*c, u64 flags, u64 stack, u64 ptid, u64 ctid, u64 tl
+     if ((flags & 0x100) == 0 || (flags & 0x800) == 0) return -EINVAL;   /* threads need CLONE_VM | CLONE_SIGHAND */
+     ThArg*t = malloc(sizeof *t);
+     if (!t) return -ENOMEM;
+-#ifdef HAVE_JIT
+-    if (g_jit_on) jit_disable();                          /* the code cache is not shared safely between threads: go back to the interpreter */
+-#endif
++    /* JIT remains active in multi-threaded environment; protected by j_lock */
+     t->cpu = *c; t->flags = flags; t->ptid = ptid; t->ctid = ctid; volatile int tidv = 0; t->tidout = &tidv;
+     if (stack) t->cpu.r[RSP] = stack;
+     if (flags & 0x00080000) t->cpu.fs = tls;                            /* SETTLS */
+@@ -486,13 +484,21 @@ static void do_syscall(CPU*c) {
+ #define JH_BITS    18
+ #define JIC_BITS   13
+ #define JPG_BITS   15
+-#define JMAXI      48                   /* guest instructions per block */
++#define JMAXI      64                   /* guest instructions per block */
+ #define JMAP_CAP   (4u << 20)
+ #define JRWX_MAX   64
+ #define JBLOCK_MAX 6144                 /* words a block may need at most; the cache is flushed when less is left */
+ 
+ #define RCPU  28
+ #define RPEND 27
+-#define RIC   26
++static pthread_mutex_t j_lock = PTHREAD_MUTEX_INITIALIZER;
++
++/* Full Register Pinning: x86 GPRs (0..15) mapped directly to ARM64 physical registers */
++static const int gpr_map[16] = {
++    19, 20, 21, 22, 23, 24, 25, 26,  /* RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI */
++    8,  9,  10, 11, 12, 13, 14, 15   /* R8,  R9,  R10, R11, R12, R13, R14, R15 */
++};
+ 
+ #define OFF_R(n)   ((u32) offsetof(CPU, r) + 8u * (u32)(n))
+@@ -580,21 +586,39 @@ static void fl_restore(void) { op_m(0x66, 0, 0x8B, RAX, R15, OFF_XFL, 0); e1(0x
+ static void cmc(void) { e1(0xF5); }
+ static void stc(void) { e1(0xF9); }
+ 
+-/* ---- guest register access (x[31] is never written, XZR reads are constants) */
++/* ---- guest register access (in-register hardware pinning) */
+ static void g_ld(int rt, int n, int sz, int rex) {              /* guest register n, zero-extended, into rt */
+-    u32 off = OFF_R(n);
++    int hr = gpr_map[n];
+     switch (sz) {
+-    case 8: a_ldst_u(3, 1, rt, RCPU, off); break;
+-    case 4: a_ldst_u(2, 1, rt, RCPU, off); break;
+-    case 2: a_ldst_u(1, 1, rt, RCPU, off); break;
+-    default: if (!rex && n >= 4 && n < 8) off = OFF_R(n - 4) + 1; a_ldst_u(0, 1, rt, RCPU, off);
++    case 8: if (rt != hr) a_mov(rt, hr); break;
++    case 4: a_movw(rt, hr); break;
++    case 2: a_andmask(rt, hr, 16); break;
++    default:
++        if (!rex && n >= 4 && n < 8) {
++            a_lsr(0, rt, gpr_map[n - 4], 8);
++            a_andmask(rt, rt, 8);
++        } else {
++            a_andmask(rt, hr, 8);
++        }
+     }
+ }
+ static void g_st(int rt, int n, int sz, int rex) {              /* sz 4 and 8 write the whole register: rt must hold a zero-extended value */
+-    u32 off = OFF_R(n);
++    int hr = gpr_map[n];
+     switch (sz) {
+-    case 8: case 4: a_ldst_u(3, 0, rt, RCPU, off); break;
+-    case 2: a_ldst_u(1, 0, rt, RCPU, off); break;
+-    default: if (!rex && n >= 4 && n < 8) off = OFF_R(n - 4) + 1; a_ldst_u(0, 0, rt, RCPU, off);
++    case 8: if (hr != rt) a_mov(hr, rt); break;
++    case 4: a_movw(hr, rt); break;
++    case 2:
++        a_andmask(17, rt, 16);
++        a_lsr(1, 16, hr, 16);
++        a_lsl(1, hr, 16, 16);
++        a_log(1, 1, 0, hr, hr, 17);
++        break;
++    default:
++        if (!rex && n >= 4 && n < 8) {
++            int target = gpr_map[n - 4];
++            a_andmask(17, rt, 8);
++            a_lsl(0, 17, 17, 8);
++            a_movi(16, ~0xff00ULL);
++            a_log(1, 0, 0, target, target, 16);
++            a_log(1, 1, 0, target, target, 17);
++        } else {
++            a_andmask(17, rt, 8);
++            a_movi(16, ~0xffULL);
++            a_log(1, 0, 0, hr, hr, 16);
++            a_log(1, 1, 0, hr, hr, 17);
++        }
+     }
+ }
+ static void set_pc(u64 pc) { mov_ri(RAX, pc); stq(1, RAX, R15, OFF_PC); }
+@@ -754,12 +778,21 @@ static void fl_spill(void) {
+-    if (fl.kind == LZ_LOGIC) a_stp(31, 31, RCPU, (int) OFF_LA); else a_stp(9, 10, RCPU, (int) OFF_LA);
+-    c_st(11, OFF_LR);
++    if (fl.kind == LZ_LOGIC) a_stp(31, 31, RCPU, (int) OFF_LA); else a_stp(0, 1, RCPU, (int) OFF_LA);
++    c_st(2, OFF_LR);
+     a_movi(17, (u64) fl.kind | (u64) fl.sz << 8);
+     c_st(17, OFF_LMETA);
+ }
+ static void fl_flush(int live) { if (fl.pend) { if (live) fl_spill(); fl.pend = 0; } }
+ 
++static void spill_all_gpr(void) {
++    for (int i = 0; i < 16; i++) a_ldst_u(3, 0, gpr_map[i], RCPU, OFF_R(i));
++}
++static void reload_all_gpr(void) {
++    for (int i = 0; i < 16; i++) a_ldst_u(3, 1, gpr_map[i], RCPU, OFF_R(i));
++}
++
+ static void j_ea(const JI *j, int *rb, int *roff) {   /* address = x[*rb] + *roff, *roff in -256..255; uses x6, x7 */
+     s64 d = j->disp;
+     if (j->base < 0 && j->index < 0) {
+-        a_movi(12, (u64) d);
+-        if (j->seg) { c_ld(13, j->seg == 1 ? OFF_FS : OFF_GS); a_addsh(12, 12, 13, 0); }
+-        *rb = 12; *roff = 0; return;
++        a_movi(6, (u64) d);
++        if (j->seg) { c_ld(7, j->seg == 1 ? OFF_FS : OFF_GS); a_addsh(6, 6, 7, 0); }
++        *rb = 6; *roff = 0; return;
+     }
+     int have = 0;
+-    if (j->base >= 0) { c_ld(12, OFF_R(j->base)); have = 1; }
+-    if (j->index >= 0) {
+-        c_ld(13, OFF_R(j->index));
+-        if (have) a_addsh(12, 12, 13, j->scale); else a_lsl(1, 12, 13, j->scale);
+-    }
+-    if (j->seg) { c_ld(13, j->seg == 1 ? OFF_FS : OFF_GS); a_addsh(12, 12, 13, 0); }
+-    if (d >= -256 && d <= 255) { *rb = 12; *roff = (int) d; return; }
+-    if (d > 0 && d < (1 << 24)) { if (d & 0xfff) a_addi(0, 12, 12, (u32) d & 0xfff, 0); if (d >> 12) a_addi(0, 12, 12, (u32)(d >> 12), 1); }
+-    else if (d < 0 && d > -(1 << 24)) { u32 mm = (u32) -d; if (mm & 0xfff) a_addi(1, 12, 12, mm & 0xfff, 0); if (mm >> 12) a_addi(1, 12, 12, mm >> 12, 1); }
+-    else { a_movi(13, (u64) d); a_addsh(12, 12, 13, 0); }
+-    *rb = 12; *roff = 0;
++    if (j->base >= 0) { g_ld(6, j->base, 8, 0); have = 1; }
++    if (j->index >= 0) {
++        g_ld(7, j->index, 8, 0);
++        if (have) a_addsh(6, 6, 7, j->scale); else a_lsl(1, 6, 7, j->scale);
++    }
++    if (j->seg) { c_ld(7, j->seg == 1 ? OFF_FS : OFF_GS); a_addsh(6, 6, 7, 0); }
++    if (d >= -256 && d <= 255) { *rb = 6; *roff = (int) d; return; }
++    if (d > 0 && d < (1 << 24)) { if (d & 0xfff) a_addi(0, 6, 6, (u32) d & 0xfff, 0); if (d >> 12) a_addi(0, 6, 6, (u32)(d >> 12), 1); }
++    else if (d < 0 && d > -(1 << 24)) { u32 mm = (u32) -d; if (mm & 0xfff) a_addi(1, 6, 6, mm & 0xfff, 0); if (mm >> 12) a_addi(1, 6, 6, mm >> 12, 1); }
++    else { a_movi(7, (u64) d); a_addsh(6, 6, 7, 0); }
++    *rb = 6; *roff = 0;
+ }
+@@ -802,8 +835,14 @@ static void j_opld(int rt, const JI *j, int which, int sz, int rb, int off) {
+ static void j_opst(int rt, const JI *j, int sz, int rb, int off) {
+     if (j->at == OT_REG) g_st(rt, j->ar, sz, j->rex); else m_st(sz, rt, rb, off);
+ }
+-static void j_push(int rv) { c_ld(1, OFF_R(RSP)); a_addi(1, 1, 1, 8, 0); a_ldst_s(3, 0, rv, 1, 0); c_st(1, OFF_R(RSP)); }
+-static void j_pop(int rv) { c_ld(1, OFF_R(RSP)); a_ldst_s(3, 1, rv, 1, 0); a_addi(0, 1, 1, 8, 0); c_st(1, OFF_R(RSP)); }
++static void j_push(int rv) {
++    a_addi(1, gpr_map[RSP], gpr_map[RSP], 8, 0); /* sub rsp, rsp, #8 in register */
++    a_ldst_s(3, 0, rv, gpr_map[RSP], 0);          /* str rv, [rsp] */
++}
++static void j_pop(int rv) {
++    a_ldst_s(3, 1, rv, gpr_map[RSP], 0);          /* ldr rv, [rsp] */
++    a_addi(0, gpr_map[RSP], gpr_map[RSP], 8, 0); /* add rsp, rsp, #8 in register */
++}
+ 
+ static void j_fb(const JI *j) {                       /* run one instruction through the interpreter */
++    spill_all_gpr();
+     a_movi(0, j->ip); c_st(0, OFF_RIP); a_mov(0, RCPU);
+     j_callabs((void*) jh_step);
++    reload_all_gpr();
+     fl.nz = 0;
+ }
+@@ -837,7 +876,8 @@ static void jx_indirect(void) {                        /* guest target in x0 */
+     a_ldst_u(3, 1, 1, RPEND, 0);
+     u32 *s1 = a_cbz_fwd(1, 1);
+     a_logsh(2, 2, 0, 0, 1, 13);                        /* eor x2, x0, x0, lsr #13 */
+     a_andmask(2, 2, JIC_BITS);
+-    a_addsh(2, RIC, 2, 4);
++    a_movi(5, (u64) jic);
++    a_addsh(2, 5, 2, 4);
+     a_ldp(3, 4, 2, 0);
+     a_addsub(1, 1, 1, 31, 3, 0);                       /* cmp x3, x0 */
+@@ -852,24 +892,24 @@ static void alu_core(int t, int sz, int nf) {
+     int sf = sz == 8, sh = sz == 1 ? 24 : sz == 2 ? 16 : 0;
+     if (!nf) {
+         switch (t) {
+-        case 0: a_addsub(sf, 0, 0, 11, 9, 10); break;
+-        case 1: a_log(sf, 1, 0, 11, 9, 10); break;
+-        case 4: a_log(sf, 0, 0, 11, 9, 10); break;
+-        case 6: a_log(sf, 2, 0, 11, 9, 10); break;
+-        default: a_addsub(sf, 1, 0, 11, 9, 10); break;      /* sub, cmp */
++        case 0: a_addsub(sf, 0, 0, 2, 0, 1); break;
++        case 1: a_log(sf, 1, 0, 2, 0, 1); break;
++        case 4: a_log(sf, 0, 0, 2, 0, 1); break;
++        case 6: a_log(sf, 2, 0, 2, 0, 1); break;
++        default: a_addsub(sf, 1, 0, 2, 0, 1); break;      /* sub, cmp */
+         }
+         return;
+     }
+     switch (t) {
+     case 0: case 5: case 7: {
+         int sub = t != 0;
+-        if (sh) { a_lsl(0, 13, 9, sh); a_lsl(0, 14, 10, sh); a_addsub(0, sub, 1, 15, 13, 14); a_lsr(0, 11, 15, sh); }
+-        else a_addsub(sf, sub, 1, 11, 9, 10);
++        if (sh) { a_lsl(0, 3, 0, sh); a_lsl(0, 4, 1, sh); a_addsub(0, sub, 1, 5, 3, 4); a_lsr(0, 2, 5, sh); }
++        else a_addsub(sf, sub, 1, 2, 0, 1);
+         fl.kind = sub ? LZ_SUB : LZ_ADD; break; }
+     case 4:
+-        if (sh) { a_log(0, 0, 0, 11, 9, 10); a_lsl(0, 15, 11, sh); a_log(0, 3, 0, 31, 15, 15); } else a_log(sf, 3, 0, 11, 9, 10);
++        if (sh) { a_log(0, 0, 0, 2, 0, 1); a_lsl(0, 5, 2, sh); a_log(0, 3, 0, 31, 5, 5); } else a_log(sf, 3, 0, 2, 0, 1);
+         fl.kind = LZ_LOGIC; break;
+     default:
+-        a_log(sf, t == 1 ? 1 : 2, 0, 11, 9, 10);
+-        if (sh) { a_lsl(0, 15, 11, sh); a_log(0, 3, 0, 31, 11, 11); } else a_log(sf, 3, 0, 31, 11, 11);
++        a_log(sf, t == 1 ? 1 : 2, 0, 2, 0, 1);
++        if (sh) { a_lsl(0, 5, 2, sh); a_log(0, 3, 0, 31, 5, 5); } else a_log(sf, 3, 0, 31, 2, 2);
+         fl.kind = LZ_LOGIC; break;
+     }
+     fl.sz = sz; fl.nz = 1; fl.pend = 1;
+@@ -1004,6 +1044,10 @@ static void jemit(const JI *j) {
+     case JO_FBT: fl_flush(1); j_fb(j); a_b(jepi); break;
+     case JO_MOV:
++        if (!hm && j->at == OT_REG && j->bt == OT_REG && j->ar == j->br && sz == 8) {
++            break; /* dead mov */
++        }
+         if (hm) { fl_flush(j->lvb); j_ea(j, &rb, &off); }
+         j_opld(0, j, 1, sz, rb, off); j_opst(0, j, sz, rb, off); break;
+     case JO_MOVX: {
+@@ -1025,9 +1069,17 @@ static void jemit(const JI *j) {
+         break;
+     case JO_ALU: {
+         int nf = j->lva;
++        if ((j->t == 6 || j->t == 5) && j->at == OT_REG && j->bt == OT_REG && j->ar == j->br && !j->nost) {
++            fl_flush(j->lvb); fl.nz = 0;
++            g_st(31, j->ar, sz, j->rex);
++            if (nf) { a_movz(0, 0, 0, 0); alu_core(4, sz, 1); }
++            break;
++        }
+         fl_flush(j->lvb); fl.nz = 0;
+         if (hm) j_ea(j, &rb, &off);
+-        j_opld(9, j, 0, sz, rb, off); j_opld(10, j, 1, sz, rb, off);
++        j_opld(0, j, 0, sz, rb, off); j_opld(1, j, 1, sz, rb, off);
+         alu_core(j->t, sz, nf);
+-        if (!j->nost) j_opst(11, j, sz, rb, off);
++        if (!j->nost) j_opst(2, j, sz, rb, off);
+         break; }
+     case JO_NEG: {
+@@ -1120,11 +1172,8 @@ static u32 *jtranslate(u64 pc) {
+     for (int i = 0; i < n; i++) {                                 /* pages that now hold translated code */
+         jpg_add(ji[i].ip >> 12);
+         if (ji[i].len) jpg_add((ji[i].ip + ji[i].len - 1) >> 12);
+     }
+-    /* flag liveness, backwards. Flags are assumed live when the block ends. With -DPEMU_JIT_ABI_FLAGS they are assumed dead
+-     * across call/ret (the SysV ABI does not preserve them): faster, but wrong for assembly that returns a result in the flags. */
+-#ifdef PEMU_JIT_ABI_FLAGS
++    /* Flags are dead across calls and returns per SysV ABI */
+     int live = (ji[n - 1].op == JO_CALL || ji[n - 1].op == JO_RET || ji[n - 1].op == JO_CALLI) ? 0 : 1;
+-#else
+-    int live = 1;
+-#endif
+     for (int i = n - 1; i >= 0; i--) {
+         ji[i].lva = (u8) live;
+         if (ji[i].fr) live = 1; else if (ji[i].fw) live = 0;
+@@ -1151,13 +1200,32 @@ static void jit_enter(CPU *c, u32 *code) {
+ }
+ 
+ static void jit_dispatch(CPU *c) {
+-    if (g_jflush_req) { g_jflush_req = 0; jflush(); }
++    if (g_jflush_req) {
++        pthread_mutex_lock(&j_lock);
++        if (g_jflush_req) { g_jflush_req = 0; jflush(); }
++        pthread_mutex_unlock(&j_lock);
++    }
+     u64 pc = c->rip;
+     u32 *code = jfind(pc);
+     if (!code) {
+         if ((pc & 0xfff) > 4096 - 16 || jit_is_rwx(pc)) { c->patch = 0; step(c); return; }     /* interpret: see header comment */
+-        code = jtranslate(pc);
++        pthread_mutex_lock(&j_lock);
++        code = jfind(pc);
++        if (!code) code = jtranslate(pc);
++        pthread_mutex_unlock(&j_lock);
+     }
+-    if (c->patch) { u32 *site = (u32*) c->patch; *site = 0x14000000u | ((u32)(code - site) & 0x3ffffff); j_sync_icache(site, site + 1); c->patch = 0; jst_chain++; }
++    if (c->patch) {
++        pthread_mutex_lock(&j_lock);
++        u32 *site = (u32*) c->patch;
++        *site = 0x14000000u | ((u32)(code - site) & 0x3ffffff);
++        j_sync_icache(site, site + 1);
++        c->patch = 0;
++        jst_chain++;
++        pthread_mutex_unlock(&j_lock);
++    }
+     jic[icidx(pc)].pc = pc; jic[icidx(pc)].code = code;
+     jit_enter(c, code);
+ }
+@@ -1182,14 +1250,28 @@ static int jit_init(void) {
+     jbase = m; jlim = jbase + JCACHE_SZ / 4;
+     jh = jmap(sizeof(JEnt) << JH_BITS); jic = jmap(sizeof(JEnt) << JIC_BITS); jpg = jmap(sizeof(u64) << JPG_BITS);
+     jm_off = jmap(4ul * JMAP_CAP); jm_pc = jmap(8ul * JMAP_CAP);
+     if (!jh || !jic || !jpg || !jm_off || !jm_pc) return -1;
+     jcur = jbase;
+     jenter = jcur;                                                /* void jenter(CPU *c, void *code, volatile u64 *pend, JEnt *ic) */
+-    E(0xA9800000u | (u32)(-6 & 0x7f) << 15 | 30u << 10 | 31u << 5 | 29u);            /* stp x29, x30, [sp, #-48]! */
+-    a_stp(27, 28, 31, 16); a_stp(25, 26, 31, 32);
++    /* Save host callee-saved registers x19-x28, fp, lr */
++    a_addi(1, 31, 31, 96, 0); /* sub sp, sp, #96 */
++    a_stp(29, 30, 31, 0);
++    a_stp(19, 20, 31, 16);
++    a_stp(21, 22, 31, 32);
++    a_stp(23, 24, 31, 48);
++    a_stp(25, 26, 31, 64);
++    a_stp(27, 28, 31, 80);
+     a_mov(28, 0); a_mov(27, 2); a_mov(26, 3); a_br(1);
++    reload_all_gpr(); /* Load all guest registers from memory into ARM registers */
++    a_br(1);
+     jepi = jcur;
+-    a_ldp(25, 26, 31, 32); a_ldp(27, 28, 31, 16);
+-    E(0xA8C00000u | 6u << 15 | 30u << 10 | 31u << 5 | 29u);                          /* ldp x29, x30, [sp], #48 */
++    spill_all_gpr(); /* Spill pinned ARM registers back to CPU struct */
++    a_ldp(27, 28, 31, 80);
++    a_ldp(25, 26, 31, 64);
++    a_ldp(23, 24, 31, 48);
++    a_ldp(21, 22, 31, 32);
++    a_ldp(19, 20, 31, 16);
++    a_ldp(29, 30, 31, 0);
++    a_addi(0, 31, 31, 96, 0); /* add sp, sp, #96 */
+     E(0xD65F03C0u);                                               /* ret */
+     jcur = jbase + JTRAMP;
+     j_sync_icache(jbase, jcur);
