@@ -638,6 +638,9 @@ static void undef(CPU*c, u32 i) {
 }
 static u64 rev_n(u64 v, int bytes) { u64 r = 0; for (int k = 0; k < bytes; k++) { r = (r << 8) | (v & 0xff); v >>= 8; } return r; }
 
+#ifdef PEMU_EMBED
+static void embed_hostcall(CPU *c);
+#endif
 static void step(CPU*c) {
     u64 pc = c->pc, npc = pc + 4;
     u32 i = *(u32*) pc;
@@ -700,6 +703,9 @@ static void step(CPU*c) {
             if (opc == 1) c->x[30] = pc + 4;
             npc = t;
         } else if ((i & 0xFFE0001F) == 0xD4000001) {           /* SVC */
+#ifdef PEMU_EMBED
+            if (((i >> 5) & 0xffff) == 0x7001) { c->pc = npc; embed_hostcall(c); return; }
+#endif
             c->pc = npc; do_svc(c); return;
         } else if ((i & 0xFF000000) == 0xD4000000) {           /* BRK etc. */
             c->pc = pc; raise(SIGTRAP); return;
@@ -1663,3 +1669,31 @@ int main(int argc, char**argv, char**envp) {
     if (g_jit) run_jit(&cpu); else run(&cpu);
     return 0;
 }
+
+#ifdef PEMU_EMBED
+/* ------------------------------------------------------------ embedding hook (self-tests only)
+ * Built with -DPEMU_EMBED -Dmain=<unused>, this file is linked next to pemu_x64.c compiled with
+ * -DPEMU_JIT_EMBED. pemu_x64's JIT then emits real AArch64 machine code, and that code is executed
+ * by the interpreter above instead of by a CPU, which lets the AArch64 back end be tested on an
+ * x86_64 machine. `svc #0x7001` is a host call: it calls the C function whose address is in x16
+ * with x0..x5 as arguments and returns the result in x0 (what `blr x16` does on real hardware). */
+static int embed_in_host; static CPU *embed_cur;
+static void embed_hostcall(CPU *c) {
+    typedef u64 (*fn6)(u64, u64, u64, u64, u64, u64);
+    fn6 f = (fn6) c->x[16];
+    embed_in_host++;
+    c->x[0] = f(c->x[0], c->x[1], c->x[2], c->x[3], c->x[4], c->x[5]);
+    embed_in_host--;
+}
+u64 pemu_embed_pc(void) { return (embed_cur && !embed_in_host) ? embed_cur->pc : 0; }
+void pemu_embed_clear(void) { embed_cur = NULL; embed_in_host = 0; }
+/* run AArch64 code at pc until it reaches `stop`; x[0..30] = registers, x[31] = sp (in/out) */
+void pemu_embed_run(u64 *x, u64 pc, u64 stop) {
+    static CPU ec;
+    memcpy(ec.x, x, 31 * 8); ec.sp = x[31]; ec.pc = pc; ec.nzcv = 0;
+    embed_in_host = 0; embed_cur = &ec;
+    while (ec.pc != stop) step(&ec);
+    memcpy(x, ec.x, 31 * 8); x[31] = ec.sp;
+    embed_cur = NULL;
+}
+#endif

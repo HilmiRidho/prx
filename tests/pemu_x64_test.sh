@@ -24,5 +24,6 @@ ARGS="arg1" run hello 3 -O1 -static "$D/hello.c" -lm
 ARGS="" run sig 0 -O1 -static "$D/sig.c" -lm
 ARGS="" run x87 0 -O1 -static "$D/x87.c" -lm
 ARGS="" run thread 0 -O1 -static -pthread "$D/thread.c"
+ARGS="" run jit 0 -O1 -static "$D/jit.c"
 [ $fail = 0 ] && echo "RESULT PASS" || echo "RESULT FAIL"
 exit $fail

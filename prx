@@ -128,9 +128,10 @@ info "Loader patch tool built successfully: $PRX_HOME/lib/ldpatch"
 case "$HARCH" in x86_64) PEMU_SRC=pemu.c ;; aarch64) PEMU_SRC=pemu_x64.c ;; *) PEMU_SRC= ;; esac
 if [ -n "$PEMU_SRC" ] && [ -f "$SRCDIR/$PEMU_SRC" ]; then
 pemu_tmp="$PRX_HOME/lib/pemu.tmp.$$"; pemu_log="$PRX_HOME/lib/pemu-build.log"
-# Try with -pthread first (guest threads), then without it (libcs where -pthread is unsupported).
+# Try with -pthread first (guest threads), then without it (libcs where -pthread is unsupported), then without the JIT.
 if "$cc" -O2 -o "$pemu_tmp" "$SRCDIR/$PEMU_SRC" -lm -pthread 2>"$pemu_log" \
-   || "$cc" -O2 -o "$pemu_tmp" "$SRCDIR/$PEMU_SRC" -lm 2>>"$pemu_log"; then
+   || "$cc" -O2 -o "$pemu_tmp" "$SRCDIR/$PEMU_SRC" -lm 2>>"$pemu_log" \
+   || "$cc" -O2 -DPEMU_NO_JIT -o "$pemu_tmp" "$SRCDIR/$PEMU_SRC" -lm -pthread 2>>"$pemu_log"; then
 mv -f "$pemu_tmp" "$PRX_HOME/lib/pemu"; rm -f "$pemu_log"
 info "Built-in emulator built: $PRX_HOME/lib/pemu (use PRX_QEMU=pemu)"
 else

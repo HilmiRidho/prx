@@ -6,7 +6,7 @@ DATADIR ?= $(PREFIX)/share/prx
 MANDIR  ?= $(PREFIX)/share/man/man1
 CC      ?= cc
 
-.PHONY: all install uninstall check lint clean pemu pemu-x64
+.PHONY: all install uninstall check lint clean pemu pemu-x64 pemu-x64-jit
 
 all:
 	@echo "Nothing to compile at install time: the shim is built per-user on first 'prx login' (or 'prx build')."
@@ -29,6 +29,14 @@ pemu: $(PEMU_SRC)
 pemu-x64: src/pemu_x64.c
 	$(CC) -O2 -Wall -o pemu-x64 src/pemu_x64.c -lm -pthread
 
+# Test build of the x86_64-guest JIT on a NON-aarch64 machine: the AArch64 code the JIT generates is executed by the
+# interpreter in src/pemu.c (built with -DPEMU_EMBED) instead of by a CPU. Slow, but it tests the real back end.
+pemu-x64-jit: src/pemu_x64.c src/pemu.c
+	$(CC) -O2 -Wall -DPEMU_JIT_EMBED -c -o pemu-x64-jit.o src/pemu_x64.c
+	$(CC) -O2 -DPEMU_EMBED -Dmain=a64_unused_main -c -o pemu-a64-embed.o src/pemu.c
+	$(CC) -o pemu-x64-jit pemu-x64-jit.o pemu-a64-embed.o -lm -pthread
+	@rm -f pemu-x64-jit.o pemu-a64-embed.o
+
 install:
 	install -Dm755 prx          $(DESTDIR)$(BINDIR)/prx
 	install -Dm644 src/prx.c     $(DESTDIR)$(DATADIR)/src/prx.c
@@ -49,6 +57,8 @@ lint:
 	@if command -v shellcheck >/dev/null 2>&1; then shellcheck -S warning -s bash prx tests/smoke.sh; else echo "shellcheck not installed, skipped"; fi
 	$(CC) -fsyntax-only -Wall -Wno-unused-function src/ldpatch.c
 	$(CC) -fsyntax-only -Wall src/pemu_x64.c
+	$(CC) -fsyntax-only -Wall -DPEMU_NO_JIT src/pemu_x64.c
+	@if [ "$$(uname -m)" != aarch64 ]; then $(CC) -fsyntax-only -Wall -DPEMU_JIT_EMBED src/pemu_x64.c; fi
 	@if [ "$$(uname -m)" = x86_64 ]; then $(CC) -fsyntax-only -Wall src/pemu.c; fi
 
 check: lint
@@ -56,9 +66,10 @@ check: lint
 	@if [ "$$(uname -m)" = x86_64 ]; then \
 		if command -v python3 >/dev/null 2>&1; then $(MAKE) --no-print-directory pemu && python3 tests/pemu_test.py ./pemu && python3 tests/pemu_fuzz.py ./pemu 200 1; fi; \
 		$(MAKE) --no-print-directory pemu-x64 && bash tests/pemu_x64_test.sh ./pemu-x64; \
+		if command -v python3 >/dev/null 2>&1; then $(MAKE) --no-print-directory pemu-x64-jit && bash tests/pemu_x64_test.sh ./pemu-x64-jit && python3 tests/pemu_x64_fuzz.py ./pemu-x64-jit 60 1; fi; \
 	elif [ "$$(uname -m)" = aarch64 ]; then \
-		$(MAKE) --no-print-directory pemu && bash tests/pemu_x64_test.sh ./pemu; \
+		$(MAKE) --no-print-directory pemu && bash tests/pemu_x64_test.sh ./pemu && if command -v python3 >/dev/null 2>&1; then python3 tests/pemu_x64_fuzz.py ./pemu 200 1; fi; \
 	fi
 
 clean:
-	rm -rf tests/.tmp pemu pemu-x64
+	rm -rf tests/.tmp pemu pemu-x64 pemu-x64-jit pemu-x64-jit.o pemu-a64-embed.o
