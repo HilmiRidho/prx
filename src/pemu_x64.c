@@ -18,8 +18,9 @@
  *
  * JIT (aarch64 hosts): guest basic blocks are translated to AArch64 code (see the "JIT" section below). Anything the
  * translator does not know runs through the interpreter from inside the translated block, so behaviour is identical.
- * Disable it with PEMU_JIT=0 or -nojit. The JIT switches itself off when the guest creates a second thread.
- * PEMU_JIT_OPT=<mask> (default 3) toggles optional translations: 1 = lazy flags for shift-by-immediate, 2 = scalar SSE float.
+ * Disable it with PEMU_JIT=0 or -nojit. The JIT works with guest threads (one shared cache, see JT).
+ * PEMU_JIT_OPT=<mask> (default 31) toggles optional translations: 1 = lazy flags for shift-by-immediate, 2 = scalar SSE float,
+ * 4 = guest rax..rdi pinned to host registers, 8 = superblocks, 16 = return stack buffer.
  * Not a security boundary. */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -69,12 +70,14 @@ enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI };
 #define DF_ 0x400
 #define OF_ 0x800
 
+#define RSB_N 64
 typedef struct {
     u64 r[16];
     u64 rip, rf, fs, gs;
     u64 la, lb, lr;                                   /* lazy arithmetic flags: operands/result of the last add/sub/logic op */
     union { struct { u8 lop, lsz, lcin; }; u64 lmeta; };   /* lmeta = lop | lsz << 8 | lcin << 16 (the JIT stores it in one go) */
-    u64 patch;                                        /* JIT: chain patch site left by an exit stub */
+    u64 patch;                                        /* JIT: chain patch site left by an exit stub (bit 0: it is a bl); 1 = interpret one instruction */
+    u64 rsbi; u64 rsb[RSB_N][2];                      /* JIT return stack buffer: ring of (guest return address, host continuation) pairs, filled by call, checked by ret */
     V x[16] __attribute__((aligned(16)));
     u32 mxcsr; u16 fcw, fsw;
     long double st[8]; int top;
@@ -88,12 +91,17 @@ static int g_trace;
 static char g_self[4096];
 static u64 g_tramp;
 #ifdef HAVE_JIT
-static volatile int g_jit_on;                 /* JIT active (cleared when the guest creates a thread) */
-static u64 jit_pc2rip(void*uctx);
+static volatile int g_jit_on;                 /* JIT active */
+static void jit_fault(void*uctx, CPU*c);
 static void jit_post_syscall(CPU*c, u64 n, long r);
 static void jit_note_rwx(u64 start, u64 len);
-static void jit_disable(void);
 static void jit_report(void);
+static void jit_thread_init(void);
+static void jit_thread_exit(void);
+static void jit_region_abort(void);
+static void jit_rsb_clear(CPU *c);
+static void jit_mt_enable(void);
+static void jit_atfork(int phase);
 #endif
 
 /* ------------------------------------------------------------ helpers */
@@ -296,7 +304,7 @@ static void hsys(int s, siginfo_t*si, void*u) {
 static void hsig(int s, siginfo_t*si, void*u) { (void) u; if (si) pinfo[s] = *si; __atomic_or_fetch(PENDP(), 1ULL << s, __ATOMIC_SEQ_CST); }
 static void hsegv(int s, siginfo_t*si, void*u) {
 #ifdef HAVE_JIT
-    if (g_jit_on) { u64 r = jit_pc2rip(u); if (r) g_cur->rip = r; }       /* fault inside translated code: recover the guest rip */
+    if (g_jit_on) jit_fault(u, g_cur);                                     /* fault inside translated code: recover the guest rip */
 #else
     (void) u;
 #endif
@@ -483,6 +491,9 @@ static long pass_nr(u64 n) {
 static void run(CPU*c);
 typedef struct { CPU cpu; u64 flags, ptid, ctid; volatile int*tidout; } ThArg;
 static void thread_exit(CPU*c) {
+#ifdef HAVE_JIT
+    if (g_jit_on) jit_thread_exit();
+#endif
     if (g_clear_tid) {
         __atomic_store_n((u32*) g_clear_tid, 0, __ATOMIC_SEQ_CST);
         syscall(SYS_futex, g_clear_tid, FUTEX_WAKE, 1, NULL, NULL, 0);
@@ -506,7 +517,7 @@ static long clone_thread(CPU*c, u64 flags, u64 stack, u64 ptid, u64 ctid, u64 tl
     ThArg*t = malloc(sizeof *t);
     if (!t) return -ENOMEM;
 #ifdef HAVE_JIT
-    if (g_jit_on) jit_disable();                          /* the code cache is not shared safely between threads: go back to the interpreter */
+    if (g_jit_on) jit_mt_enable();                        /* translated code from now on carries the memory barriers of x86 ordering */
 #endif
     __atomic_store_n(&g_mt, 1, __ATOMIC_SEQ_CST);        /* from now on emulate x86 memory ordering (see mrd/mwr) */
     t->cpu = *c; t->flags = flags; t->ptid = ptid; t->ctid = ctid; volatile int tidv = 0; t->tidout = &tidv;
@@ -635,8 +646,14 @@ static long gsys(CPU*c, int*noset) {
     case 56: case 57: case 58: {                      /* clone / fork / vfork */
         u64 flags = n == 56 ? a0 : SIGCHLD;
         if (flags & 0x10000 /*CLONE_THREAD*/) return clone_thread(c, flags, a1, a2, a3, a4);
-        long pid = fork();
-        if (pid < 0) return -errno;
+#ifdef HAVE_JIT
+        if (g_jit_on) jit_atfork(0);                  /* no other thread may hold the JIT lock across the fork */
+#endif
+        long pid = fork(); int fe = errno;
+#ifdef HAVE_JIT
+        if (g_jit_on) jit_atfork(pid == 0 ? 2 : 1);
+#endif
+        if (pid < 0) return -fe;
         if (pid == 0) {
             if (n == 56 && a1) c->r[RSP] = a1;
             if (n == 56 && (flags & 0x01000000)) *(u32*) a3 = (u32) getpid();     /* CHILD_SETTID: ctid */
@@ -1499,23 +1516,29 @@ static void step(CPU*c) {
  * Block-translating JIT, modelled on the one in pemu.c (the other direction). A block is a run of guest
  * instructions that ends at a branch, call, return, syscall or after JMAXI instructions.
  *
- *  - Guest registers stay in the CPU struct (x28 points at it), so every translated instruction loads its inputs
- *    from and stores its results to memory. That keeps the fallback trivial: an instruction the translator does not
- *    know is executed by the interpreter (step()) through a helper call, in the middle of a translated block, and
- *    guest state is always consistent at such a call.
+ *  - Guest rax..rdi are pinned to host x19-x25,x29 while translated code runs; the other registers stay in the CPU
+ *    struct (x28 points at it). The pinned ones are written back when the code is left and around a fallback: an
+ *    instruction the translator does not know is executed by the interpreter (step()) through a helper call, in the
+ *    middle of a translated block, and guest state is always consistent at such a call. After a fault the pinned
+ *    registers are read from the signal context (jit_fault).
  *  - Arithmetic flags stay lazy, exactly as in the interpreter (la/lb/lr/lmeta). When the next instruction of the
  *    block reads the flags (jcc, setcc, cmovcc) the host flags (NZCV) of the producing instruction are used directly
  *    (cmp + b.cond). The lazy fields are only written when the flags can still be observed (liveness within the
  *    block; flags are assumed live at a block exit) and always before anything that can
  *    fault or call a helper, so a fault or a signal sees exact flags.
- *  - Direct branches are chained (patched on first use); indirect ones use a direct-mapped inline cache. Pending
- *    signals are polled on backward and indirect branches and after every syscall.
+ *  - Blocks are superblocks: direct jmp and forward jcc on the same page are followed (a jcc's taken path is an out-of-line
+ *    side exit), and a call continues inline after the callee returns. Direct branches are chained (patched on first use);
+ *    indirect ones use a per-thread direct-mapped inline cache. call = host bl + a push on the return stack buffer in the
+ *    CPU struct, ret = pop + compare + host ret (inline cache on a mismatch). Pending signals are polled on backward and
+ *    indirect branches and after every syscall.
  *  - Faults in translated code are mapped back to the guest rip through a host-pc -> guest-rip table.
  *  - The cache is flushed when the guest unmaps, re-protects or MAP_FIXED-overwrites pages that were translated.
  *    Pages that are writable and executable at the same time are never translated (x86 needs no explicit flush
- *    for self-modifying code), they are interpreted. The JIT turns itself off when a second guest thread appears.
+ *    for self-modifying code), they are interpreted. Instructions that end a block and are not translated (syscall, ...) are
+ *    interpreted by the dispatcher outside the cache.
  *
- * Register use of translated code:  x28 CPU*   x27 &pend   x26 inline cache
+ * Register use of translated code:  x28 CPU*   x27 &pending word of the thread   x26 inline cache of the thread
+ *   x19-x25,x29 guest rax,rcx,rdx,rbx,rsp,rbp,rsi,rdi
  *   x9,x10,x11  flag operands a,b,result of the last flag-producing instruction (kept for the lazy spill)
  *   x12,x13     effective address scratch      x0-x8,x14,x15  scratch       x16,x17  call / spill scratch
  *
@@ -1526,6 +1549,7 @@ static void step(CPU*c) {
 #ifdef PEMU_JIT_EMBED
 extern void pemu_embed_run(u64 *x, u64 pc, u64 stop);
 extern u64 pemu_embed_pc(void);
+extern u64 pemu_embed_x(int n);
 extern void pemu_embed_clear(void);
 #endif
 
@@ -1534,10 +1558,10 @@ extern void pemu_embed_clear(void);
 #define JH_BITS    18
 #define JIC_BITS   13
 #define JPG_BITS   15
-#define JMAXI      48                   /* guest instructions per block */
+#define JMAXI      64                   /* guest instructions per block */
 #define JMAP_CAP   (4u << 20)
 #define JRWX_MAX   64
-#define JBLOCK_MAX 6144                 /* words a block may need at most; the cache is flushed when less is left */
+#define JBLOCK_MAX 8192                 /* words a block may need at most; the cache is flushed when less is left */
 
 #define RCPU  28
 #define RPEND 27
@@ -1551,24 +1575,52 @@ extern void pemu_embed_clear(void);
 #define OFF_LR     ((u32) offsetof(CPU, lr))
 #define OFF_LMETA  ((u32) offsetof(CPU, lmeta))
 #define OFF_PATCH  ((u32) offsetof(CPU, patch))
+#define OFF_RSBI   ((u32) offsetof(CPU, rsbi))
+#define OFF_RSB    ((int) offsetof(CPU, rsb))      /* must stay below 512: ldp/stp immediate */
 
 typedef struct { u64 pc; u32 *code; } JEnt;
 static u32 *jbase, *jcur, *jlim, *jenter, *jepi;
-static JEnt *jh, *jic;
+static JEnt *jh;
 static u32 jhn, jmapn, jpgn, jrwxn;
 static u32 *jm_off; static u64 *jm_pc, *jpg;
 static u64 jrwx[JRWX_MAX][2]; static int jrwx_over;
 static volatile int g_jflush_req;
+/* ---- one code cache shared by all guest threads.
+ *  - Translation and flushing are serialised by jmu. Looking blocks up is lock-free (a block is published into jh only
+ *    when it is complete; jh entries are written code first, pc last, with release/acquire).
+ *  - Every thread has its own inline cache (its x26) and its own pending-signal word (its x27), so a signal that
+ *    arrives on a thread is delivered on that thread, as in the interpreter.
+ *  - A flush needs every other thread out of the cache (stop-the-world): the flusher sets g_jstop and bit 0 of every
+ *    thread's pending word (translated code polls that word on backward and indirect branches and leaves the cache),
+ *    then waits until no thread is 'active'. A thread is active from the moment it relies on a pointer into the cache
+ *    (block lookup, chain patching) until it is back in C; system calls and the interpreter run while not active, so a
+ *    thread blocked in a futex never delays a flush. g_jgen counts flushes: a thread that sees a new generation clears
+ *    its inline cache (and the other per-thread pointers into the old cache) before it enters the cache again. */
+typedef struct JT { volatile int active; volatile u64 *pp; JEnt *ic; u32 gen; struct JT *next; } JT;
+static __thread JT t_jt;
+static JT *jreg;                                               /* every registered thread; protected by jmu */
+static pthread_mutex_t jmu = PTHREAD_MUTEX_INITIALIZER;
+static volatile int g_jstop;
+static volatile u32 g_jgen;
+static int g_jmt;                                              /* the guest has more than one thread: translated code carries x86 memory-ordering barriers */
+static u32 *jt_start; static u64 jt_pc;                        /* block being translated (visible to its own chained exits only) */
 static unsigned long long jst_blocks, jst_flush, jst_chain, jst_ins, jst_words;
 static int g_jstats;
 #define JOPT_SHFL 1u                    /* flags of shift-by-immediate kept lazy instead of running the interpreter */
 #define JOPT_FP   2u                    /* scalar SSE float: movss/movsd, add/sub/mul/div/sqrt ss/sd, cvtsi2ss/sd */
-static unsigned g_jopt = JOPT_SHFL | JOPT_FP;   /* PEMU_JIT_OPT=<mask> overrides (0 = neither): handy to bisect a misbehaving guest */
+#define JOPT_PIN  4u                    /* guest rax..rdi live in host registers while translated code runs */
+#define JOPT_SB   8u                    /* superblocks: translation continues across direct jmp and forward jcc */
+#define JOPT_RSB  16u                   /* return stack buffer: call/ret are host bl/ret, checked against a shadow stack */
+static unsigned g_jopt = JOPT_SHFL | JOPT_FP | JOPT_PIN | JOPT_SB | JOPT_RSB;   /* PEMU_JIT_OPT=<mask> overrides (0 = none): handy to bisect a misbehaving guest */
+/* Register pinning: guest rax,rcx,rdx,rbx,rsp,rbp,rsi,rdi (numbers 0..7) are kept in callee-saved host registers, so
+ * they survive helper calls and chained block-to-block branches. The CPU struct is only written back when translated
+ * code is left (jepi), around an interpreter fallback (j_pin_spill / j_pin_fill) and, after a fault, from the signal
+ * context (jit_fault). r8..r15 stay in memory. */
+static const u8 jpin_reg[8] = { 19, 20, 21, 22, 23, 24, 25, 29 };
+static int g_jpin;
+static inline int pin(int n) { return (g_jpin && n >= 0 && n < 8) ? jpin_reg[n] : -1; }
 static unsigned long long jdyn[512], jst_dyn;                     /* statistics: interpreter fallbacks EXECUTED, by opcode (jfbh below counts translated sites) */
 static unsigned jfbh[512], jst_fb;                               /* statistics: interpreter fallbacks by opcode (0x100 + x for 0F xx) */
-#ifdef PEMU_JIT_EMBED
-static u64 jemb_stack[8192];
-#endif
 
 /* ------------------------------------------------------------ AArch64 encoders */
 static inline void E(u32 w) { *jcur++ = w; }
@@ -1618,6 +1670,7 @@ static void a_shv(int sf, int op, int rd, int rn, int rm) { E(SFB(sf) | 0x1AC020
 static void a_bfm(int sf, int sbfm, int rd, int rn, int immr, int imms) {
     E(SFB(sf) | (sbfm ? 0x13000000u : 0x53000000u) | (sf ? 0x400000u : 0) | (u32) immr << 16 | (u32) imms << 10 | (u32) rn << 5 | (u32) rd);
 }
+static void a_bfi(int rd, int rn, int lsb, int width) { E(0xB3400000u | (u32)((64 - lsb) & 63) << 16 | (u32)(width - 1) << 10 | (u32) rn << 5 | (u32) rd); }   /* bfi xd, xn, #lsb, #width */
 static void a_lsl(int sf, int rd, int rn, int n) { int b = sf ? 64 : 32; a_bfm(sf, 0, rd, rn, (b - n) & (b - 1), b - 1 - n); }
 static void a_lsr(int sf, int rd, int rn, int n) { a_bfm(sf, 0, rd, rn, n, sf ? 63 : 31); }
 static void a_asr(int sf, int rd, int rn, int n) { a_bfm(sf, 1, rd, rn, n, sf ? 63 : 31); }
@@ -1635,6 +1688,9 @@ static void a_b(u32 *t) { E(0x14000000u | ((u32)(t - jcur) & 0x3ffffff)); }
 static u32 *a_bcond_fwd(int cc) { E(0x54000000u | (u32) cc); return jcur - 1; }        /* patched with jpatch19 */
 static u32 *a_cbz_fwd(int nz, int rt) { E((nz ? 0xB5000000u : 0xB4000000u) | (u32) rt); return jcur - 1; }
 static void jpatch19(u32 *at) { *at |= ((u32)(jcur - at) & 0x7ffff) << 5; }
+static void a_adr_at(u32 *at, int rd, u32 *target) { s64 d = (s64)((u8*) target - (u8*) at); *at = 0x10000000u | ((u32) d & 3) << 29 | (((u32)(d >> 2)) & 0x7ffff) << 5 | (u32) rd; }
+static void a_bl(u32 *t) { E(0x94000000u | ((u32)(t - jcur) & 0x3ffffff)); }
+static void a_ret(void) { E(0xD65F03C0u); }
 static void a_br(int rn) { E(0xD61F0000u | (u32) rn << 5); }
 static void a_adr(int rd, u32 *target) { s64 d = (s64)((u8*) target - (u8*) jcur); E(0x10000000u | ((u32) d & 3) << 29 | (((u32)(d >> 2)) & 0x7ffff) << 5 | (u32) rd); }
 static void j_callabs(void *f) {                                /* call a C helper; x0..x5 = arguments */
@@ -1657,6 +1713,12 @@ static void j_sync_icache(void *a, void *b) {
 static void c_ld(int rt, u32 off) { a_ldst_u(3, 1, rt, RCPU, off); }
 static void c_st(int rt, u32 off) { a_ldst_u(3, 0, rt, RCPU, off); }
 static void g_ld(int rt, int n, int sz, int rex) {              /* guest register n, zero-extended, into rt */
+    int hb = (sz == 1 && !rex && n >= 4 && n < 8) ? pin(n - 4) : -1, h = pin(n);
+    if (hb >= 0) { a_bfm(1, 0, rt, hb, 8, 15); return; }          /* ah, ch, dh, bh */
+    if (h >= 0 && !(sz == 1 && !rex && n >= 4 && n < 8)) {
+        switch (sz) { case 8: a_mov(rt, h); break; case 4: a_movw(rt, h); break; case 2: a_andmask(rt, h, 16); break; default: a_andmask(rt, h, 8); }
+        return;
+    }
     u32 off = OFF_R(n);
     switch (sz) {
     case 8: a_ldst_u(3, 1, rt, RCPU, off); break;
@@ -1666,6 +1728,12 @@ static void g_ld(int rt, int n, int sz, int rex) {              /* guest registe
     }
 }
 static void g_st(int rt, int n, int sz, int rex) {              /* sz 4 and 8 write the whole register: rt must hold a zero-extended value */
+    int hb = (sz == 1 && !rex && n >= 4 && n < 8) ? pin(n - 4) : -1, h = pin(n);
+    if (hb >= 0) { a_bfi(hb, rt, 8, 8); return; }
+    if (h >= 0 && !(sz == 1 && !rex && n >= 4 && n < 8)) {
+        switch (sz) { case 8: case 4: if (rt != h) a_mov(h, rt); break; case 2: a_bfi(h, rt, 0, 16); break; default: a_bfi(h, rt, 0, 8); }
+        return;
+    }
     u32 off = OFF_R(n);
     switch (sz) {
     case 8: case 4: a_ldst_u(3, 0, rt, RCPU, off); break;
@@ -1673,15 +1741,31 @@ static void g_st(int rt, int n, int sz, int rex) {              /* sz 4 and 8 wr
     default: if (!rex && n >= 4 && n < 8) off = OFF_R(n - 4) + 1; a_ldst_u(0, 0, rt, RCPU, off);
     }
 }
+static void g_ldx(int rt, int n, int sz2, int sx, int dsz, int rex) {   /* low sz2 bytes of guest register n, zero- or sign-extended (to dsz) into rt */
+    int lo = 0, rn = n;
+    if (sz2 == 1 && !rex && n >= 4 && n < 8) { rn = n - 4; lo = 8; }
+    int h = pin(rn);
+    if (h < 0) {
+        int size = sz2 == 1 ? 0 : sz2 == 2 ? 1 : 2;
+        a_ldst_u(size, !sx ? 1 : (dsz == 8 ? 2 : 3), rt, RCPU, OFF_R(rn) + (lo ? 1u : 0u)); return;
+    }
+    a_bfm(sx && dsz == 8, sx, rt, h, lo, lo + sz2 * 8 - 1);
+}
+static void j_pin_spill(void) { if (g_jpin) { a_stp(19, 20, RCPU, (int) OFF_R(0)); a_stp(21, 22, RCPU, (int) OFF_R(2)); a_stp(23, 24, RCPU, (int) OFF_R(4)); a_stp(25, 29, RCPU, (int) OFF_R(6)); } }
+static void j_pin_fill(void)  { if (g_jpin) { a_ldp(19, 20, RCPU, (int) OFF_R(0)); a_ldp(21, 22, RCPU, (int) OFF_R(2)); a_ldp(23, 24, RCPU, (int) OFF_R(4)); a_ldp(25, 29, RCPU, (int) OFF_R(6)); } }
+/* x86 memory ordering for guests with more than one thread (g_jmt): loads are followed by a load barrier, stores are
+ * preceded by a full barrier (only store->load reordering is allowed on x86). Single-threaded guests pay nothing. */
+static void a_dmb_ld(void) { if (g_jmt) E(0xD50339BFu); }               /* dmb ishld */
+static void a_dmb_st(void) { if (g_jmt) E(0xD5033BBFu); }               /* dmb ish */
 static void m_ld(int sz, int sgn, int sf, int rt, int rn, int off) {      /* guest memory, [rn + off], off in -256..255 */
     int size = sz == 1 ? 0 : sz == 2 ? 1 : sz == 4 ? 2 : 3;
-    a_ldst_s(size, !sgn ? 1 : (sf ? 2 : 3), rt, rn, off);
+    a_ldst_s(size, !sgn ? 1 : (sf ? 2 : 3), rt, rn, off); a_dmb_ld();
 }
 #define OFF_X(n) ((u32) offsetof(CPU, x) + 16u * (u32)(n))
 static void q_ldc(int vt, u32 off) { E(0x3DC00000u | ((off >> 4) & 0xfff) << 10 | (u32) RCPU << 5 | (u32) vt); }       /* ldr qt, [cpu, #off] */
 static void q_stc(int vt, u32 off) { E(0x3D800000u | ((off >> 4) & 0xfff) << 10 | (u32) RCPU << 5 | (u32) vt); }       /* str qt, [cpu, #off] */
-static void q_ldm(int vt, int rn, int off) { E(0x3CC00000u | ((u32) off & 0x1ff) << 12 | (u32) rn << 5 | (u32) vt); }  /* ldur qt, [rn, #off] */
-static void q_stm(int vt, int rn, int off) { E(0x3C800000u | ((u32) off & 0x1ff) << 12 | (u32) rn << 5 | (u32) vt); }  /* stur qt, [rn, #off] */
+static void q_ldm(int vt, int rn, int off) { E(0x3CC00000u | ((u32) off & 0x1ff) << 12 | (u32) rn << 5 | (u32) vt); a_dmb_ld(); }  /* ldur qt, [rn, #off] */
+static void q_stm(int vt, int rn, int off) { a_dmb_st(); E(0x3C800000u | ((u32) off & 0x1ff) << 12 | (u32) rn << 5 | (u32) vt); }  /* stur qt, [rn, #off] */
 static void q_log(int op, int vd, int vn, int vm) {                      /* 0 eor 1 orr 2 and 3 bic: vd = vn op vm (16b) */
     static const u32 base[4] = { 0x6E201C00u, 0x4EA01C00u, 0x4E201C00u, 0x4E601C00u };
     E(base[op] | (u32) vm << 16 | (u32) vn << 5 | (u32) vd);
@@ -1693,8 +1777,8 @@ static void q_v3(int kind, int size, int vd, int vn, int vm) {          /* 0 add
 /* scalar float: sz 8 = double (d regs), 4 = single (s regs). Loads/stores touch only the low sz bytes of the xmm slot. */
 static void f_ldc(int sz, int vt, u32 off) { E((sz == 8 ? 0xFD400000u : 0xBD400000u) | ((off >> (sz == 8 ? 3 : 2)) & 0xfff) << 10 | (u32) RCPU << 5 | (u32) vt); }   /* ldr dt/st, [cpu, #off] */
 static void f_stc(int sz, int vt, u32 off) { E((sz == 8 ? 0xFD000000u : 0xBD000000u) | ((off >> (sz == 8 ? 3 : 2)) & 0xfff) << 10 | (u32) RCPU << 5 | (u32) vt); }   /* str dt/st, [cpu, #off] */
-static void f_ldm(int sz, int vt, int rn, int off) { E((sz == 8 ? 0xFC400000u : 0xBC400000u) | ((u32) off & 0x1ff) << 12 | (u32) rn << 5 | (u32) vt); }          /* ldur dt/st, [rn, #off] (zeroes the rest of vt) */
-static void f_stm(int sz, int vt, int rn, int off) { E((sz == 8 ? 0xFC000000u : 0xBC000000u) | ((u32) off & 0x1ff) << 12 | (u32) rn << 5 | (u32) vt); }          /* stur dt/st, [rn, #off] */
+static void f_ldm(int sz, int vt, int rn, int off) { E((sz == 8 ? 0xFC400000u : 0xBC400000u) | ((u32) off & 0x1ff) << 12 | (u32) rn << 5 | (u32) vt); a_dmb_ld(); }          /* ldur dt/st, [rn, #off] (zeroes the rest of vt) */
+static void f_stm(int sz, int vt, int rn, int off) { a_dmb_st(); E((sz == 8 ? 0xFC000000u : 0xBC000000u) | ((u32) off & 0x1ff) << 12 | (u32) rn << 5 | (u32) vt); }          /* stur dt/st, [rn, #off] */
 static void f_arith(int t, int sz, int vd, int vn, int vm) {             /* t: 0 fadd 1 fmul 2 fsub 3 fdiv 4 fsqrt (vd = sqrt(vm)) */
     static const u32 opc[4] = { 0x2, 0x0, 0x3, 0x1 };
     u32 ty = sz == 8 ? 1u << 22 : 0;
@@ -1704,7 +1788,7 @@ static void f_arith(int t, int sz, int vd, int vn, int vm) {             /* t: 0
 static void f_scvtf(int sz, int src64, int vd, int rn) { E(0x1E220000u | (src64 ? 0x80000000u : 0u) | (sz == 8 ? 1u << 22 : 0u) | (u32) rn << 5 | (u32) vd); }   /* scvtf dd/sd, xn/wn */
 static void m_st(int sz, int rt, int rn, int off) {
     int size = sz == 1 ? 0 : sz == 2 ? 1 : sz == 4 ? 2 : 3;
-    a_ldst_s(size, 0, rt, rn, off);
+    a_dmb_st(); a_ldst_s(size, 0, rt, rn, off);
 }
 
 /* ------------------------------------------------------------ block cache */
@@ -1712,12 +1796,18 @@ static inline u32 hpc(u64 pc, int bits) { return (u32)((pc * 0x9E3779B97F4A7C15U
 static inline u32 icidx(u64 pc) { return (u32)((pc ^ (pc >> 13)) & ((1u << JIC_BITS) - 1)); }
 static u32 *jfind(u64 pc) {
     u32 h = hpc(pc, JH_BITS);
-    for (;;) { if (jh[h].pc == pc) return jh[h].code; if (!jh[h].pc) return NULL; h = (h + 1) & ((1u << JH_BITS) - 1); }
+    for (;;) {
+        u64 k = __atomic_load_n(&jh[h].pc, __ATOMIC_ACQUIRE);
+        if (k == pc) return jh[h].code;
+        if (!k) return NULL;
+        h = (h + 1) & ((1u << JH_BITS) - 1);
+    }
 }
-static void jins(u64 pc, u32 *code) {
+static u32 *jfind_emit(u64 pc) { return pc == jt_pc && jt_start ? jt_start : jfind(pc); }      /* while translating: the block under construction is a valid target */
+static void jins(u64 pc, u32 *code) {                           /* jmu held; the block is complete */
     u32 h = hpc(pc, JH_BITS);
     while (jh[h].pc) h = (h + 1) & ((1u << JH_BITS) - 1);
-    jh[h].pc = pc; jh[h].code = code; jhn++;
+    jh[h].code = code; __atomic_store_n(&jh[h].pc, pc, __ATOMIC_RELEASE); jhn++;
 }
 static void jpg_add(u64 page) {
     u64 k = page | (1ULL << 63); u32 h = hpc(page << 12, JPG_BITS);
@@ -1735,20 +1825,20 @@ static int jit_has_code(u64 addr, u64 len) {
     for (u32 k = 0; k < (1u << JPG_BITS); k++) if (jpg[k]) { u64 p = jpg[k] & ~(1ULL << 63); if (p >= p0 && p <= p1) return 1; }
     return 0;
 }
-static void jflush(void) {
+static void jflush(void) {                                      /* only through jit_stw_flush(): no thread is in the cache */
     jcur = jbase + JTRAMP;
-    memset(jh, 0, sizeof(JEnt) << JH_BITS); memset(jic, 0, sizeof(JEnt) << JIC_BITS); memset(jpg, 0, sizeof(u64) << JPG_BITS);
-    jhn = jmapn = jpgn = 0; g_cur->patch = 0; jst_flush++;
+    memset(jh, 0, sizeof(JEnt) << JH_BITS); memset(jpg, 0, sizeof(u64) << JPG_BITS);
+    jhn = jmapn = jpgn = 0; jst_flush++;
 }
 static int jit_is_rwx(u64 pc) {
     if (jrwx_over) return 1;
-    u64 p = pc & ~4095ULL;
-    for (u32 k = 0; k < jrwxn; k++) if (p < jrwx[k][1] && p + 4096 > jrwx[k][0]) return 1;
+    u64 p = pc & ~4095ULL; u32 nr = __atomic_load_n(&jrwxn, __ATOMIC_ACQUIRE);
+    for (u32 k = 0; k < nr; k++) if (p < jrwx[k][1] && p + 4096 > jrwx[k][0]) return 1;
     return 0;
 }
-static void jit_note_rwx(u64 start, u64 len) {
-    if (jrwxn < JRWX_MAX) { jrwx[jrwxn][0] = start; jrwx[jrwxn][1] = start + len; jrwxn++; } else jrwx_over = 1;
-    if (jbase && jit_has_code(start, len)) g_jflush_req = 1;
+static void jit_note_rwx(u64 start, u64 len) {                  /* jmu held */
+    if (jrwxn < JRWX_MAX) { jrwx[jrwxn][0] = start; jrwx[jrwxn][1] = start + len; __atomic_store_n(&jrwxn, jrwxn + 1, __ATOMIC_RELEASE); } else jrwx_over = 1;
+    if (jbase && jit_has_code(start, len)) __atomic_store_n(&g_jflush_req, 1, __ATOMIC_RELEASE);
 }
 
 /* ------------------------------------------------------------ decoder (static, no guest state) */
@@ -1764,7 +1854,12 @@ typedef struct { int reg, rm, ismem; } JM;
 
 static inline s32 rd32s(const u8*p) { s32 v; memcpy(&v, p, 4); return v; }
 static inline s16 rd16s(const u8*p) { s16 v; memcpy(&v, p, 2); return v; }
-static inline int jterm(const JI*j) { return j->op >= JO_JMP || j->op == JO_FBT; }
+/* JI.cnt on jcc/call/calli/nop: the superblock continues after this instruction (jcc: on the fall-through path, side exit when taken;
+ * call/calli: after the callee returns, through the return stack buffer; nop: a followed backward jmp that must poll for signals) */
+static inline int jterm(const JI*j) {
+    if ((j->op == JO_JCC || j->op == JO_CALL || j->op == JO_CALLI) && j->cnt) return 0;
+    return j->op >= JO_JMP || j->op == JO_FBT;
+}
 
 static void jmodrm(const u8 **pp, JI *j, JM *m, int immbytes) {      /* same semantics as modrm() but static */
     const u8 *p = *pp; u8 b = *p++; int rex = j->rex, ripr = 0, mod = b >> 6;
@@ -2086,25 +2181,32 @@ static int jmapcc(int x86cc, int *cc) {
     *cc = v; return 0;
 }
 
-static void j_ea(const JI *j, int *rb, int *roff) {   /* address = x[*rb] + *roff, *roff in -256..255; uses x12, x13 */
+static void j_ea(const JI *j, int *rb, int *roff) {   /* address = x[*rb] + *roff, *roff in -256..255; uses x12, x13 (*rb may be a pinned register) */
     s64 d = j->disp;
     if (j->base < 0 && j->index < 0) {
         a_movi(12, (u64) d);
         if (j->seg) { c_ld(13, j->seg == 1 ? OFF_FS : OFF_GS); a_addsh(12, 12, 13, 0); }
         *rb = 12; *roff = 0; return;
     }
-    int have = 0;
-    if (j->base >= 0) { c_ld(12, OFF_R(j->base)); have = 1; }
-    if (j->index >= 0) {
-        c_ld(13, OFF_R(j->index));
-        if (have) a_addsh(12, 12, 13, j->scale); else a_lsl(1, 12, 13, j->scale);
+    int rbase = -1, ridx = -1, cur;
+    if (j->base >= 0) { int h = pin(j->base); if (h >= 0) rbase = h; else { c_ld(12, OFF_R(j->base)); rbase = 12; } }
+    if (j->index >= 0) { int h = pin(j->index); if (h >= 0) ridx = h; else { c_ld(13, OFF_R(j->index)); ridx = 13; } }
+    if (rbase >= 0 && ridx >= 0) { a_addsh(12, rbase, ridx, j->scale); cur = 12; }
+    else if (rbase >= 0) cur = rbase;
+    else { a_lsl(1, 12, ridx, j->scale); cur = 12; }
+    if (j->seg) { c_ld(13, j->seg == 1 ? OFF_FS : OFF_GS); a_addsh(12, cur, 13, 0); cur = 12; }
+    if (d >= -256 && d <= 255) { *rb = cur; *roff = (int) d; return; }
+    if (d > 0 && d < (1 << 24)) {
+        if (d & 0xfff) { a_addi(0, 12, cur, (u32) d & 0xfff, 0); cur = 12; }
+        if (d >> 12) { a_addi(0, 12, cur, (u32)(d >> 12), 1); cur = 12; }
     }
-    if (j->seg) { c_ld(13, j->seg == 1 ? OFF_FS : OFF_GS); a_addsh(12, 12, 13, 0); }
-    if (d >= -256 && d <= 255) { *rb = 12; *roff = (int) d; return; }
-    if (d > 0 && d < (1 << 24)) { if (d & 0xfff) a_addi(0, 12, 12, (u32) d & 0xfff, 0); if (d >> 12) a_addi(0, 12, 12, (u32)(d >> 12), 1); }
-    else if (d < 0 && d > -(1 << 24)) { u32 mm = (u32) -d; if (mm & 0xfff) a_addi(1, 12, 12, mm & 0xfff, 0); if (mm >> 12) a_addi(1, 12, 12, mm >> 12, 1); }
-    else { a_movi(13, (u64) d); a_addsh(12, 12, 13, 0); }
-    *rb = 12; *roff = 0;
+    else if (d < 0 && d > -(1 << 24)) {
+        u32 mm = (u32) -d;
+        if (mm & 0xfff) { a_addi(1, 12, cur, mm & 0xfff, 0); cur = 12; }
+        if (mm >> 12) { a_addi(1, 12, cur, mm >> 12, 1); cur = 12; }
+    }
+    else { a_movi(13, (u64) d); a_addsh(12, cur, 13, 0); cur = 12; }
+    *rb = cur; *roff = 0;
 }
 static inline u64 szmask(int sz) { return sz == 8 ? ~0ULL : (1ULL << (sz * 8)) - 1; }
 static void j_opld(int rt, const JI *j, int which, int sz, int rb, int off) {
@@ -2116,13 +2218,21 @@ static void j_opld(int rt, const JI *j, int which, int sz, int rb, int off) {
 static void j_opst(int rt, const JI *j, int sz, int rb, int off) {
     if (j->at == OT_REG) g_st(rt, j->ar, sz, j->rex); else m_st(sz, rt, rb, off);
 }
-static void j_push(int rv) { c_ld(1, OFF_R(RSP)); a_addi(1, 1, 1, 8, 0); a_ldst_s(3, 0, rv, 1, 0); c_st(1, OFF_R(RSP)); }
-static void j_pop(int rv) { c_ld(1, OFF_R(RSP)); a_ldst_s(3, 1, rv, 1, 0); a_addi(0, 1, 1, 8, 0); c_st(1, OFF_R(RSP)); }
+static void j_push(int rv) {                                    /* the store comes first: a fault leaves rsp unchanged */
+    int hs = pin(RSP);
+    if (hs >= 0) { a_dmb_st(); a_ldst_s(3, 0, rv, hs, -8); a_addi(1, hs, hs, 8, 0); return; }
+    c_ld(1, OFF_R(RSP)); a_addi(1, 1, 1, 8, 0); a_dmb_st(); a_ldst_s(3, 0, rv, 1, 0); c_st(1, OFF_R(RSP));
+}
+static void j_pop(int rv) {
+    int hs = pin(RSP);
+    if (hs >= 0) { a_ldst_s(3, 1, rv, hs, 0); a_dmb_ld(); a_addi(0, hs, hs, 8, 0); return; }
+    c_ld(1, OFF_R(RSP)); a_ldst_s(3, 1, rv, 1, 0); a_dmb_ld(); a_addi(0, 1, 1, 8, 0); c_st(1, OFF_R(RSP));
+}
 
 static void j_fb(const JI *j) {                       /* run one instruction through the interpreter */
-    a_movi(0, j->ip); c_st(0, OFF_RIP); a_mov(0, RCPU);
+    a_movi(0, j->ip); c_st(0, OFF_RIP); j_pin_spill(); a_mov(0, RCPU);
     j_callabs((void*) jh_step);
-    fl.nz = 0;
+    j_pin_fill(); fl.nz = 0;
 }
 
 /* ---- block exits */
@@ -2133,7 +2243,7 @@ static void jx_direct(u64 from, u64 target) {
         a_movi(0, target); c_st(0, OFF_RIP); a_b(jepi);
         jpatch19(z);
     }
-    u32 *tc = jfind(target);
+    u32 *tc = jfind_emit(target);
     if (tc) { a_b(tc); return; }
     u32 *site = jcur; E(0x14000001u);                  /* b .+4: patched to "b target" once the target is translated */
     a_adr(0, site); c_st(0, OFF_PATCH);
@@ -2151,6 +2261,51 @@ static void jx_indirect(void) {                        /* guest target in x0 */
     a_br(4);
     jpatch19(s1); jpatch19(s2);
     c_st(0, OFF_RIP); a_b(jepi);
+}
+
+/* ---- deferred out-of-line exits of the block being translated (side exits of jcc, unresolved callees, indirect-call misses) */
+enum { JS_SIDE, JS_CALL, JS_IND };
+typedef struct { int kind; u32 *br[2]; u64 from, target; int fpend, fkind, fsz; } JStub;
+static JStub jstub[2 * JMAXI]; static int jnstub;
+static void jx_ret(void) {                              /* guest return address in x0: predicted by the return stack buffer, then the inline cache */
+    if (!(g_jopt & JOPT_RSB)) { jx_indirect(); return; }
+    a_ldst_u(3, 1, 1, RPEND, 0);
+    u32 *s1 = a_cbz_fwd(1, 1);                         /* signal pending: slow path polls again and leaves */
+    c_ld(2, OFF_RSBI); a_addi(1, 2, 2, 1, 0); a_andmask(2, 2, 6); c_st(2, OFF_RSBI);
+    a_addsh(3, RCPU, 2, 4); a_ldp(4, 30, 3, OFF_RSB);
+    a_addsub(1, 1, 1, 31, 4, 0);                       /* cmp x4, x0 */
+    u32 *s2 = a_bcond_fwd(1);
+    a_ret();                                           /* host ret: the CPU's own return predictor follows the bl of the call */
+    jpatch19(s1); jpatch19(s2);
+    jx_indirect();
+}
+static void jrsb_push(u64 retaddr, u32 **adrsite) {    /* uses x2-x5; *adrsite = adr of the host continuation, patched by the caller */
+    c_ld(2, OFF_RSBI); a_addsh(3, RCPU, 2, 4);
+    a_movi(4, retaddr); *adrsite = jcur; E(0);
+    a_stp(4, 5, 3, OFF_RSB);
+    a_addi(0, 2, 2, 1, 0); a_andmask(2, 2, 6); c_st(2, OFF_RSBI);
+}
+static void jstub_add(int kind, u32 *b0, u32 *b1, u64 from, u64 target) {
+    JStub *t = &jstub[jnstub++]; t->kind = kind; t->br[0] = b0; t->br[1] = b1; t->from = from; t->target = target;
+    t->fpend = fl.pend; t->fkind = fl.kind; t->fsz = fl.sz;
+}
+static void jstubs_emit(void) {
+    for (int i = 0; i < jnstub; i++) {
+        JStub *t = &jstub[i];
+        if (t->kind == JS_CALL) {                       /* br[0] is a bl: becomes the chain patch site */
+            u32 *site = t->br[0]; *site = 0x94000000u | ((u32)(jcur - site) & 0x3ffffff);
+            a_adr(0, site); a_addi(0, 0, 0, 1, 0); c_st(0, OFF_PATCH);
+            a_movi(0, t->target); c_st(0, OFF_RIP); a_b(jepi);
+        } else if (t->kind == JS_IND) {
+            for (int k = 0; k < 2; k++) if (t->br[k]) { u32 w = *t->br[k]; *t->br[k] = w | ((u32)(jcur - t->br[k]) & 0x7ffff) << 5; }
+            c_st(0, OFF_RIP); a_b(jepi);
+        } else {
+            jpatch19(t->br[0]);
+            if (t->fpend) { fl.kind = t->fkind; fl.sz = t->fsz; fl_spill(); }
+            jx_direct(t->from, t->target);
+        }
+    }
+    jnstub = 0;
 }
 
 /* ---- arithmetic: x9 = a, x10 = b (zero-extended to size) -> x11 = result; host flags + x9-x11 are the lazy state when nf */
@@ -2183,23 +2338,27 @@ static void alu_core(int t, int sz, int nf) {
     fl.sz = sz; fl.nz = 1; fl.pend = 1;
 }
 
-static void jemit(const JI *j) {
+static int jemit(const JI *j) {          /* returns 1 when it ended the block (the exit is emitted) */
     int sz = j->sz, rb = 0, off = 0, hm = j->at == OT_MEM || j->bt == OT_MEM, sf = sz == 8;
     switch (j->op) {
-    case JO_NOP: break;
+    case JO_NOP:
+        if (j->cnt) {                                    /* followed backward jmp: poll for signals here, since no exit stub will */
+            a_ldst_u(3, 1, 0, RPEND, 0);
+            u32 *z = a_cbz_fwd(0, 0);
+            if (fl.pend) fl_spill();
+            a_movi(0, j->target); c_st(0, OFF_RIP); a_b(jepi);
+            jpatch19(z);
+        }
+        break;
     case JO_FB: fl_flush(j->lvb); j_fb(j); break;
-    case JO_FBT: fl_flush(1); j_fb(j); a_b(jepi); break;
+    case JO_FBT:                                         /* not translated, ends the block: the dispatcher interprets it (outside the cache, so a blocking system call never holds up a flush) */
+        fl_flush(1); a_movi(0, j->ip); c_st(0, OFF_RIP); a_movi(0, 1); c_st(0, OFF_PATCH); a_b(jepi); return 1;
     case JO_MOV:
         if (hm) { fl_flush(j->lvb); j_ea(j, &rb, &off); }
         j_opld(0, j, 1, sz, rb, off); j_opst(0, j, sz, rb, off); break;
     case JO_MOVX: {
-        int size = j->sz2 == 1 ? 0 : j->sz2 == 2 ? 1 : 2, opc = !j->sx ? 1 : (j->sz == 8 ? 2 : 3);
         if (j->bt == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); m_ld(j->sz2, j->sx, j->sz == 8, 0, rb, off); }
-        else {
-            u32 o = OFF_R(j->br);
-            if (j->sz2 == 1 && !j->rex && j->br >= 4 && j->br < 8) o = OFF_R(j->br - 4) + 1;
-            a_ldst_u(size, opc, 0, RCPU, o);
-        }
+        else g_ldx(0, j->br, j->sz2, j->sx, j->sz, j->rex);
         g_st(0, j->ar, j->sz, j->rex); break; }
     case JO_LEA: {
         j_ea(j, &rb, &off);
@@ -2213,7 +2372,8 @@ static void jemit(const JI *j) {
     case JO_POP: fl_flush(j->lvb); j_pop(0); g_st(0, j->ar, 8, 0); break;
     case JO_LEAVE:
         fl_flush(j->lvb);
-        c_ld(0, OFF_R(RBP)); a_ldst_s(3, 1, 2, 0, 0); a_addi(0, 0, 0, 8, 0); c_st(0, OFF_R(RSP)); c_st(2, OFF_R(RBP)); break;
+        if (pin(RBP) >= 0) { a_ldst_s(3, 1, 2, pin(RBP), 0); a_dmb_ld(); a_addi(0, pin(RSP), pin(RBP), 8, 0); a_mov(pin(RBP), 2); break; }
+        c_ld(0, OFF_R(RBP)); a_ldst_s(3, 1, 2, 0, 0); a_dmb_ld(); a_addi(0, 0, 0, 8, 0); c_st(0, OFF_R(RSP)); c_st(2, OFF_R(RBP)); break;
     case JO_CWDE:
         if (sz == 8) { g_ld(0, RAX, 4, 0); a_sxtw(0, 0); g_st(0, RAX, 8, 0); }
         else { g_ld(0, RAX, 2, 0); a_sxth(0, 0, 0); g_st(0, RAX, 4, 0); }
@@ -2260,7 +2420,7 @@ static void jemit(const JI *j) {
         if (j->at == OT_MEM) j_ea(j, &rb, &off);
         j_opld(0, j, 0, sz, rb, off);
         if (j->cnt == 2) {
-            c_ld(1, OFF_R(RCX));
+            g_ld(1, RCX, 8, 0);
             switch (j->t) {
             case 4: case 6: a_shv(sf, 0, 0, 0, 1); break;
             case 5: a_shv(sf, 1, 0, 0, 1); break;
@@ -2372,41 +2532,115 @@ static void jemit(const JI *j) {
         if (j->bt == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); m_ld(sz, 0, 0, 0, rb, off); } else g_ld(0, j->br, sz, 0);
         f_scvtf(j->sz2, sz == 8, 0, 0);
         f_stc(j->sz2, 0, OFF_X(j->ar)); break;
-    case JO_JMP: fl_flush(j->lvb); jx_direct(j->ip, j->target); break;
+    case JO_JMP: fl_flush(j->lvb); jx_direct(j->ip, j->target); return 1;
     case JO_JCC: {
-        fl_flush(1);
         int cc = 0, m = fl.nz ? jmapcc(j->t, &cc) : -1;
         u64 next = j->ip + j->len;
-        if (m < 0) { j_fb(j); c_ld(0, OFF_RIP); jx_indirect(); }
+        if (j->cnt) {                                    /* superblock: the fall-through path continues, the taken path is an out-of-line side exit */
+            if (m < 0) { fl_flush(1); a_movi(0, j->ip); c_st(0, OFF_RIP); a_movi(0, 1); c_st(0, OFF_PATCH); a_b(jepi); return 1; }
+            if (m == 1) { fl_flush(1); jx_direct(j->ip, j->target); return 1; }
+            if (m == 2) break;
+            jstub_add(JS_SIDE, a_bcond_fwd(cc), NULL, j->ip, j->target);       /* the stub is entered by the branch itself: x9-x11 still hold the lazy flags */
+            break;
+        }
+        fl_flush(1);
+        if (m < 0) { a_movi(0, j->ip); c_st(0, OFF_RIP); a_movi(0, 1); c_st(0, OFF_PATCH); a_b(jepi); }       /* flags not expressible: the dispatcher interprets the jcc */
         else if (m == 1) jx_direct(j->ip, j->target);
         else if (m == 2) jx_direct(j->ip, next);
         else { u32 *bt = a_bcond_fwd(cc); jx_direct(j->ip, next); jpatch19(bt); jx_direct(j->ip, j->target); }
-        break; }
-    case JO_CALL: fl_flush(j->lvb); a_movi(0, j->imm); j_push(0); jx_direct(j->ip, j->target); break;
+        return 1; }
+    case JO_CALL:
+        fl_flush(j->lvb);
+        a_movi(0, j->imm); j_push(0);
+        if (!j->cnt) { jx_direct(j->ip, j->target); return 1; }
+        else {                                           /* bl callee; the code after it is the continuation, reached by the callee's ret */
+            u32 *adr; jrsb_push(j->imm, &adr);
+            u32 *tc = jfind_emit(j->target);
+            if (tc) a_bl(tc); else { E(0x94000000u); jstub_add(JS_CALL, jcur - 1, NULL, j->ip, j->target); }
+            a_adr_at(adr, 5, jcur);
+            fl.nz = 0; fl.pend = 0;
+        }
+        break;
     case JO_RET:
         fl_flush(j->lvb);
-        c_ld(1, OFF_R(RSP)); a_ldst_s(3, 1, 0, 1, 0); a_addi(0, 1, 1, 8, 0);
+        if (pin(RSP) >= 0) {
+            int hs = pin(RSP);
+            a_ldst_s(3, 1, 0, hs, 0); a_dmb_ld(); a_addi(0, hs, hs, 8, 0);
+            if (j->imm) { a_movi(2, j->imm); a_addsh(hs, hs, 2, 0); }
+            jx_ret(); return 1;
+        }
+        c_ld(1, OFF_R(RSP)); a_ldst_s(3, 1, 0, 1, 0); a_dmb_ld(); a_addi(0, 1, 1, 8, 0);
         if (j->imm) { a_movi(2, j->imm); a_addsh(1, 1, 2, 0); }
-        c_st(1, OFF_R(RSP)); jx_indirect(); break;
+        c_st(1, OFF_R(RSP)); jx_ret(); return 1;
     case JO_JMPI: case JO_CALLI:
         fl_flush(j->lvb);
         if (j->at == OT_MEM) { j_ea(j, &rb, &off); m_ld(8, 0, 0, 0, rb, off); } else g_ld(0, j->ar, 8, 0);
         if (j->op == JO_CALLI) { a_movi(2, j->imm); j_push(2); }
-        jx_indirect(); break;
+        if (!j->cnt) { jx_indirect(); return 1; }
+        {                                                /* indirect call: inline cache hit = blr, miss = leave through an out-of-line exit */
+            u32 *adr; jrsb_push(j->imm, &adr);
+            a_ldst_u(3, 1, 1, RPEND, 0);
+            u32 *s1 = a_cbz_fwd(1, 1);
+            a_logsh(2, 2, 0, 0, 1, 13); a_andmask(2, 2, JIC_BITS); a_addsh(2, RIC, 2, 4);
+            a_ldp(3, 4, 2, 0); a_addsub(1, 1, 1, 31, 3, 0);
+            u32 *s2 = a_bcond_fwd(1);
+            E(0xD63F0000u | 4u << 5);                    /* blr x4 */
+            a_adr_at(adr, 5, jcur);
+            jstub_add(JS_IND, s1, s2, j->ip, 0);
+            fl.nz = 0; fl.pend = 0;
+        }
+        break;
     }
+    return 0;
 }
 
 /* ------------------------------------------------------------ translation, dispatch, hooks */
-static u32 *jtranslate(u64 pc) {
-    if ((u64)(jlim - jcur) < 2 * JBLOCK_MAX || jmapn + 4 * JMAXI > JMAP_CAP || jhn * 2 > (1u << JH_BITS)) jflush();
+static void jit_stw_locked(void) {                       /* flush the whole cache. jmu held, the caller is not active */
+    JT *me = &t_jt;
+    __atomic_store_n(&g_jstop, 1, __ATOMIC_SEQ_CST);
+    for (JT *t = jreg; t; t = t->next) if (t != me) __atomic_or_fetch((u64*) t->pp, 1ULL, __ATOMIC_SEQ_CST);     /* bit 0: leave the cache (no signal has number 0) */
+    for (JT *t = jreg; t; t = t->next) if (t != me) while (__atomic_load_n(&t->active, __ATOMIC_SEQ_CST)) sched_yield();
+    jflush();
+    __atomic_add_fetch(&g_jgen, 1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_jstop, 0, __ATOMIC_SEQ_CST);
+}
+static void jit_flush_req(void) {
+    pthread_mutex_lock(&jmu);
+    if (__atomic_exchange_n(&g_jflush_req, 0, __ATOMIC_ACQ_REL)) jit_stw_locked();
+    pthread_mutex_unlock(&jmu);
+}
+
+static void jtranslate(u64 pc) {                          /* the caller is not active; the block is found with jfind() afterwards */
     JI ji[JMAXI]; int n = 0; u64 ip = pc;
-    while (n < JMAXI) {
+    int sb = !!(g_jopt & JOPT_SB), rsb = !!(g_jopt & JOPT_RSB);
+    while (n < JMAXI) {                                   /* decoding reads guest code but touches no JIT state: a fault here is the guest's fault, and no lock is held */
         if (n && (ip & 0xfff) > 4096 - 16) break;               /* an instruction may cross into a page we have not looked at */
         JI *j = &ji[n];
         if (!jdecode(j, ip)) { memset(j, 0, sizeof *j); j->ip = ip; j->op = JO_FBT; j->fr = j->fw = 1; n++; break; }
-        n++; ip += j->len;
+        n++;
+        /* Superblock: keep translating along the likely path. Only addresses on pages this block already reads are followed, so that
+         * decoding never touches a page the guest has not reached yet (it could be unmapped: the fault belongs to the guest, later). */
+        if (j->op == JO_JMP && sb && n < JMAXI && (j->target & 0xfff) <= 4096 - 16) {
+            int ok = 0;
+            for (int k = 0; k < n; k++) { if (ji[k].ip == j->target) { ok = 0; break; } if ((ji[k].ip >> 12) == (j->target >> 12)) ok = 1; }
+            if (ok) { j->op = JO_NOP; j->cnt = j->target <= j->ip; ip = j->target; continue; }
+        }
+        if (j->op == JO_JCC && sb && n < JMAXI && j->target > j->ip) { j->cnt = 1; ip = j->ip + j->len; continue; }       /* forward: assume not taken */
+        if ((j->op == JO_CALL || j->op == JO_CALLI) && rsb && n < JMAXI) {                                                /* the callee returns here through the return stack buffer */
+#ifdef PEMU_JIT_ABI_FLAGS
+            j->fw = 1;
+#else
+            j->fr = 1;
+#endif
+            j->cnt = 1; ip = j->ip + j->len; continue;
+        }
+        ip += j->len;
         if (jterm(j)) break;
     }
+    u64 endip = ip;
+    pthread_mutex_lock(&jmu);
+    if (jfind(pc)) { pthread_mutex_unlock(&jmu); return; }       /* another thread was faster */
+    if ((u64)(jlim - jcur) < 2 * JBLOCK_MAX || jmapn + 4 * JMAXI > JMAP_CAP || jhn * 2 > (1u << JH_BITS)) jit_stw_locked();
     if (g_jstats)
         for (int i = 0; i < n; i++)
             if (ji[i].op == JO_FB || ji[i].op == JO_FBT) {
@@ -2429,40 +2663,87 @@ static u32 *jtranslate(u64 pc) {
         ji[i].lvb = (u8) live;
     }
     u32 *start = jcur;
-    jins(pc, start);
+    jt_start = start; jt_pc = pc;
     memset(&fl, 0, sizeof fl);
-    for (int i = 0; i < n; i++) {
-        jm_off[jmapn] = (u32)((u8*) jcur - (u8*) jbase); jm_pc[jmapn++] = ji[i].ip;
-        jemit(&ji[i]);
+    int ended = 0; jnstub = 0;
+    for (int i = 0; i < n && !ended; i++) {
+        u32 k = jmapn; jm_off[k] = (u32)((u8*) jcur - (u8*) jbase); jm_pc[k] = ji[i].ip;
+        __atomic_store_n(&jmapn, k + 1, __ATOMIC_RELEASE);          /* the entry is complete before the fault handler of another thread can see it */
+        ended = jemit(&ji[i]);
     }
-    if (!jterm(&ji[n - 1])) { fl_flush(1); jx_direct(ji[n - 1].ip, ji[n - 1].ip + ji[n - 1].len); }
+    if (!ended) { fl_flush(1); jx_direct(ji[n - 1].ip, endip); }
+    jstubs_emit();
     jst_blocks++; jst_ins += (unsigned) n; jst_words += (unsigned long long)(jcur - start);
     j_sync_icache(start, jcur);
-    return start;
+    jt_start = NULL; jt_pc = 0;
+    jins(pc, start);                                              /* published: other threads may run it from now on */
+    pthread_mutex_unlock(&jmu);
 }
 
 #define JSTOP 0x1000ULL
+#ifdef PEMU_JIT_EMBED
+static __thread u64 jemb_stack[8192];
+#endif
 static void jit_enter(CPU *c, u32 *code) {
+    JT *t = &t_jt;
 #ifdef PEMU_JIT_EMBED
     u64 x[32] = {0};
-    x[0] = (u64) c; x[1] = (u64) code; x[2] = (u64)(void*) &pend; x[3] = (u64) jic; x[30] = JSTOP; x[31] = (u64)(jemb_stack + 8192);
+    x[0] = (u64) c; x[1] = (u64) code; x[2] = (u64)(void*) t->pp; x[3] = (u64) t->ic; x[30] = JSTOP; x[31] = (u64)(jemb_stack + 8192);
     pemu_embed_run(x, (u64) jenter, JSTOP);
 #else
-    ((void (*)(CPU*, u32*, volatile u64*, JEnt*)) (void*) jenter)(c, code, &pend, jic);
+    ((void (*)(CPU*, u32*, volatile u64*, JEnt*)) (void*) jenter)(c, code, t->pp, t->ic);
 #endif
 }
 
-static void jit_dispatch(CPU *c) {
-    if (g_jflush_req) { g_jflush_req = 0; jflush(); }
-    u64 pc = c->rip;
-    u32 *code = jfind(pc);
-    if (!code) {
-        if ((pc & 0xfff) > 4096 - 16 || jit_is_rwx(pc)) { c->patch = 0; step(c); return; }     /* interpret: see header comment */
-        code = jtranslate(pc);
+/* A thread that has seen a flush starts again with an empty inline cache and no pending chain patch. */
+static void jit_rsb_clear(CPU *c) { c->rsbi = 0; for (int i = 0; i < RSB_N; i++) { c->rsb[i][0] = ~0ULL; c->rsb[i][1] = 0; } }
+static void jit_resync(JT *t, CPU *c) {
+    memset(t->ic, 0, sizeof(JEnt) << JIC_BITS);
+    c->patch = 0; jit_rsb_clear(c);
+    t->gen = g_jgen;
+#ifndef PEMU_JIT_EMBED
+    __asm__ volatile("isb" ::: "memory");
+#endif
+}
+static inline void jreg_enter(JT *t, CPU *c) {
+    for (;;) {
+        __atomic_store_n(&t->active, 1, __ATOMIC_SEQ_CST);
+        if (!__atomic_load_n(&g_jstop, __ATOMIC_SEQ_CST)) break;
+        __atomic_store_n(&t->active, 0, __ATOMIC_SEQ_CST);      /* a flush is running: wait for it */
+        pthread_mutex_lock(&jmu); pthread_mutex_unlock(&jmu);
     }
-    if (c->patch) { u32 *site = (u32*) c->patch; *site = 0x14000000u | ((u32)(code - site) & 0x3ffffff); j_sync_icache(site, site + 1); c->patch = 0; jst_chain++; }
-    jic[icidx(pc)].pc = pc; jic[icidx(pc)].code = code;
-    jit_enter(c, code);
+    if (__builtin_expect(t->gen != __atomic_load_n(&g_jgen, __ATOMIC_ACQUIRE), 0)) jit_resync(t, c);
+}
+static inline void jreg_leave(JT *t) { __atomic_store_n(&t->active, 0, __ATOMIC_SEQ_CST); }
+
+static void jit_dispatch(CPU *c) {
+    JT *t = &t_jt;
+    for (;;) {
+        if (__builtin_expect(__atomic_load_n(&g_jflush_req, __ATOMIC_ACQUIRE), 0)) jit_flush_req();
+        u64 pc = c->rip;
+        if (c->patch == 1) {                                  /* the block ended with an instruction the translator does not handle: interpret it here */
+            c->patch = 0;
+            if (__builtin_expect(g_jstats, 0)) { jdyn[jfb_idx((const u8*) pc)]++; jst_dyn++; }
+            step(c); return;
+        }
+        jreg_enter(t, c);
+        u32 *code = jfind(pc);
+        if (!code) {
+            jreg_leave(t);
+            if ((pc & 0xfff) > 4096 - 16 || jit_is_rwx(pc)) { c->patch = 0; step(c); return; }     /* interpret: see header comment */
+            jtranslate(pc);
+            continue;
+        }
+        if (c->patch) {                                       /* chain: turn the exit's b (or bl, bit 0) into a branch to the new code */
+            u64 pv = c->patch; u32 *site = (u32*)(pv & ~3ULL);
+            *site = ((pv & 1) ? 0x94000000u : 0x14000000u) | ((u32)(code - site) & 0x3ffffff);
+            j_sync_icache(site, site + 1); c->patch = 0; jst_chain++;
+        }
+        t->ic[icidx(pc)].pc = pc; t->ic[icidx(pc)].code = code;
+        jit_enter(c, code);
+        jreg_leave(t);
+        return;
+    }
 }
 
 static u64 jit_pc2rip(void *u) {
@@ -2472,37 +2753,52 @@ static u64 jit_pc2rip(void *u) {
 #else
     pc = (u64) ((ucontext_t*) u)->uc_mcontext.pc;
 #endif
-    if (!pc || !jbase || pc < (u64) jbase || pc >= (u64) jcur || !jmapn) return 0;
-    u32 off = (u32)(pc - (u64) jbase), lo = 0, hi = jmapn;
+    if (!pc || !jbase || pc < (u64) jbase || pc >= (u64) jcur) return 0;
+    u32 off = (u32)(pc - (u64) jbase), lo = 0, hi = __atomic_load_n(&jmapn, __ATOMIC_ACQUIRE);
+    if (!hi) return 0;
     while (hi - lo > 1) { u32 mid = (lo + hi) / 2; if (jm_off[mid] <= off) lo = mid; else hi = mid; }
     return jm_off[lo] <= off ? jm_pc[lo] : 0;
 }
+static void jit_fault(void *u, CPU *c) {                          /* fault in translated code: guest rip and the pinned registers come from the signal context */
+    u64 regs[8], r;
+#ifdef PEMU_JIT_EMBED
+    for (int i = 0; i < 8; i++) regs[i] = pemu_embed_x(jpin_reg[i]);
+#else
+    for (int i = 0; i < 8; i++) regs[i] = ((ucontext_t*) u)->uc_mcontext.regs[jpin_reg[i]];
+#endif
+    r = jit_pc2rip(u);                                            /* (the embedded interpreter's state is cleared here) */
+    if (!r) return;
+    c->rip = r;
+    if (g_jpin) memcpy(c->r, regs, sizeof regs);
+}
+static void jit_region_abort(void) { __atomic_store_n(&t_jt.active, 0, __ATOMIC_SEQ_CST); }      /* after a fault longjmp'ed out of the cache */
 
 static void jit_post_syscall(CPU *c, u64 n, long r) {
     u64 a0 = c->r[RDI], a1 = c->r[RSI], a2 = c->r[RDX], a3 = c->r[10];
+    if (n != 9 && n != 10 && n != 11 && n != 25) return;
+    pthread_mutex_lock(&jmu);                                     /* jpg / jrwx are shared with the translators */
     switch (n) {
     case 9:                                                       /* mmap */
         if ((u64) r >= 0xfffffffffffff000ULL) break;
         if ((a2 & PROT_EXEC) && (a2 & PROT_WRITE)) jit_note_rwx((u64) r, a1);
-        if ((a3 & MAP_FIXED) && jit_has_code(a0, a1)) g_jflush_req = 1;
+        if ((a3 & MAP_FIXED) && jit_has_code(a0, a1)) __atomic_store_n(&g_jflush_req, 1, __ATOMIC_RELEASE);
         break;
     case 10:                                                      /* mprotect */
         if (r) break;
         if ((a2 & PROT_EXEC) && (a2 & PROT_WRITE)) jit_note_rwx(a0, a1);
-        if (jit_has_code(a0, a1)) g_jflush_req = 1;
+        if (jit_has_code(a0, a1)) __atomic_store_n(&g_jflush_req, 1, __ATOMIC_RELEASE);
         break;
-    case 11: if (!r && jit_has_code(a0, a1)) g_jflush_req = 1; break;        /* munmap */
-    case 25: if ((u64) r < 0xfffffffffffff000ULL && jit_has_code(a0, a1)) g_jflush_req = 1; break;   /* mremap */
+    case 11: if (!r && jit_has_code(a0, a1)) __atomic_store_n(&g_jflush_req, 1, __ATOMIC_RELEASE); break;        /* munmap */
+    case 25: if ((u64) r < 0xfffffffffffff000ULL && jit_has_code(a0, a1)) __atomic_store_n(&g_jflush_req, 1, __ATOMIC_RELEASE); break;   /* mremap */
     default: break;
     }
+    pthread_mutex_unlock(&jmu);
 }
-static void jit_disable(void) { g_jit_on = 0; }
 static void jit_report(void) {
     if (!g_jstats) return;
     g_jstats = 0;
     fprintf(stderr, "pemu jit: %llu blocks, %llu guest instructions translated (%.1f AArch64 instructions each), %llu chained exits, %llu cache flushes\n",
             jst_blocks, jst_ins, jst_ins ? (double) jst_words / (double) jst_ins : 0.0, jst_chain, jst_flush);
-    if (!g_jit_on) fprintf(stderr, "pemu jit: switched off before exit (the guest created a thread): dynamic counts below are incomplete\n");
     fprintf(stderr, "pemu jit: %u translated instructions fall back to the interpreter; opcodes by number of sites:", jst_fb);
     for (int k = 0; k < 8; k++) {
         int b = -1; for (int i = 0; i < 512; i++) if (jfbh[i] && (b < 0 || jfbh[i] > jfbh[b])) b = i;
@@ -2527,37 +2823,74 @@ static int jit_init(void) {
     void *m = mmap(NULL, JCACHE_SZ, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (m == MAP_FAILED) return -1;                               /* no executable memory: stay with the interpreter */
     jbase = m; jlim = jbase + JCACHE_SZ / 4;
-    jh = jmap(sizeof(JEnt) << JH_BITS); jic = jmap(sizeof(JEnt) << JIC_BITS); jpg = jmap(sizeof(u64) << JPG_BITS);
+    jh = jmap(sizeof(JEnt) << JH_BITS); jpg = jmap(sizeof(u64) << JPG_BITS);
     jm_off = jmap(4ul * JMAP_CAP); jm_pc = jmap(8ul * JMAP_CAP);
-    if (!jh || !jic || !jpg || !jm_off || !jm_pc) return -1;
+    if (!jh || !jpg || !jm_off || !jm_pc) return -1;
+    { const char *eo = getenv("PEMU_JIT_OPT"); if (eo && *eo) g_jopt = (unsigned) strtoul(eo, NULL, 0); }
+    g_jpin = !!(g_jopt & JOPT_PIN);
     jcur = jbase;
     jenter = jcur;                                                /* void jenter(CPU *c, void *code, volatile u64 *pend, JEnt *ic) */
-    E(0xA9800000u | (u32)(-6 & 0x7f) << 15 | 30u << 10 | 31u << 5 | 29u);            /* stp x29, x30, [sp, #-48]! */
-    a_stp(27, 28, 31, 16); a_stp(25, 26, 31, 32);
-    a_mov(28, 0); a_mov(27, 2); a_mov(26, 3); a_br(1);
+    E(0xA9800000u | (u32)(-12 & 0x7f) << 15 | 30u << 10 | 31u << 5 | 29u);           /* stp x29, x30, [sp, #-96]! */
+    a_stp(27, 28, 31, 16); a_stp(25, 26, 31, 32); a_stp(19, 20, 31, 48); a_stp(21, 22, 31, 64); a_stp(23, 24, 31, 80);
+    a_mov(28, 0); a_mov(27, 2); a_mov(26, 3);
+    j_pin_fill();                                                 /* guest rax..rdi into their host registers */
+    E(0xD5033FDFu);                                               /* isb: code other threads translated is visible */
+    a_br(1);
     jepi = jcur;
-    a_ldp(25, 26, 31, 32); a_ldp(27, 28, 31, 16);
-    E(0xA8C00000u | 6u << 15 | 30u << 10 | 31u << 5 | 29u);                          /* ldp x29, x30, [sp], #48 */
+    j_pin_spill();
+    a_ldp(25, 26, 31, 32); a_ldp(27, 28, 31, 16); a_ldp(19, 20, 31, 48); a_ldp(21, 22, 31, 64); a_ldp(23, 24, 31, 80);
+    E(0xA8C00000u | 12u << 15 | 30u << 10 | 31u << 5 | 29u);                         /* ldp x29, x30, [sp], #96 */
     E(0xD65F03C0u);                                               /* ret */
     jcur = jbase + JTRAMP;
     j_sync_icache(jbase, jcur);
     g_jstats = getenv("PEMU_JIT_STATS") != NULL;
-    { const char *eo = getenv("PEMU_JIT_OPT"); if (eo && *eo) g_jopt = (unsigned) strtoul(eo, NULL, 0); }
     return 0;
+}
+/* Every guest thread registers once before it runs translated code; see the comment at JT. */
+static void jit_thread_init(void) {
+    JT *t = &t_jt;
+    t->ic = jmap(sizeof(JEnt) << JIC_BITS);
+    if (!t->ic) return;                                           /* this thread stays with the interpreter (run() checks t_jt.ic) */
+    t->pp = PENDP(); t->active = 0;
+    pthread_mutex_lock(&jmu);
+    t->gen = g_jgen; t->next = jreg; jreg = t;
+    pthread_mutex_unlock(&jmu);
+}
+static void jit_thread_exit(void) {
+    JT *t = &t_jt;
+    if (!t->ic) return;
+    pthread_mutex_lock(&jmu);
+    for (JT **pp = &jreg; *pp; pp = &(*pp)->next) if (*pp == t) { *pp = t->next; break; }
+    pthread_mutex_unlock(&jmu);
+    munmap(t->ic, sizeof(JEnt) << JIC_BITS); t->ic = NULL;
+}
+static void jit_mt_enable(void) {                                 /* the guest is about to get its second thread */
+    if (g_jmt) return;
+    pthread_mutex_lock(&jmu);
+    g_jmt = 1; jit_stw_locked();                                  /* everything translated so far has no memory barriers */
+    pthread_mutex_unlock(&jmu);
+}
+static void jit_atfork(int phase) {                               /* 0 before fork(), 1 in the parent after it, 2 in the child */
+    if (phase == 0) { pthread_mutex_lock(&jmu); return; }
+    if (phase == 2) { jreg = t_jt.ic ? &t_jt : NULL; t_jt.next = NULL; }      /* the other threads do not exist in the child */
+    pthread_mutex_unlock(&jmu);
 }
 #endif /* HAVE_JIT */
 
 static void run(CPU*c) {
+#ifdef HAVE_JIT
+    if (g_jit_on) { jit_thread_init(); jit_rsb_clear(c); }
+#endif
     if (sigsetjmp(g_jb, 1)) {
         int s = g_fault; sigset_t ss; sigemptyset(&ss); sigaddset(&ss, s); sigprocmask(SIG_UNBLOCK, &ss, NULL);
 #ifdef HAVE_JIT
-        c->patch = 0;
+        c->patch = 0; jit_region_abort();
 #endif
         deliver_sig(c, s);
     }
     for (;;) {
 #ifdef HAVE_JIT
-        if (g_jit_on) { if (pend) { c->patch = 0; check_pending(c); } jit_dispatch(c); continue; }
+        if (g_jit_on && t_jt.ic) { if (*PENDP()) { c->patch = 0; check_pending(c); } jit_dispatch(c); continue; }
 #endif
         if (*PENDP()) check_pending(c);
         step(c);
