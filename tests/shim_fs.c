@@ -16,7 +16,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-static int raw_exists(const char *p) { return syscall(SYS_access, p, 0) == 0; }
+static int raw_exists(const char *p) { return syscall(SYS_faccessat, AT_FDCWD, p, 0, 0) == 0; }
 
 int main(int argc, char **argv) {
     int bad = 0;
