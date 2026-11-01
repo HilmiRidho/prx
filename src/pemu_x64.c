@@ -87,7 +87,7 @@ static int g_trace;
 static char g_self[4096];
 static u64 g_tramp;
 #ifdef HAVE_JIT
-static int g_jit_on;                          /* JIT active (cleared when the guest creates a thread); only accessed with __atomic_* */
+static volatile int g_jit_on;                 /* JIT active (cleared when the guest creates a thread) */
 static u64 jit_pc2rip(void*uctx);
 static void jit_post_syscall(CPU*c, u64 n, long r);
 static void jit_note_rwx(u64 start, u64 len);
