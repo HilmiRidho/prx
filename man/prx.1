@@ -51,6 +51,10 @@ Pass an environment variable. May be given more than once.
 .B \-\-no\-root\-id
 Run as the host user instead of fake root.
 .TP
+.B \-\-no\-seccomp
+Skip the workarounds for a host seccomp policy (Android): the loader/libc patch,
+the SIGSYS handler and the GLIBC_TUNABLES rseq default. Same as PRX_SECCOMP=0.
+.TP
 .B \-\-trace
 Debug syscall and seccomp tracing.
 .TP
@@ -84,6 +88,12 @@ Data directory. Default: \fI~/.prx\fR if it exists, otherwise
 .TP
 .B PRX_SRCDIR
 Directory containing \fIprx.c\fR, \fIldpatch.c\fR and the \fIshim/\fR modules.
+.TP
+.B PRX_SECCOMP
+0 skips the host-seccomp workarounds, like \fB\-\-no\-seccomp\fR (default 1).
+.TP
+.B PRX_SHIM_CFLAGS
+Extra compiler flags for the shim, for example \fB\-DPRX_NO_SECCOMP\fR. Run \fBprx build\fR afterwards.
 .TP
 .B CC
 C compiler used by \fBprx build\fR.

@@ -23,7 +23,7 @@ static char*acat(struct ar*a, const char*k, const char*v) {
     return d;
 }
 static int is_ours(const char*e) {
-    return envmatch(e, "LD_PRELOAD") || envmatch(e, "PRX_ROOTFS") || envmatch(e, "PRX_SHIM") || envmatch(e, "PRX_LIBPATH") || envmatch(e, "PRX_BIND") || envmatch(e, "PRX_FAKEROOT") || envmatch(e, "PRX_DNS") || envmatch(e, "PRX_LOADER") || envmatch(e, "PRX_QEMU") || envmatch(e, "QEMU_SET_ENV") || envmatch(e, "PRX_SELF_EXE") || envmatch(e, "PRX_VUSER") || envmatch(e, "PRX_CRED") || envmatch(e, "PRX_NO_ARGV0");
+    return envmatch(e, "LD_PRELOAD") || envmatch(e, "PRX_ROOTFS") || envmatch(e, "PRX_SHIM") || envmatch(e, "PRX_LIBPATH") || envmatch(e, "PRX_BIND") || envmatch(e, "PRX_FAKEROOT") || envmatch(e, "PRX_DNS") || envmatch(e, "PRX_LOADER") || envmatch(e, "PRX_QEMU") || envmatch(e, "QEMU_SET_ENV") || envmatch(e, "PRX_SELF_EXE") || envmatch(e, "PRX_VUSER") || envmatch(e, "PRX_CRED") || envmatch(e, "PRX_NO_ARGV0") || envmatch(e, "PRX_SECCOMP");
 }
 #if defined(__i386__)
 /* ELF32 (the only class an i386 guest can run) */
@@ -200,10 +200,11 @@ static char**mkenv(struct ar*a, char*const envp[], int native, const char*cur_ex
         if (cur_exe && cur_exe[0]) ne[k++] = acat(a, "PRX_SELF_EXE=", cur_exe);
         if (g_loader[0]) ne[k++] = acat(a, "PRX_LOADER=", g_loader);
         if (g_noargv0) ne[k++] = acat(a, "PRX_NO_ARGV0=", "1");
+        if (!g_seccomp) ne[k++] = acat(a, "PRX_SECCOMP=", "0");
         if (g_qemu[0]) ne[k++] = acat(a, "PRX_QEMU=", g_qemu);
         int has = 0;
         for (int i = 0; i<n; i++) if (envmatch(envp[i], "GLIBC_TUNABLES")) has = 1;
-        if (!has) ne[k++] = acat(a, "GLIBC_TUNABLES=", "glibc.pthread.rseq=0");
+        if (!has && SECCOMP_ON()) ne[k++] = acat(a, "GLIBC_TUNABLES=", "glibc.pthread.rseq=0");
     }
     if (!native && g_qemu[0]) {
         const char*pl = NULL, *ll = NULL;

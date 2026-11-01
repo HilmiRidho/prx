@@ -85,6 +85,7 @@ Container names may only contain letters, digits, `.`, `_` and `-`, and cannot s
 | `-w, --workdir DIR` | Initial working directory inside the guest (default `/root`). |
 | `-e, --env KEY=VAL` | Pass an environment variable. |
 | `--no-root-id` | Run as the host user instead of fake root; `sudo` and `su` still work. |
+| `--no-seccomp` | Skip the host-seccomp workarounds (see [Seccomp module](#seccomp-module)). |
 | `--trace` | Debug syscall and seccomp tracing. |
 
 Unknown options are an error, not a command; put the command after `--`.
@@ -95,6 +96,8 @@ Unknown options are an error, not a command; put the command after `--`.
 | --- | --- |
 | `PRX_HOME` | Data directory. Default: `~/.prx` if it exists, otherwise `$XDG_DATA_HOME/prx` (`~/.local/share/prx`). |
 | `PRX_SRCDIR` | Directory holding `prx.c`, `ldpatch.c` and `shim/`. |
+| `PRX_SECCOMP` | `0` disables the host-seccomp workarounds, same as `--no-seccomp` (default `1`). |
+| `PRX_SHIM_CFLAGS` | Extra compiler flags for the shim, e.g. `-DPRX_NO_SECCOMP`; run `prx build` afterwards. |
 | `PRX_DNS` | IPv4 / IPv6 nameservers for the guest, separated by `,`, `;` or blanks. Invalid entries and scoped addresses (`fe80::1%eth0`) are dropped with a warning. |
 | `PRX_QEMU` | Path (or name) of a specific `qemu-user` binary for cross-architecture rootfs. `PRX_QEMU=pemu` selects the built-in emulator from `$PRX_HOME/lib`. |
 | `QEMU_CPU`, `QEMU_STRACE`, `QEMU_LOG`, `QEMU_RESERVED_VA`, `QEMU_GUEST_BASE`, `QEMU_PAGESIZE` | Passed through to the emulator when one is used. |
@@ -131,11 +134,24 @@ modules in dependency order). `prx source` prints the modules expanded into one 
 | Module | Concern |
 | --- | --- |
 | `types.h`, `sysnum.h`, `sys.h`, `libc.h` | Types and constants, per-arch syscall numbers, raw syscalls, libc imports |
-| `state.h`, `init.h` | Global state, bind parsing, SIGSYS handler, early init |
+| `state.h`, `seccomp.h`, `init.h` | Global state; host-seccomp workarounds; bind parsing, early init |
 | `path.h`, `procfs.h` | Guest/host path translation, fake `/proc` files |
 | `fs_open.h`, `fs_stat.h`, `fs_ops.h`, `tty.h`, `glob_tmp.h` | File-system interposers |
 | `net_unix.h`, `resolve.h` | AF_UNIX path translation, DNS and `/etc/hosts` |
-| `proc.h`, `cred.h`, `pwdb.h`, `exec.h` | Capabilities and signals, virtual credentials, passwd/group, exec and spawn |
+| `proc.h`, `cred.h`, `pwdb.h`, `exec.h` | Capabilities, prctl, uname, sysinfo, virtual credentials, passwd/group, exec and spawn |
+
+### Seccomp module
+
+Android applies a seccomp allow-list built for bionic to every app process. glibc also uses syscalls
+that list lacks (`rseq`, `clone3`, `faccessat2`, ...), and the kernel answers with `SIGSYS`. All the
+workarounds live in `src/shim/seccomp.h`: a `SIGSYS` handler that turns the blocked syscall into
+`-ENOSYS` (so glibc uses its fallback), hooks that keep the guest from replacing or blocking that
+handler, and fallbacks for `sched_{get,set}affinity` and `PR_SET_NO_NEW_PRIVS`. The launcher adds the
+loader/libc patch (`ldpatch`, aarch64) and the `glibc.pthread.rseq=0` default.
+
+- Run time: `prx login NAME --no-seccomp` (or `PRX_SECCOMP=0`) skips all of it, which helps tell a seccomp problem from another shim bug. The setting is inherited by guest child processes.
+- Build time: `PRX_SHIM_CFLAGS=-DPRX_NO_SECCOMP prx build` leaves the module out of the shim entirely.
+- It cannot lift the host policy: a syscall issued before the handler exists (static binaries, raw `svc`) is still killed.
 
 ## pemu: built-in emulator (experimental)
 

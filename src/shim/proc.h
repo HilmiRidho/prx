@@ -1,4 +1,4 @@
-/* proc.h - capabilities, prctl, uname, signals, sysinfo
+/* proc.h - capabilities, prctl, uname, sysinfo
  * Part of the prx shim (unity build: included by src/prx.c, not a standalone header). */
 struct cap_header_t {
     u32 version;
@@ -44,12 +44,7 @@ EXP int prctl(int option, unsigned long a2, unsigned long a3, unsigned long a4, 
     if ((g_fake || g_user) && option == 23) return 1;
     static int(*f)(int, unsigned long, unsigned long, unsigned long, unsigned long);
     if (!f) f = nextsym("prctl");
-    if (option == 38) {
-        /* PR_SET_NO_NEW_PRIVS: really apply it; only when the host refuses it
-           (seccomp/SELinux) keep the old behaviour of reporting success. */
-        if (f) f(option, a2, a3, a4, a5);
-        return 0;
-    }
+    if (option == 38) return seccomp_nnp(f, a2, a3, a4, a5);
     return f ? f(option, a2, a3, a4, a5) : 0;
 }
 struct utsname_t {
@@ -70,27 +65,6 @@ EXP int uname(struct utsname_t*buf) {
         memcpy(buf->version, "#1 SMP PREEMPT", 15);
     }
     return r;
-}
-EXP int sigaction(int sig, const void*act, void*old) {
-    static int(*f)(int, const void*, void*);
-    if (!f) f = nextsym("sigaction");
-    if (sig == 31 && g_rl && !g_inst) {
-        if (old) memset(old, 0, sizeof (struct ksa));
-        return 0;
-    }
-    return f(sig, act, old);
-}
-EXP void*signal(int sig, void*h) {
-    static void*(*f)(int, void*);
-    if (!f) f = nextsym("signal");
-    if (sig == 31 && g_rl) return NULL;
-    return f(sig, h);
-}
-EXP void*bsd_signal(int sig, void*h) {
-    static void*(*f)(int, void*);
-    if (!f) f = nextsym("bsd_signal");
-    if (sig == 31 && g_rl) return NULL;
-    return f(sig, h);
 }
 EXP int socket(int dom, int type, int proto) {
     static int(*f)(int, int, int);
@@ -115,24 +89,6 @@ EXP int is_selinux_enabled(void) {
     if (g_rl) return 0;
     if (!f) f = nextsym("is_selinux_enabled");
     return f ? f() : 0;
-}
-static const void*unblock_sys(const void*set, int how, u8*tmp) {
-    if (!g_rl || !set || (how != 0 && how != 2)) return set;
-    memcpy(tmp, set, 128);
-    tmp[3] &= (u8)~(1u<<6);
-    return tmp;
-}
-EXP int sigprocmask(int how, const void*set, void*old) {
-    static int(*f)(int, const void*, void*);
-    u8 t[128];
-    if (!f) f = nextsym("sigprocmask");
-    return f(how, unblock_sys(set, how, t), old);
-}
-EXP int pthread_sigmask(int how, const void*set, void*old) {
-    static int(*f)(int, const void*, void*);
-    u8 t[128];
-    if (!f) f = nextsym("pthread_sigmask");
-    return f(how, unblock_sys(set, how, t), old);
 }
 struct sysinfo_data {
     long uptime;

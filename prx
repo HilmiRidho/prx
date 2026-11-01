@@ -39,6 +39,7 @@ Usage:
         -w, --workdir DIR            Initial working directory, absolute guest path (default: /root)
         -e, --env KEY=VAL            Pass custom environment variable (repeatable)
         --no-root-id                 Run as the host user (host name/UID/GID); sudo/su still work
+        --no-seccomp                 Skip the host-seccomp workarounds (loader/libc patch, SIGSYS handler)
         --trace                      Enable debug syscall & seccomp tracing
         --                           End of options; the rest is the command to run
   prx list                           List all installed rootfs containers
@@ -53,6 +54,8 @@ NAME may contain only letters, digits, '.', '_' and '-' (not starting with '-').
 Environment:
   PRX_HOME=DIR      Data directory (default: ~/.prx if present, else \$XDG_DATA_HOME/prx)
   PRX_SRCDIR=DIR    Directory holding prx.c, ldpatch.c and shim/
+  PRX_SECCOMP=0|1   0 = same as --no-seccomp (default 1)
+  PRX_SHIM_CFLAGS   Extra compiler flags for the shim, e.g. -DPRX_NO_SECCOMP (run 'prx build' afterwards)
   PRX_DNS=LIST      IPv4/IPv6 DNS servers for the guest (separated by ',', ';' or blanks)
   PRX_KEEP=1        Leave guest processes running after 'prx login' exits (default: kill them)
   PRX_NO_ARGV0=1    Never pass --argv0 to the loader (auto-detected; glibc < 2.33 lacks it)
@@ -127,7 +130,7 @@ if command -v ld.lld >/dev/null 2>&1; then extra="$extra -fuse-ld=lld -Wl,--pack
 fi
 "$cc" -O2 -fPIC -shared -nostdlib -ffreestanding -fno-stack-protector \
 -fno-builtin -Wl,-z,undefs -Wl,-soname,libprx.so $extra \
--o "$SHIM" "$SRCDIR/prx.c" || die "Failed to build shim: $SHIM"
+${PRX_SHIM_CFLAGS:-} -o "$SHIM" "$SRCDIR/prx.c" || die "Failed to build shim: $SHIM"
 info "Shim built successfully: $SHIM"
 "$cc" -O2 -o "$PRX_HOME/lib/ldpatch" "$SRCDIR/ldpatch.c" || die "Failed to build ldpatch"
 info "Loader patch tool built successfully: $PRX_HOME/lib/ldpatch"
@@ -223,7 +226,7 @@ fi
 [ "$garch" = aarch64 ] && extra="$extra -mbranch-protection=none"
 "$cc" ${tflag:+"$tflag"} -O2 -fPIC -shared -nostdlib -ffreestanding -fno-stack-protector \
 -fno-builtin -Wl,-z,undefs -Wl,-soname,libprx.so $extra \
--o "$out" "$SRCDIR/prx.c" || die "Failed to cross-compile shim for $garch (CC=$cc must be able to target $garch; clang also needs lld)"
+${PRX_SHIM_CFLAGS:-} -o "$out" "$SRCDIR/prx.c" || die "Failed to cross-compile shim for $garch (CC=$cc must be able to target $garch; clang also needs lld)"
 info "Guest shim built successfully: $out"
 }
 verify_sha256() {
@@ -620,7 +623,7 @@ if [ "${#binds}" -ge 16000 ]; then die "--bind list too long (limit 16000 bytes 
 cmd_login() {
 [ $# -ge 1 ] || { usage; exit 1; }
 local name="$1"; shift
-local R binds="" nbinds=0 wd=/root wdset=0 fake=1 bh bg trace=0
+local R binds="" nbinds=0 wd=/root wdset=0 fake=1 bh bg trace=0 seccomp="${PRX_SECCOMP:-1}"
 local -a extra_envs=()
 chk "$name"
 R="$(rootdir "$name")"
@@ -691,12 +694,14 @@ shift 2 ;;
 -w|--workdir) [ $# -ge 2 ] || die "-w requires a directory"; case "$2" in /*) wd="$2"; wdset=1 ;; *) die "-w requires an absolute guest path: $2" ;; esac; shift 2 ;;
 -e|--env)     [ $# -ge 2 ] || die "-e requires KEY=VALUE"; extra_envs+=("$2"); shift 2 ;;
 --no-root-id) fake=0; shift ;;
+--no-seccomp) seccomp=0; shift ;;
 --trace)      trace=1; shift ;;
 --) shift; break ;;
 -*) die "Unknown option for 'login': $1 (put '--' before the command if it starts with '-')" ;;
 *) break ;;
 esac
 done
+case "$seccomp" in 0|1) ;; *) die "PRX_SECCOMP must be 0 or 1 (got: $seccomp)" ;; esac
 local vuser="" vhome="/root"
 if [ "$fake" = 0 ]; then
 local huid hgid hu
@@ -735,7 +740,7 @@ elif ! { ${QEMU:+"$QEMU"} "$LD" --help 2>&1 || true; } | grep -q -- '--argv0'; t
 fi
 if [ "$NOARGV0" = 1 ] && [ "$trace" = 1 ]; then info "loader has no --argv0 (glibc < 2.33): argv[0] will be the full path"; fi
 local PL=""
-if [ "$ARCH" = aarch64 ] && [ -z "$QEMU" ]; then
+if [ "$ARCH" = aarch64 ] && [ -z "$QEMU" ] && [ "$seccomp" = 1 ]; then
 [ -x "$PRX_HOME/lib/ldpatch" ] || cmd_build
 PL="$PRX_HOME/lib/ld-$name.so"
 local ldst lcst
@@ -850,6 +855,8 @@ user_val="$vuser"
 home_val="$vhome"
 fi
 local cur_dns; cur_dns="$(detect_dns)"
+local tun="${GLIBC_TUNABLES:-}"
+if [ "$seccomp" = 1 ] && [ -z "$tun" ]; then tun="glibc.pthread.rseq=0"; fi
 local -a ldenv=() runner=() argv0opt=()
 [ "$NOARGV0" = 1 ] || argv0opt=(--argv0 "$(basename "$gshell")")
 if [ -n "$QEMU" ]; then
@@ -871,7 +878,7 @@ PRX_ROOTFS="$R" PRX_SHIM="$SHIM" PRX_LIBPATH="$LP" PRX_BIND="$binds" \
 PRX_SESSION="$tok" PRX_SELF_EXE="$gshell" \
 PRX_DNS="$cur_dns" PRX_FAKEROOT="$fake" PRX_VUSER="$vuser" \
 PRX_TRACE="$trace" PRX_LOADER="$PL" PRX_NO_ARGV0="$NOARGV0" \
-GLIBC_TUNABLES="${GLIBC_TUNABLES:-glibc.pthread.rseq=0}" \
+PRX_SECCOMP="$seccomp" GLIBC_TUNABLES="$tun" \
 ${ldenv[@]+"${ldenv[@]}"} \
 ${term_envs[@]+"${term_envs[@]}"} \
 ${extra_envs[@]+"${extra_envs[@]}"} \

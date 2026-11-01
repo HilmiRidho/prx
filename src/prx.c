@@ -11,7 +11,8 @@
 #include "shim/sys.h"       /* raw syscalls (sc), pread_, 64-bit div        */
 #include "shim/libc.h"      /* libc imports, ret/fail/geterr, nextsym       */
 #include "shim/state.h"     /* globals: rootfs, binds, virtual creds        */
-#include "shim/init.h"      /* bind parsing, SIGSYS handler, init           */
+#include "shim/seccomp.h"   /* host seccomp workarounds (SIGSYS -> ENOSYS)  */
+#include "shim/init.h"      /* bind parsing, early init                     */
 #include "shim/path.h"      /* guest <-> host path translation              */
 #include "shim/procfs.h"    /* fake /proc files, mountinfo                  */
 #include "shim/fs_open.h"   /* open / fopen / dlopen                        */
@@ -21,7 +22,7 @@
 #include "shim/tty.h"       /* ioctl, isatty, tcgetattr, fcntl              */
 #include "shim/glob_tmp.h"  /* glob, scandir, mkstemp                       */
 #include "shim/net_unix.h"  /* AF_UNIX translation, sendmsg / recvmsg       */
-#include "shim/proc.h"      /* capabilities, prctl, uname, signals, sysinfo */
+#include "shim/proc.h"      /* capabilities, prctl, uname, sysinfo          */
 #include "shim/cred.h"      /* setuid family, groups (virtual credentials)  */
 #include "shim/pwdb.h"      /* passwd / group lookups, credential encoding  */
 #include "shim/exec.h"      /* exec / spawn / system / popen                */

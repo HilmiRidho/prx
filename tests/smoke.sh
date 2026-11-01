@@ -15,7 +15,7 @@ bash -n "$PRX" && ok "bash -n prx"
 [ "$("$PRX" --version)" = "prx $(sed -n 's/^PRX_VERSION=//p' "$PRX")" ] && ok "--version"
 "$PRX" help | grep -q 'prx install NAME' && ok "help"
 [ "$("$PRX" -V)" = "$("$PRX" --version)" ] && [ "$("$PRX" version)" = "$("$PRX" --version)" ] && ok "-V and version match --version"
-for w in PRX_KEEP PRX_QEMU=pemu PEMU_JIT PRX_NO_ARGV0 PRX_DNS PRX_SRCDIR '\-\-sha256' '\-\-no-root-id' '\-\-trace' '\-V'; do
+for w in PRX_KEEP PRX_QEMU=pemu PEMU_JIT PRX_NO_ARGV0 PRX_DNS PRX_SRCDIR '\-\-sha256' '\-\-no-root-id' '\-\-no-seccomp' PRX_SECCOMP PRX_SHIM_CFLAGS '\-\-trace' '\-V'; do
   "$PRX" help | grep -q -e "$w" || fail "help does not mention $w"
 done
 ok "help documents every option and environment variable"
@@ -30,6 +30,7 @@ ok "prx source has no unresolved shim includes"
 exp=$(( $(grep -vc '^#include "shim/' "$HERE/src/prx.c") + $(cat "$HERE"/src/shim/*.h | wc -l) ))
 [ "$(wc -l < "$T/shim_all.c")" = "$exp" ] && ok "prx source = src/prx.c + every src/shim module"
 "${CC:-cc}" -fsyntax-only -w -ffreestanding "$T/shim_all.c" 2>/dev/null && ok "prx source compiles standalone"
+"${CC:-cc}" -fsyntax-only -Wall -Wno-unused-function -ffreestanding -DPRX_NO_SECCOMP "$T/shim_all.c" 2>/dev/null && ok "shim compiles with -DPRX_NO_SECCOMP"
 "$PRX" ldsource | cmp -s - "$HERE/src/ldpatch.c" && ok "prx ldsource matches src/ldpatch.c"
 
 # XDG default location (no ~/.prx present)
@@ -158,6 +159,25 @@ CEOF
 out="$(env -i PRX_ROOTFS="$T/fs" PRX_SHIM="$SHIMSO" LD_PRELOAD="$SHIMSO" "$T/aff")"
 echo "$out" | grep -q 'pid invalid: r=-1 errno=3' && ok "sched_getaffinity reports ESRCH" || fail "sched_getaffinity reports ESRCH"
 echo "$out" | grep -q 'buf 1 byte: r=-1 errno=22' && ok "sched_getaffinity reports EINVAL" || fail "sched_getaffinity reports EINVAL"
+# seccomp module: the guest cannot replace the SIGSYS handler, unless it is switched off
+cat > "$T/sg.c" <<'CEOF'
+#include <signal.h>
+#include <stdio.h>
+static void h(int s) { (void) s; }
+int main(void) {
+    struct sigaction a = {0}, o = {0};
+    a.sa_handler = h;
+    sigaction(SIGSYS, &a, 0);
+    sigaction(SIGSYS, 0, &o);
+    puts(o.sa_handler == h ? "guest-handler" : "shim-handler");
+    return 0;
+}
+CEOF
+"$CCB" -o "$T/sg" "$T/sg.c"
+out="$(env -i PRX_ROOTFS="$T/fs" PRX_SHIM="$SHIMSO" LD_PRELOAD="$SHIMSO" "$T/sg")"
+[ "$out" = shim-handler ] && ok "seccomp module: guest cannot replace SIGSYS handler" || fail "seccomp module: guest cannot replace SIGSYS handler"
+out="$(env -i PRX_ROOTFS="$T/fs" PRX_SHIM="$SHIMSO" LD_PRELOAD="$SHIMSO" PRX_SECCOMP=0 "$T/sg")"
+[ "$out" = guest-handler ] && ok "PRX_SECCOMP=0 leaves SIGSYS to the guest" || fail "PRX_SECCOMP=0 leaves SIGSYS to the guest"
 bd="$T/lb"; while [ "${#bd}" -lt 400 ]; do bd="$bd/$(printf 'b%.0s' $(seq 1 60))"; done
 mkdir -p "$bd"; echo bound > "$bd/f"
 [ "$(env -i PRX_ROOTFS="$T/fs" PRX_SHIM="$SHIMSO" LD_PRELOAD="$SHIMSO" PRX_BIND="$bd" "$(command -v cat)" "$bd/f" 2>/dev/null)" = bound ] && ok "bind path > 159 bytes works" || fail "bind path > 159 bytes works"
