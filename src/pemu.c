@@ -504,6 +504,39 @@ static int simd_insn(CPU*c, u32 i) {
         if (!q) c->v[rd][1] = 0;
         return 0;
     }
+    if ((i & 0x9FE08400) == 0x0E000400) {                      /* copy: DUP (element/general), INS, SMOV, UMOV */
+        int imm5 = (i >> 16) & 31, imm4 = (i >> 11) & 15, op = (i >> 29) & 1;
+        if (!(imm5 & 15)) return -1;
+        int sz = __builtin_ctz((unsigned) imm5), idx = imm5 >> (sz + 1), esz = 1 << sz;
+        u8*d = (u8*) c->v[rd], *n = (u8*) c->v[rn];
+        if (op) {                                              /* INS (element) */
+            if (!q) return -1;
+            int idx2 = imm4 >> sz; u8 t[8];
+            memcpy(t, n + idx2 * esz, (size_t) esz); memcpy(d + idx * esz, t, (size_t) esz);
+            return 0;
+        }
+        switch (imm4) {
+        case 0: case 1: {                                      /* DUP */
+            if (sz == 3 && !q) return -1;
+            u64 e = 0; u8 t[16] = {0};
+            if (imm4 == 0) memcpy(&e, n + idx * esz, (size_t) esz); else e = X(rn);
+            for (int k = 0; k < (q ? 16 : 8) / esz; k++) memcpy(t + k * esz, &e, (size_t) esz);
+            memcpy(d, t, 16); return 0; }
+        case 3: {                                              /* INS (general) */
+            if (!q) return -1;
+            u64 e = X(rn); memcpy(d + idx * esz, &e, (size_t) esz); return 0; }
+        case 5: {                                              /* SMOV */
+            if (sz == 3 || (!q && sz == 2)) return -1;
+            u64 e = 0; memcpy(&e, n + idx * esz, (size_t) esz);
+            s64 v = sz == 0 ? (s64)(int8_t) e : sz == 1 ? (s64)(int16_t) e : (s64)(int32_t) e;
+            SET(rd, q ? (u64) v : (u64) v & M32); return 0; }
+        case 7: {                                              /* UMOV */
+            if (q ? sz != 3 : sz == 3) return -1;
+            u64 e = 0; memcpy(&e, n + idx * esz, (size_t) esz);
+            SET(rd, e); return 0; }
+        default: return -1;
+        }
+    }
     if ((i & 0x9FF80400) == 0x0F000400) {                      /* modified immediate: MOVI / MVNI / ORR / BIC / FMOV (vector) */
         int cm = (i >> 12) & 15, op = (i >> 29) & 1;
         u64 imm8 = (((i >> 16) & 7) << 5) | ((i >> 5) & 31), v = 0, w;
