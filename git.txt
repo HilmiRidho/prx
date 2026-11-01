@@ -1,5 +1,5 @@
-git apply --check docs-tests-update.patch
-git apply docs-tests-update.patch
+git apply --check pemu_x64.patch
+git apply pemu_x64.patch
 git add .
-git commit -m "docs update"
+git commit -m "improve pemu performance"
 git push
