@@ -71,7 +71,6 @@ See `man prx` or `prx help` for all commands and options.
 | `prx list` | List installed containers. |
 | `prx fixperm NAME` | Repair permissions and flush the library-path cache. |
 | `prx remove NAME` | Delete a container and its derived files. |
-| `prx source`, `prx ldsource` | Print the C sources of the shim / loader patcher. |
 | `prx --version` (`-V`, `version`) | Print the version. |
 | `prx help` (`-h`, `--help`) | Print usage. |
 
@@ -94,7 +93,7 @@ Unknown options are an error, not a command; put the command after `--`.
 
 | Variable | Meaning |
 | --- | --- |
-| `PRX_HOME` | Data directory. Default: `~/.prx` if it exists, otherwise `$XDG_DATA_HOME/prx` (`~/.local/share/prx`). |
+| `PRX_HOME` | Data directory. Default: `$XDG_DATA_HOME/prx` (`~/.local/share/prx`). |
 | `PRX_SRCDIR` | Directory holding `prx.c`, `ldpatch.c` and `shim/`. |
 | `PRX_SECCOMP` | `0` disables the host-seccomp workarounds, same as `--no-seccomp` (default `1`). |
 | `PRX_SHIM_CFLAGS` | Extra compiler flags for the shim, e.g. `-DPRX_NO_SECCOMP`; run `prx build` afterwards. |
@@ -129,7 +128,7 @@ Unknown options are an error, not a command; put the command after `--`.
 ### Shim modules
 
 The shim is compiled as a single translation unit (`src/prx.c` includes the
-modules in dependency order). `prx source` prints the modules expanded into one file.
+modules in dependency order).
 
 | Module | Concern |
 | --- | --- |
@@ -138,6 +137,7 @@ modules in dependency order). `prx source` prints the modules expanded into one 
 | `path.h`, `procfs.h` | Guest/host path translation, fake `/proc` files |
 | `fs_open.h`, `fs_stat.h`, `fs_ops.h`, `tty.h`, `glob_tmp.h` | File-system interposers |
 | `net_unix.h`, `resolve.h` | AF_UNIX path translation, DNS and `/etc/hosts` |
+| `ipc_shm.h` | System V shared-memory emulation for kernels without SysV IPC |
 | `proc.h`, `cred.h`, `pwdb.h`, `exec.h` | Capabilities, prctl, uname, sysinfo, virtual credentials, passwd/group, exec and spawn |
 
 ### Seccomp module
@@ -212,6 +212,24 @@ Threads in `pemu.c` (aarch64 guest), AVX/SSE3+/BMI (cpuid reports a baseline x86
 ## Changelog
 
 ### Unreleased
+
+**Removed**
+
+- `prx source` and `prx ldsource`; the sources are installed under `share/prx/src`.
+- Backward-compatibility code: the `~/.prx` data directory (now always `$XDG_DATA_HOME/prx`) and the `:`-separated `PRX_DNS` list.
+- Shim wrappers that only forwarded to glibc (`ioctl`, `fcntl`, `fcntl64`, `fchdir`, `fdopendir`, `ftruncate*`, `f{get,set,list,remove}xattr`, `futimes`, `fpathconf`, `fstatvfs*`, `socketpair`) and some unused constants.
+
+**Fixed (shim)**
+
+- `faccessat`/`faccessat2` ignored `AT_SYMLINK_NOFOLLOW` and `AT_EACCESS`.
+- `tmpfile()` wrote to the host's `/tmp`; `inotify_add_watch`, `ftw` and `nftw` did not translate paths.
+- `getpwent`/`getgrent`/`getgrouplist` read the host's databases, and `getpw*`/`getgr*` fell back to the host for users missing in the guest.
+- `sched_setaffinity` always succeeded, even with `--no-seccomp`; it now only hides errors that seccomp causes.
+- `sendmsg` with `SCM_CREDENTIALS` reported success but dropped the message; it is now resent without the forged credentials.
+- `SO_PEERCRED` reported host ids instead of the fake-root ids.
+- `getcwd(buf, 0)` returned `ERANGE` instead of `EINVAL`.
+- `shmget` emulation was not atomic across processes; `shmctl` no longer locks for real kernel segments.
+- `make lint` now also checks the shim.
 
 **Fixed (`pemu_x64`)**
 

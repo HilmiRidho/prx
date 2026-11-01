@@ -1,7 +1,8 @@
 /* fs_ops.h - access, readlink, cwd, realpath, rename, link, chmod, chown, mknod, mount, xattr, statfs
  * Part of the prx shim (unity build: included by src/prx.c, not a standalone header). */
 static int do_access(int dfd, const char*p, int mode, int fl) {
-    TR1(dfd, p, !(fl&AT_SYMLINK_NOFOLLOW)) long r = SC3(N_faccessat, dfd, h1, mode);
+    TR1(dfd, p, !(fl&AT_SYMLINK_NOFOLLOW)) long r = SC4(N_faccessat2, dfd, h1, mode, fl);
+    if (r == -ENOSYS) r = SC3(N_faccessat, dfd, h1, mode);
     if (r == -EACCES && VROOT()) {
         char st[256];
         if (SC4(N_newfstatat, dfd, h1, st, fl&AT_SYMLINK_NOFOLLOW) == 0) {
@@ -64,13 +65,12 @@ EXP long __readlinkat_chk(int d, const char*p, char*b, size_t n, size_t bl) {
 EXP int chdir(const char*p) {
     TR1(AT_FDCWD, p, 1) return (int) ret(SC3(N_chdir, h1, 0, 0));
 }
-EXP int fchdir(int fd) {
-    static int(*f)(int);
-    if (!f) f = nextsym("fchdir");
-    return f ? f(fd) : (int) ret(sc(N_fchdir, fd, 0, 0, 0, 0, 0));
-}
 static char*do_getcwd(char*buf, size_t size) {
     char tmp[PM];
+    if (buf && size == 0) {
+        fail(EINVAL);
+        return NULL;
+    }
     long n = sc(N_getcwd, (long) tmp, PM, 0, 0, 0, 0);
     if (n<0) {
         fail((int)-n);
@@ -345,16 +345,6 @@ EXP int truncate64(const char*p, s64 len) {
     TR1(AT_FDCWD, p, 1) return (int) ret(SC3(N_truncate, h1, len, 0));
 #endif
 }
-EXP int ftruncate(int fd, long len) {
-    static int(*f)(int, long);
-    if (!f) f = nextsym("ftruncate");
-    return f ? f(fd, len) : 0;
-}
-EXP int ftruncate64(int fd, s64 len) {
-    static int(*f)(int, s64);
-    if (!f) f = nextsym("ftruncate64");
-    return f ? f(fd, len) : 0;
-}
 EXP int utimensat(int d, const char*p, const void*t, int f) {
     if (!p) return (int) ret(SC4(N_utimensat, d, 0, t, f));
     TR1(d, p, !(f&AT_SYMLINK_NOFOLLOW)) return (int) ret(SC4(N_utimensat, d, h1, t, f));
@@ -440,26 +430,7 @@ XA_LIST(listxattr, N_listxattr, 1) XA_LIST(llistxattr, N_llistxattr, 0)
 #define XA_SET(name,nr,fol) EXP int name(const char*p,const char*n,const void*v,size_t s,int f){TR1(AT_FDCWD,p,fol)return(int)ret(sc(nr,(long)h1,(long)n,(long)v,(long)s,f,0));}
 XA_SET(setxattr, N_setxattr, 1) XA_SET(lsetxattr, N_lsetxattr, 0)
 #define XA_REM(name,nr,fol) EXP int name(const char*p,const char*n){TR1(AT_FDCWD,p,fol)return(int)ret(SC3(nr,h1,n,0));}
-XA_REM(removexattr, N_removexattr, 1) XA_REM(lremovexattr, N_lremovexattr, 0) EXP long fgetxattr(int fd, const char*n, void*v, size_t s) {
-    static long(*f)(int, const char*, void*, size_t);
-    if (!f) f = nextsym("fgetxattr");
-    return f ? f(fd, n, v, s) : -1;
-}
-EXP int fsetxattr(int fd, const char*n, const void*v, size_t s, int flags) {
-    static int(*f)(int, const char*, const void*, size_t, int);
-    if (!f) f = nextsym("fsetxattr");
-    return f ? f(fd, n, v, s, flags) : 0;
-}
-EXP long flistxattr(int fd, char*l, size_t s) {
-    static long(*f)(int, char*, size_t);
-    if (!f) f = nextsym("flistxattr");
-    return f ? f(fd, l, s) : -1;
-}
-EXP int fremovexattr(int fd, const char*n) {
-    static int(*f)(int, const char*);
-    if (!f) f = nextsym("fremovexattr");
-    return f ? f(fd, n) : 0;
-}
+XA_REM(removexattr, N_removexattr, 1) XA_REM(lremovexattr, N_lremovexattr, 0)
 static void fix_statfs(void*b) {
     if (!b) return;
     unsigned long t = *(unsigned long*) b;
@@ -509,16 +480,6 @@ EXP int statvfs64(const char*p, void*b) {
     if (!f) f = nextsym("statvfs64");
     return f ? f(h, b) : -1;
 }
-EXP int fstatvfs(int fd, void*b) {
-    static int(*f)(int, void*);
-    if (!f) f = nextsym("fstatvfs");
-    return f ? f(fd, b) : -1;
-}
-EXP int fstatvfs64(int fd, void*b) {
-    static int(*f)(int, void*);
-    if (!f) f = nextsym("fstatvfs64");
-    return f ? f(fd, b) : -1;
-}
 #define TRWRAP(rt,name,fol,T2) EXP rt name(const char*p,T2 a){static rt(*f)(const char*,T2);char bb[PM];const char*h;if(tr(AT_FDCWD,p,bb,(fol),&h)<0)return(rt)-1;if(!f)f=nextsym(#name);return f(h,a);}
 TRWRAP(int, utimes, 1, const void*) TRWRAP(int, utime, 1, const void*) TRWRAP(int, lutimes, 0, const void*) TRWRAP(long, pathconf, 1, int) EXP int futimesat(int d, const char*p, const void*tv) {
     static int(*f)(int, const char*, const void*);
@@ -529,13 +490,60 @@ TRWRAP(int, utimes, 1, const void*) TRWRAP(int, utime, 1, const void*) TRWRAP(in
     if (!f) f = nextsym("futimesat");
     return f(d, h, tv);
 }
-EXP int futimes(int fd, const void*tv) {
-    static int(*f)(int, const void*);
-    if (!f) f = nextsym("futimes");
-    return f ? f(fd, tv) : 0;
+/* inotify_add_watch takes a path that glibc passes straight to the kernel. */
+EXP int inotify_add_watch(int fd, const char*p, u32 mask) {
+    static int(*f)(int, const char*, u32);
+    TR1(AT_FDCWD, p, !(mask&0x02000000)) /* IN_DONT_FOLLOW */
+    if (!f) f = nextsym("inotify_add_watch");
+    return f ? f(fd, h1, mask) : (int) fail(ENOSYS);
 }
-EXP long fpathconf(int fd, int name) {
-    static long(*f)(int, int);
-    if (!f) f = nextsym("fpathconf");
-    return f ? f(fd, name) : -1;
+/* ftw/nftw walk the tree with glibc-internal syscalls, so the root is
+   translated here and the callback gets the guest view of each path back
+   (and FTW.base shifted accordingly). Not re-entrant across threads. */
+struct ftwbuf_t {
+    int base;
+    int level;
+};
+typedef int(*nftw_cb_t)(const char*, const void*, int, struct ftwbuf_t*);
+typedef int(*ftw_cb_t)(const char*, const void*, int);
+static nftw_cb_t g_nftw_cb;
+static ftw_cb_t g_ftw_cb;
+static const char*ftw_guest(const char*p) {
+    if (!hasroot(p)) return p;
+    p += g_rl;
+    return *p ? p : "/";
 }
+static int nftw_tramp(const char*p, const void*s, int fl, struct ftwbuf_t*w) {
+    const char*q = ftw_guest(p);
+    int ob = w->base;
+    if (q != p) w->base = ob>(int) g_rl ? ob-(int) g_rl : 0;
+    int r = g_nftw_cb(q, s, fl, w);
+    w->base = ob;
+    return r;
+}
+static int ftw_tramp(const char*p, const void*s, int fl) {
+    return g_ftw_cb(ftw_guest(p), s, fl);
+}
+#define NFTW_WRAP(name) EXP int name(const char*p, nftw_cb_t cb, int nfd, int fl) { \
+    static int(*f)(const char*, void*, int, int); \
+    char b[PM]; const char*h; \
+    if (!f) f = nextsym(#name); \
+    if (!f) return (int) fail(ENOSYS); \
+    if (tr(AT_FDCWD, p, b, 1, &h)<0) return-1; \
+    if (h == p) return f(p, cb, nfd, fl); \
+    nftw_cb_t old = g_nftw_cb; g_nftw_cb = cb; \
+    int r = f(h, nftw_tramp, nfd, fl); \
+    g_nftw_cb = old; \
+    return r; }
+#define FTW_WRAP(name) EXP int name(const char*p, ftw_cb_t cb, int nfd) { \
+    static int(*f)(const char*, void*, int); \
+    char b[PM]; const char*h; \
+    if (!f) f = nextsym(#name); \
+    if (!f) return (int) fail(ENOSYS); \
+    if (tr(AT_FDCWD, p, b, 1, &h)<0) return-1; \
+    if (h == p) return f(p, cb, nfd); \
+    ftw_cb_t old = g_ftw_cb; g_ftw_cb = cb; \
+    int r = f(h, ftw_tramp, nfd); \
+    g_ftw_cb = old; \
+    return r; }
+NFTW_WRAP(nftw) NFTW_WRAP(nftw64) FTW_WRAP(ftw) FTW_WRAP(ftw64)

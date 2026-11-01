@@ -1,4 +1,4 @@
-/* glob_tmp.h - glob, scandir, mkstemp, mkdtemp
+/* glob_tmp.h - glob, scandir, mkstemp, mkdtemp, tmpfile
  * Part of the prx shim (unity build: included by src/prx.c, not a standalone header). */
 typedef struct {
     size_t gl_pathc;
@@ -107,6 +107,27 @@ EXP int mkstemps(char*t, int s) {
 }
 EXP int mkstemps64(char*t, int s) {
     return tmpgen(t, s, 0, 0);
+}
+/* glibc's own tmpfile() opens "/tmp" through an internal call that bypasses
+   this shim and lands in the host's /tmp; build it from the translated mkstemp. */
+static void*do_tmpfile(void) {
+    char t[] = "/tmp/tmpfXXXXXX";
+    int fd = tmpgen(t, 0, 0, 0);
+    if (fd<0) return NULL;
+    unlink(t);
+    void*f = fdopen(fd, "w+");
+    if (!f) {
+        int e = geterr();
+        sc(N_close, fd, 0, 0, 0, 0, 0);
+        *__errno_location() = e;
+    }
+    return f;
+}
+EXP void*tmpfile(void) {
+    return do_tmpfile();
+}
+EXP void*tmpfile64(void) {
+    return do_tmpfile();
 }
 EXP char*mkdtemp(char*t) {
     return tmpgen(t, 0, 0, 1)<0 ? NULL : t;

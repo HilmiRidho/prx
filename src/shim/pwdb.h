@@ -1,4 +1,4 @@
-/* pwdb.h - passwd/group lookups, credential encoding
+/* pwdb.h - passwd/group lookups and enumeration, credential encoding
  * Part of the prx shim (unity build: included by src/prx.c, not a standalone header). */
 struct pw {
     char*name, *passwd;
@@ -58,10 +58,13 @@ static char*read_rel_all(const char*rel, long*lenp) {
     if (lenp)*lenp = (long) len;
     return b;
 }
+/* byuid: 0 = by name, 1 = by uid, 2 = the uid-th valid entry (enumeration).
+   Returns 1 found, 0 not found, -1 buffer too small, -2 database unreadable. */
 static int pw_lookup(const char*name, int byuid, u32 uid, struct pw*o, char*buf, size_t bl) {
+    u32 idx = 0;
     long n;
     char*data = read_rel_all("/etc/passwd", &n);
-    if (!data) return 0;
+    if (!data) return-2;
     if (n <= 0) {
         free(data);
         return 0;
@@ -81,7 +84,7 @@ static int pw_lookup(const char*name, int byuid, u32 uid, struct pw*o, char*buf,
                 f[k++] = p+1;
             }
         }
-        if (k == 7 && ((byuid && atou(f[2]) == uid) || (!byuid && !strcmp(f[0], name)))) {
+        if (k == 7 && (byuid == 2 ? idx++ == uid : ((byuid && atou(f[2]) == uid) || (!byuid && !strcmp(f[0], name))))) {
             size_t need = 0;
             for (int i = 0; i<7; i++) need += strlen(f[i])+1;
             if (need>bl) {
@@ -112,9 +115,10 @@ static int pw_lookup(const char*name, int byuid, u32 uid, struct pw*o, char*buf,
     return res;
 }
 static int gr_lookup(const char*name, int bygid, u32 gid, struct gr*o, char*buf, size_t bl) {
+    u32 idx = 0;
     long n;
     char*data = read_rel_all("/etc/group", &n);
-    if (!data) return 0;
+    if (!data) return-2;
     if (n <= 0) {
         free(data);
         return 0;
@@ -134,7 +138,7 @@ static int gr_lookup(const char*name, int bygid, u32 gid, struct gr*o, char*buf,
                 f[k++] = p+1;
             }
         }
-        if (k == 4 && ((bygid && atou(f[2]) == gid) || (!bygid && !strcmp(f[0], name)))) {
+        if (k == 4 && (bygid == 2 ? idx++ == gid : ((bygid && atou(f[2]) == gid) || (!bygid && !strcmp(f[0], name))))) {
             size_t nmem = 0;
             if (f[3][0]) {
                 nmem = 1;
@@ -297,7 +301,7 @@ static int pw_lookup_dyn(const char*name, int byuid, u32 uid) {
     }
     for (;;) {
         int r = pw_lookup(name, byuid, uid, &s_pw, s_pwbuf, s_pwcap);
-        if (r >= 0 || s_pwcap >= (1UL<<26)) return r;
+        if (r != -1 || s_pwcap >= (1UL<<26)) return r;
         char*nb = realloc(s_pwbuf, s_pwcap*2);
         if (!nb) return-1;
         s_pwbuf = nb;
@@ -314,7 +318,7 @@ static int gr_lookup_dyn(const char*name, int bygid, u32 gid) {
     }
     for (;;) {
         int r = gr_lookup(name, bygid, gid, &s_gr, s_grbuf, s_grcap);
-        if (r >= 0 || s_grcap >= (1UL<<26)) return r;
+        if (r != -1 || s_grcap >= (1UL<<26)) return r;
         char*nb = realloc(s_grbuf, s_grcap*2);
         if (!nb) return-1;
         s_grbuf = nb;
@@ -323,25 +327,41 @@ static int gr_lookup_dyn(const char*name, int bygid, u32 gid) {
 }
 EXP struct pw*getpwuid(u32 uid) {
     static struct pw*(*f)(u32);
-    if (g_rl && pw_lookup_dyn(NULL, 1, uid) == 1) return&s_pw;
+    if (g_rl) {
+        int r = pw_lookup_dyn(NULL, 1, uid);
+        if (r == 1) return&s_pw;
+        if (r == 0) return NULL; /* readable database, no such entry: never ask the host */
+    }
     if (!f) f = nextsym("getpwuid");
     return f(uid);
 }
 EXP struct pw*getpwnam(const char*n) {
     static struct pw*(*f)(const char*);
-    if (g_rl && pw_lookup_dyn(n, 0, 0) == 1) return&s_pw;
+    if (g_rl) {
+        int r = pw_lookup_dyn(n, 0, 0);
+        if (r == 1) return&s_pw;
+        if (r == 0) return NULL; /* readable database, no such entry: never ask the host */
+    }
     if (!f) f = nextsym("getpwnam");
     return f(n);
 }
 EXP struct gr*getgrgid(u32 gid) {
     static struct gr*(*f)(u32);
-    if (g_rl && gr_lookup_dyn(NULL, 1, gid) == 1) return&s_gr;
+    if (g_rl) {
+        int r = gr_lookup_dyn(NULL, 1, gid);
+        if (r == 1) return&s_gr;
+        if (r == 0) return NULL; /* readable database, no such entry: never ask the host */
+    }
     if (!f) f = nextsym("getgrgid");
     return f(gid);
 }
 EXP struct gr*getgrnam(const char*n) {
     static struct gr*(*f)(const char*);
-    if (g_rl && gr_lookup_dyn(n, 0, 0) == 1) return&s_gr;
+    if (g_rl) {
+        int r = gr_lookup_dyn(n, 0, 0);
+        if (r == 1) return&s_gr;
+        if (r == 0) return NULL; /* readable database, no such entry: never ask the host */
+    }
     if (!f) f = nextsym("getgrnam");
     return f(n);
 }
@@ -353,7 +373,11 @@ EXP int getpwnam_r(const char*n, struct pw*pw, char*buf, size_t bl, struct pw**r
             *res = pw;
             return 0;
         }
-        if (r<0) {
+        if (r == 0) {
+            *res = NULL;
+            return 0;
+        }
+        if (r == -1) {
             *res = NULL;
             return ERANGE;
         }
@@ -369,7 +393,11 @@ EXP int getpwuid_r(u32 uid, struct pw*pw, char*buf, size_t bl, struct pw**res) {
             *res = pw;
             return 0;
         }
-        if (r<0) {
+        if (r == 0) {
+            *res = NULL;
+            return 0;
+        }
+        if (r == -1) {
             *res = NULL;
             return ERANGE;
         }
@@ -385,7 +413,11 @@ EXP int getgrnam_r(const char*n, struct gr*gr, char*buf, size_t bl, struct gr**r
             *res = gr;
             return 0;
         }
-        if (r<0) {
+        if (r == 0) {
+            *res = NULL;
+            return 0;
+        }
+        if (r == -1) {
             *res = NULL;
             return ERANGE;
         }
@@ -401,11 +433,85 @@ EXP int getgrgid_r(u32 gid, struct gr*gr, char*buf, size_t bl, struct gr**res) {
             *res = gr;
             return 0;
         }
-        if (r<0) {
+        if (r == 0) {
+            *res = NULL;
+            return 0;
+        }
+        if (r == -1) {
             *res = NULL;
             return ERANGE;
         }
     }
     if (!f) f = nextsym("getgrgid_r");
     return f(gid, gr, buf, bl, res);
+}
+static u32 s_pwi, s_gri;
+EXP void setpwent(void) {
+    static void(*f)(void);
+    if (g_rl) {
+        s_pwi = 0;
+        return;
+    }
+    if (!f) f = nextsym("setpwent");
+    if (f) f();
+}
+EXP void endpwent(void) {
+    static void(*f)(void);
+    if (g_rl) {
+        s_pwi = 0;
+        return;
+    }
+    if (!f) f = nextsym("endpwent");
+    if (f) f();
+}
+EXP struct pw*getpwent(void) {
+    static struct pw*(*f)(void);
+    if (g_rl) {
+        if (pw_lookup_dyn(NULL, 2, s_pwi) != 1) return NULL;
+        s_pwi++;
+        return&s_pw;
+    }
+    if (!f) f = nextsym("getpwent");
+    return f ? f() : NULL;
+}
+EXP void setgrent(void) {
+    static void(*f)(void);
+    if (g_rl) {
+        s_gri = 0;
+        return;
+    }
+    if (!f) f = nextsym("setgrent");
+    if (f) f();
+}
+EXP void endgrent(void) {
+    static void(*f)(void);
+    if (g_rl) {
+        s_gri = 0;
+        return;
+    }
+    if (!f) f = nextsym("endgrent");
+    if (f) f();
+}
+EXP struct gr*getgrent(void) {
+    static struct gr*(*f)(void);
+    if (g_rl) {
+        if (gr_lookup_dyn(NULL, 2, s_gri) != 1) return NULL;
+        s_gri++;
+        return&s_gr;
+    }
+    if (!f) f = nextsym("getgrent");
+    return f ? f() : NULL;
+}
+EXP int getgrouplist(const char*user, u32 gid, u32*groups, int*ngroups) {
+    static int(*f)(const char*, u32, u32*, int*);
+    if (!g_rl) {
+        if (!f) f = nextsym("getgrouplist");
+        return f ? f(user, gid, groups, ngroups) : -1;
+    }
+    u32 tmp[NVG];
+    int c = cr_collect(user, gid, tmp, NVG);
+    int room = *ngroups;
+    *ngroups = c;
+    for (int i = 0; i<c && i<room; i++) groups[i] = tmp[i];
+    return room<c ? -1 : c;
 }

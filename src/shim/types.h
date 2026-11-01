@@ -49,10 +49,6 @@ typedef long long s64;
 #define ENOMEM 12
 #define EINTR 4
 #define ESTALE 116
-#define E2BIG 7
 #define ENOSPC 28
 #define EOPNOTSUPP 95
-#define R_OK 4
-#define W_OK 2
 #define X_OK 1
-#define F_OK 0

@@ -3,13 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 PRX_VERSION=1.0.1
 set -eu
-# Data directory: $PRX_HOME if set; else legacy ~/.prx if it already exists
-# (backward compatible); else the XDG location.
-if [ -z "${PRX_HOME:-}" ]; then
-if [ -d "$HOME/.prx" ]; then PRX_HOME="$HOME/.prx"
-else PRX_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/prx"
-fi
-fi
+# Data directory: $PRX_HOME if set; else the XDG location.
+PRX_HOME="${PRX_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/prx}"
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 SHIM="$PRX_HOME/lib/libprx.so"
 die()  { echo "prx: error: $*" >&2; exit 1; }
@@ -45,14 +40,13 @@ Usage:
   prx list                           List all installed rootfs containers
   prx fixperm NAME                   Fix file permissions & clear library cache
   prx remove NAME                    Completely remove a container
-  prx source | prx ldsource          Print the C sources (shim / loader patcher)
   prx help | -h | --help             Show this help
   prx --version | -V | version       Show version
 
 NAME may contain only letters, digits, '.', '_' and '-' (not starting with '-').
 
 Environment:
-  PRX_HOME=DIR      Data directory (default: ~/.prx if present, else \$XDG_DATA_HOME/prx)
+  PRX_HOME=DIR      Data directory (default: \$XDG_DATA_HOME/prx, i.e. ~/.local/share/prx)
   PRX_SRCDIR=DIR    Directory holding prx.c, ldpatch.c and shim/
   PRX_SECCOMP=0|1   0 = same as --no-seccomp (default 1)
   PRX_SHIM_CFLAGS   Extra compiler flags for the shim, e.g. -DPRX_NO_SECCOMP (run 'prx build' afterwards)
@@ -98,19 +92,6 @@ for f in "$SELF" "$SRCDIR/prx.c" "$SRCDIR/ldpatch.c" "$SRCDIR"/shim/*.h; do
 done
 return 1
 }
-# Print the whole shim as one file: src/prx.c with every `#include "shim/X.h"`
-# replaced by that module (the compiler resolves the same includes itself).
-cmd_source() {
-need_src
-local line f
-while IFS= read -r line || [ -n "$line" ]; do
-case "$line" in
-'#include "shim/'*) f="${line#*\"}"; f="${f%%\"*}"; cat "$SRCDIR/$f" ;;
-*) printf '%s\n' "$line" ;;
-esac
-done < "$SRCDIR/prx.c"
-}
-cmd_ldsource() { need_src; cat "$SRCDIR/ldpatch.c"; }
 cmd_build() {
 local cc="${CC:-}"
 if [ -z "$cc" ]; then
@@ -364,11 +345,11 @@ done
 if [ "$dbl" = 1 ]; then [ "$n" -le 7 ]; else [ "$n" -eq 8 ]; fi
 }
 # clean_dns LIST: keep only valid IPv4 / IPv6 addresses (separators: ',' ';' or
-# blanks; a legacy ':'-separated list of IPv4 addresses is still understood).
+# blanks).
 # The result is comma-separated, which is also the format the shim expects.
 clean_dns() {
-local -a toks=() parts=()
-local tok d out="" ok
+local -a toks=()
+local tok out=""
 read -r -a toks <<<"$(printf '%s' "$1" | tr ',;' '  ')"
 for tok in ${toks[@]+"${toks[@]}"}; do
 tok="${tok#[}"; tok="${tok%]}"
@@ -376,15 +357,6 @@ if valid_ipv4 "$tok" || valid_ipv6 "$tok"; then
 out="${out:+$out,}$tok"
 elif [[ "$tok" == *%* ]] && valid_ipv6 "${tok%%%*}"; then
 warn "ignoring DNS server '$tok' (scoped/zone addresses are not supported)"
-elif [[ "$tok" == *:* ]]; then
-IFS=: read -r -a parts <<<"$tok"
-ok=1
-for d in "${parts[@]}"; do valid_ipv4 "$d" || ok=0; done
-if [ "$ok" = 1 ]; then
-for d in "${parts[@]}"; do out="${out:+$out,}$d"; done
-else
-warn "ignoring invalid DNS server '$tok'"
-fi
 else
 warn "ignoring invalid DNS server '$tok'"
 fi
@@ -917,7 +889,6 @@ chmod -R u+rwX "$d" 2>/dev/null || true
 rm -rf "$d"
 rm -f "$PRX_HOME/lib/ld-$name.so" "$PRX_HOME/lib/ld-$name.so.stamp" "$PRX_HOME/lib/libpath-$name"
 rm -rf "$PRX_HOME/lib/libc-$name"
-rm -f "$PRX_HOME/conf/$name.conf"
 info "Removed container '$name' and associated patches."
 }
 case "${1:-}" in
@@ -927,9 +898,7 @@ login) shift; cmd_login "$@" ;;
 list) cmd_list ;;
 fixperm) shift; cmd_fixperm "$@" ;;
 remove) shift; cmd_remove "$@" ;;
-source) cmd_source ;;
 --version|-V|version) echo "prx $PRX_VERSION" ;;
-ldsource) cmd_ldsource ;;
 ""|-h|--help|help) usage ;;
 *) die "Unknown command '$1'. Run '$0 help' for usage." ;;
 esac

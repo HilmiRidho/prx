@@ -30,6 +30,7 @@
 #define N_capget 90
 #define N_capset 91
 #define N_getpid 172
+#define N_sched_setaffinity 122
 #define N_sched_getaffinity 123
 #define N_getppid 173
 #define N_getuid 174
@@ -42,7 +43,6 @@
 #define N_getrandom 278
 #define N_memfd_create 279
 #define N_statx 291
-#define N_execveat 281
 #define N_setxattr 5
 #define N_lsetxattr 6
 #define N_getxattr 8
@@ -68,6 +68,7 @@
 #define N_ioctl 16
 #define N_pread64 17
 #define N_getpid 39
+#define N_sched_setaffinity 203
 #define N_sched_getaffinity 204
 #define N_execve 59
 #define N_fcntl 72
@@ -111,7 +112,6 @@
 #define N_renameat2 316
 #define N_getrandom 318
 #define N_memfd_create 319
-#define N_execveat 322
 #define N_statx 332
 #define OFF_UID 28
 #define OFF_NLINK 16
@@ -153,6 +153,7 @@
 #define N_llistxattr 233
 #define N_removexattr 235
 #define N_lremovexattr 236
+#define N_sched_setaffinity 241
 #define N_sched_getaffinity 242
 #define N_statfs64 268
 #define N_fstatfs64 269
@@ -173,7 +174,6 @@
 #define N_renameat2 353
 #define N_getrandom 355
 #define N_memfd_create 356
-#define N_execveat 358
 #define N_statx 383
 #define N_utimensat_time64 412
 #define MODE_OFF 16

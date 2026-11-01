@@ -19,7 +19,7 @@
 #include "shim/ipc_shm.h"
 #include "shim/fs_stat.h"   /* stat / statx family                          */
 #include "shim/fs_ops.h"    /* access, cwd, rename, chmod, xattr, statfs... */
-#include "shim/tty.h"       /* ioctl, isatty, tcgetattr, fcntl              */
+#include "shim/tty.h"       /* isatty, tcgetattr, tcsetattr                  */
 #include "shim/glob_tmp.h"  /* glob, scandir, mkstemp                       */
 #include "shim/net_unix.h"  /* AF_UNIX translation, sendmsg / recvmsg       */
 #include "shim/proc.h"      /* capabilities, prctl, uname, sysinfo          */

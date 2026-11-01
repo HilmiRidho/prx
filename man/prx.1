@@ -72,9 +72,6 @@ Repair permissions and flush the library-path cache.
 \fBremove\fR \fINAME\fR
 Delete a container and its derived files.
 .TP
-.B source, ldsource
-Print the C sources of the shim and the loader patcher.
-.TP
 .BR \-\-version ", " \-V ", " version
 Print the version.
 .TP
@@ -83,8 +80,7 @@ Print a usage summary.
 .SH ENVIRONMENT
 .TP
 .B PRX_HOME
-Data directory. Default: \fI~/.prx\fR if it exists, otherwise
-\fI$XDG_DATA_HOME/prx\fR (\fI~/.local/share/prx\fR).
+Data directory. Default: \fI$XDG_DATA_HOME/prx\fR (\fI~/.local/share/prx\fR).
 .TP
 .B PRX_SRCDIR
 Directory containing \fIprx.c\fR, \fIldpatch.c\fR and the \fIshim/\fR modules.
@@ -107,8 +103,7 @@ An i386 rootfs always needs qemu-i386 (there is no native i386 mode).
 .TP
 .B PRX_DNS
 IPv4 and/or IPv6 nameservers to use inside the guest, separated by commas,
-semicolons or blanks (a legacy colon-separated list of IPv4 addresses is still
-accepted). Invalid entries and scoped addresses such as
+semicolons or blanks. Invalid entries and scoped addresses such as
 .I fe80::1%eth0
 are ignored with a warning.
 .TP

@@ -23,30 +23,18 @@ for w in PRX_KEEP PEMU_JIT PRX_QEMU QEMU_CPU PRX_NO_ARGV0 PRX_DNS PRX_SRCDIR PRX
   grep -q -e "$w" "$HERE/man/prx.1" || fail "man page does not mention $w"
 done
 ok "man page documents the environment variables"
-# `prx source` expands the shim modules into one self-contained file
-"$PRX" source > "$T/shim_all.c"
-if grep -q '^#include "shim/' "$T/shim_all.c"; then fail "prx source left a shim include unresolved"; fi
-ok "prx source has no unresolved shim includes"
-exp=$(( $(grep -vc '^#include "shim/' "$HERE/src/prx.c") + $(cat "$HERE"/src/shim/*.h | wc -l) ))
-[ "$(wc -l < "$T/shim_all.c")" = "$exp" ] && ok "prx source = src/prx.c + every src/shim module"
-"${CC:-cc}" -fsyntax-only -w -ffreestanding "$T/shim_all.c" 2>/dev/null && ok "prx source compiles standalone"
-"${CC:-cc}" -fsyntax-only -Wall -Wno-unused-function -ffreestanding -DPRX_NO_SECCOMP "$T/shim_all.c" 2>/dev/null && ok "shim compiles with -DPRX_NO_SECCOMP"
-"$PRX" ldsource | cmp -s - "$HERE/src/ldpatch.c" && ok "prx ldsource matches src/ldpatch.c"
+# the shim compiles standalone, with and without seccomp support
+"${CC:-cc}" -fsyntax-only -w -ffreestanding "$HERE/src/prx.c" 2>/dev/null && ok "shim compiles standalone"
+"${CC:-cc}" -fsyntax-only -Wall -Wno-unused-function -ffreestanding -DPRX_NO_SECCOMP "$HERE/src/prx.c" 2>/dev/null && ok "shim compiles with -DPRX_NO_SECCOMP"
 
-# XDG default location (no ~/.prx present)
+# default data directory (XDG)
 "$PRX" build >/dev/null 2>&1 || fail "prx build"
 [ -f "$HOME/.local/share/prx/lib/libprx.so" ] && [ -x "$HOME/.local/share/prx/lib/ldpatch" ] && ok "build -> XDG dir"
-
-# legacy dir is honoured when it already exists
-mkdir "$HOME/.prx"
-"$PRX" build >/dev/null 2>&1 || fail "prx build (legacy)"
-[ -f "$HOME/.prx/lib/libprx.so" ] && ok "legacy ~/.prx used when it exists"
-rm -rf "$HOME/.prx"
 
 # installed layout: bin/prx finds ../share/prx/src
 D="$T/dest"
 make -s -C "$HERE" install DESTDIR="$D" PREFIX=/usr >/dev/null
-"$D/usr/bin/prx" source | cmp -s - "$T/shim_all.c" && ok "installed layout finds sources"
+PRX_HOME="$T/ph" "$D/usr/bin/prx" build >/dev/null 2>&1 && [ -f "$T/ph/lib/libprx.so" ] && ok "installed layout finds sources"
 ls "$D"/usr/share/prx/src/shim/*.h >/dev/null 2>&1 && ok "shim modules installed"
 [ -f "$D/usr/share/man/man1/prx.1" ] && ok "manpage installed"
 
@@ -65,13 +53,6 @@ grep -q 'mismatch' "$T/err" && ok "wrong --sha256 is rejected"
 "$PRX" install t2 "$T/fs.tar.gz" 2>&1 | grep -q 'not verified' && ok "warns when no checksum given"
 "$PRX" list | grep -qx t1 && ok "list"
 
-# CPU/RAM limits were removed: the options and the 'set' command must be gone
-if "$PRX" set t1 -c 1 2>/dev/null; then fail "'prx set' still exists"; fi
-ok "'prx set' command removed"
-for o in -c --cpus -m --memory --hard-mem; do
-  if "$PRX" login t1 "$o" 1 2>/dev/null; then fail "login still accepts $o"; fi
-done
-ok "login rejects -c/--cpus, -m/--memory, --hard-mem"
 # ---- 1.0.1 regression tests -------------------------------------------
 # unknown option must not be run as a command
 if "$PRX" login t1 --bogus 2>"$T/err"; then fail "unknown login option accepted"; fi
@@ -97,12 +78,6 @@ want4="$(printf 'nameserver 5.6.7.8\nnameserver 2001:db8::1\nnameserver 2606:470
 grep -q "ignoring invalid DNS server '1.2.3.4%s'" "$T/err" && grep -q "ignoring invalid DNS server '999.1.1.1'" "$T/err" && ok "invalid DNS entries are reported" || fail "invalid DNS entries are reported"
 grep -q 'zone addresses are not supported' "$T/err" && ok "scoped IPv6 DNS entry is reported" || fail "scoped IPv6 DNS entry is reported"
 "$PRX" remove t4 >/dev/null 2>&1
-# legacy ':'-separated IPv4 list still works
-PRX_DNS='9.9.9.9:149.112.112.112' "$PRX" install t5 "$T/fs.tar.gz" --sha256 "$good" >/dev/null 2>&1
-want5="$(printf 'nameserver 9.9.9.9\nnameserver 149.112.112.112')"
-[ "$(cat "$HOME/.local/share/prx/rootfs/t5/etc/resolv.conf")" = "$want5" ] && ok "legacy colon-separated IPv4 list" || fail "legacy colon-separated IPv4 list"
-"$PRX" remove t5 >/dev/null 2>&1
-
 # shim: groups with >32 members, >48 KiB passwd/group, IPv6 literal parsing
 mkdir -p "$T/shimroot/etc"
 awk 'BEGIN {

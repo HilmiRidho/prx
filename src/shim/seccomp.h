@@ -49,10 +49,14 @@ _Static_assert(sizeof (struct ksa) == 152, "struct ksa must match 64-bit struct 
 #endif
 static void prx_early(void);
 EXP int sched_setaffinity(int pid, size_t cpusetsize, const void*mask) {
-    (void) pid;
-    (void) cpusetsize;
-    (void) mask;
-    return 0;
+    prx_early();
+    long r = sc(N_sched_setaffinity, pid, (long) cpusetsize, (long) mask, 0, 0, 0);
+    if (r >= 0) return 0;
+    /* Same policy as sched_getaffinity: only a syscall the host's seccomp
+       filter blocks is papered over; genuine errors (EINVAL, ESRCH, ...)
+       reach the caller, and --no-seccomp never fakes anything. */
+    int blocked = g_seccomp && (r == -ENOSYS || ((r == -EPERM || r == -EACCES) && pid == 0));
+    return blocked ? 0 : (int) ret(r);
 }
 EXP int sched_getaffinity(int pid, size_t cpusetsize, void*mask) {
     prx_early();
@@ -63,7 +67,7 @@ EXP int sched_getaffinity(int pid, size_t cpusetsize, void*mask) {
            EFAULT, ...) must reach the caller. Only a syscall that the host's
            seccomp policy blocks (ENOSYS, or EPERM/EACCES for ourselves) is
            papered over with a synthetic mask so nproc & co. keep working. */
-        int blocked = r == -ENOSYS || ((r == -EPERM || r == -EACCES) && pid == 0);
+        int blocked = g_seccomp && (r == -ENOSYS || ((r == -EPERM || r == -EACCES) && pid == 0));
         if (!blocked || !mask || cpusetsize == 0) return (int) ret(r);
         memset(m, 0xff, cpusetsize);
         return 0;

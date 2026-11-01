@@ -56,6 +56,8 @@ lint:
 	bash -n prx
 	@if command -v shellcheck >/dev/null 2>&1; then shellcheck -S warning -s bash prx tests/smoke.sh; else echo "shellcheck not installed, skipped"; fi
 	$(CC) -fsyntax-only -Wall -Wno-unused-function src/ldpatch.c
+	$(CC) -fsyntax-only -Wall -Wextra -ffreestanding src/prx.c
+	$(CC) -fsyntax-only -Wall -Wextra -Wno-unused-function -ffreestanding -DPRX_NO_SECCOMP src/prx.c
 	$(CC) -fsyntax-only -Wall src/pemu_x64.c
 	$(CC) -fsyntax-only -Wall -DPEMU_NO_JIT src/pemu_x64.c
 	@if [ "$$(uname -m)" != aarch64 ]; then $(CC) -fsyntax-only -Wall -DPEMU_JIT_EMBED src/pemu_x64.c; fi

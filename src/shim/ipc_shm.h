@@ -5,22 +5,16 @@
 #define IPC_RMID    0
 #define IPC_SET     1
 #define IPC_STAT    2
-#define IPC_INFO    3
 
 #define IPC_CREAT   01000
 #define IPC_EXCL    02000
 
 #define SHM_RDONLY  010000
-#define SHM_RND     020000
 
 #define PROT_READ_  0x1
 #define PROT_WRITE_ 0x2
 #define MAP_SHARED_ 0x01
 #define MAP_FIXED_  0x10
-
-#ifndef ENOSPC
-#define ENOSPC 28
-#endif
 
 struct prx_shm_meta {
     u32 key;
@@ -112,17 +106,9 @@ static void shm_unlink_all(int shmid, u32 key) {
     if (key != IPC_PRIVATE && shm_build_path(p, "k", (int)key) == 0) SC3(N_unlinkat, AT_FDCWD, p, 0);
 }
 
-EXP int shmget(int key, size_t size, int shmflg) {
-    static int (*real_shmget)(int, size_t, int);
-    if (!real_shmget) real_shmget = nextsym("shmget");
-    
-    if (real_shmget) {
-        int r = real_shmget(key, size, shmflg);
-        if (r >= 0) return r;
-        int err = geterr();
-        if (err != ENOSYS && err != EACCES && err != EPERM) return -1;
-    }
-
+/* Key lookup + create must be atomic across processes, otherwise two
+   shmget(key, IPC_CREAT) callers end up with different segments. */
+static int shmget_emul(int key, size_t size, int shmflg) {
     if (size > 0x7fffffffULL) return (int)fail(EINVAL);
     
     int shmid = -1;
@@ -193,6 +179,24 @@ EXP int shmget(int key, size_t size, int shmflg) {
     }
 
     return shmid;
+}
+EXP int shmget(int key, size_t size, int shmflg) {
+    static int (*real_shmget)(int, size_t, int);
+    if (!real_shmget) real_shmget = nextsym("shmget");
+    
+    if (real_shmget) {
+        int r = real_shmget(key, size, shmflg);
+        if (r >= 0) return r;
+        int err = geterr();
+        if (err != ENOSYS && err != EACCES && err != EPERM) return -1;
+    }
+
+    long lk = shm_lock();
+    int rv = shmget_emul(key, size, shmflg);
+    int ee = geterr();
+    shm_unlock(lk);
+    *__errno_location() = ee;
+    return rv;
 }
 
 EXP void *shmat(int shmid, const void *shmaddr, int shmflg) {
@@ -351,6 +355,8 @@ static int shmctl_locked(int shmid, int cmd, void *buf) {
 }
 
 EXP int shmctl(int shmid, int cmd, void *buf) {
+    struct prx_shm_meta m0;
+    if (shm_read_meta(shmid, &m0) < 0) return shmctl_locked(shmid, cmd, buf); /* real kernel segment */
     long lk = shm_lock();
     int r = shmctl_locked(shmid, cmd, buf);
     int e = geterr();

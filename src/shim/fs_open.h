@@ -38,7 +38,7 @@ static int do_open(int dfd, const char*p, int fl, int mode) {
             int mfd = fake_proc_file(osr, sizeof (osr)-1);
             if (mfd >= 0) return mfd;
         }
-        if (strcmp(p, "/proc/mounts") == 0 || strcmp(p, "/proc/self/mounts") == 0 || strcmp(p, "/proc/self/mountinfo") == 0 || strcmp(p, "/proc/mountinfo") == 0) {
+        if (strcmp(p, "/proc/mounts") == 0 || strcmp(p, "/proc/self/mounts") == 0 || strcmp(p, "/proc/self/mountinfo") == 0) {
             if ((fl&O_ACCMODE_) != O_RDONLY) return (int) fail(EACCES);
             char mb[8192];
             size_t mn = build_mi(mb, sizeof mb, p[strlen(p)-1] == 'o');
@@ -143,11 +143,6 @@ EXP void*opendir(const char*p) {
     if (tr(AT_FDCWD, p, b, 1, &h)<0) return NULL;
     if (!f) f = nextsym("opendir");
     return f(h);
-}
-EXP void*fdopendir(int fd) {
-    static void*(*f)(int);
-    if (!f) f = nextsym("fdopendir");
-    return f ? f(fd) : NULL;
 }
 EXP void*dlopen(const char*p, int fl) {
     static void*(*f)(const char*, int);

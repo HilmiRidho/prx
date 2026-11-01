@@ -154,11 +154,6 @@ EXP int accept4(int fd, void*a, unsigned*l, int fl) {
     if (r >= 0) un_strip(a, l);
     return r;
 }
-EXP int socketpair(int domain, int type, int protocol, int sv[2]) {
-    static int(*f)(int, int, int, int*);
-    if (!f) f = nextsym("socketpair");
-    return f ? f(domain, type, protocol, sv) : -1;
-}
 #define SOL_SOCKET_ 1
 #define SO_PASSCRED_ 16
 #define SCM_CREDENTIALS_ 2
@@ -178,7 +173,15 @@ EXP int getsockopt(int fd, int level, int optname, void*optval, unsigned int*opt
             return 0;
         }
     }
-    return real_getsockopt ? real_getsockopt(fd, level, optname, optval, optlen) : 0;
+    int r = real_getsockopt ? real_getsockopt(fd, level, optname, optval, optlen) : 0;
+    /* SO_PEERCRED reports host ids; map them like stat() so the peer of a
+       fake-root process sees the same uid/gid that getuid()/getgid() return. */
+    if (r == 0 && level == SOL_SOCKET_ && optname == 17 && VROOT() && optval && optlen && *optlen >= 12) {
+        u32*c = (u32*) optval;
+        if (c[1] == g_ruid) c[1] = 0;
+        if (c[2] == g_rgid) c[2] = 0;
+    }
+    return r;
 }
 struct msghdr_t {
     void*msg_name;
@@ -198,10 +201,6 @@ struct ucred_t {
     u32 pid;
     u32 uid;
     u32 gid;
-};
-struct iovec_t {
-    void*iov_base;
-    size_t iov_len;
 };
 static int msg_has_creds(const struct msghdr_t*msg) {
     if (!msg || !msg->msg_control) return 0;
@@ -239,18 +238,37 @@ EXP ssize_t sendmsg(int sockfd, const struct msghdr_t*msg, int flags) {
     }
     ssize_t rv = real_sendmsg(sockfd, mp, flags);
     int e = geterr();
+    /* Emulated credentials (fake root) cannot be honoured by the kernel, which
+       rejects the forged SCM_CREDENTIALS with EPERM. Deliver the payload anyway:
+       resend it without that control message instead of pretending success. */
+    if (rv<0 && e == EPERM && VROOT() && msg && msg_has_creds(msg)) {
+        size_t cl = msg->msg_controllen;
+        char*nb = malloc(cl ? cl : 1);
+        if (nb) {
+            size_t nlen = 0, rem = cl;
+            const char*p = (const char*) msg->msg_control;
+            while (rem >= sizeof (struct cmsghdr_t)) {
+                const struct cmsghdr_t*cm = (const struct cmsghdr_t*) p;
+                if (cm->cmsg_len<sizeof (struct cmsghdr_t) || cm->cmsg_len>rem) break;
+                size_t step = (cm->cmsg_len+sizeof (size_t)-1) & ~(sizeof (size_t)-1);
+                if (step>rem) step = rem;
+                if (!(cm->cmsg_level == SOL_SOCKET_ && cm->cmsg_type == SCM_CREDENTIALS_)) {
+                    memcpy(nb+nlen, p, step);
+                    nlen += step;
+                }
+                p += step;
+                rem -= step;
+            }
+            struct msghdr_t m3 = *mp;
+            m3.msg_control = nlen ? nb : NULL;
+            m3.msg_controllen = nlen;
+            rv = real_sendmsg(sockfd, &m3, flags);
+            e = geterr();
+            free(nb);
+        }
+    }
     un_done(tfd);
     *__errno_location() = e;
-    /* Emulated credentials (fake root) cannot be honoured by the kernel: pretend
-       the message was sent, but only for messages that carry SCM_CREDENTIALS, and
-       report the full length. Every other EPERM is a real error. */
-    if (rv<0 && e == EPERM && VROOT() && msg_has_creds(msg)) {
-        size_t total = 0;
-        const struct iovec_t*iov = (const struct iovec_t*) msg->msg_iov;
-        for (size_t i = 0; iov && i<msg->msg_iovlen; i++) total += iov[i].iov_len;
-        *__errno_location() = 0;
-        return (ssize_t) total;
-    }
     return rv;
 }
 EXP ssize_t recvmsg(int sockfd, struct msghdr_t*msg, int flags) {

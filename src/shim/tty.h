@@ -1,10 +1,5 @@
-/* tty.h - ioctl, isatty, tcgetattr, fcntl
+/* tty.h - isatty, tcgetattr, tcsetattr
  * Part of the prx shim (unity build: included by src/prx.c, not a standalone header). */
-EXP int ioctl(int fd, unsigned long req, void*arg) {
-    static int(*f)(int, unsigned long, void*);
-    if (!f) f = nextsym("ioctl");
-    return f ? f(fd, req, arg) : (int) ret(sc(N_ioctl, fd, (long) req, (long) arg, 0, 0, 0));
-}
 /* Fallback tty untuk glibc baru: Android/SELinux menolak TCGETS2 (EACCES) */
 EXP int isatty(int fd) {
     static int(*f)(int);
@@ -55,15 +50,4 @@ EXP int tcsetattr(int fd, int act, const void*t) {
         return -1;
     }
     return 0;
-}
-EXP int fcntl(int fd, int cmd, void*arg) {
-    static int(*f)(int, int, void*);
-    if (!f) f = nextsym("fcntl");
-    return f ? f(fd, cmd, arg) : (int) ret(sc(N_fcntl, fd, cmd, (long) arg, 0, 0, 0));
-}
-EXP int fcntl64(int fd, int cmd, void*arg) {
-    static int(*f)(int, int, void*);
-    if (!f) f = nextsym("fcntl64");
-    if (!f) f = nextsym("fcntl");
-    return f ? f(fd, cmd, arg) : (int) ret(sc(N_fcntl, fd, cmd, (long) arg, 0, 0, 0));
 }
