@@ -1,0 +1,5 @@
+loop interrupted=1
+fault: rcx=77 cf=1 flags=0x95
+rewritten code total=240
+self-modifying total=126
+indirect acc=62621
