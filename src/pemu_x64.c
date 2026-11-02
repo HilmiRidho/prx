@@ -334,6 +334,24 @@ static void hsegv(int s, siginfo_t*si, void*u) {
             }
             fclose(mf);
         }
+        /* TEMPORARY, specific to libSDL2 2.32.4 SDL_AddEvent (rip page offset 0x8a0): r12 = &SDL_EventQ.count, tail = r12+0x14, free = r12+0x1c.
+         * Shows whether the global itself holds text and which mappings surround it. */
+        if ((g_cur->rip & 0xfff) == 0x8a0) {
+            u64 t = (g_cur->r[12] + 0x14) & ~7ULL;
+            fprintf(stderr, "pemu:   SDL_EventQ words (tail@%#llx):", (unsigned long long) t);
+            for (int i = -4; i < 8; i++) fprintf(stderr, "%s%016llx", (i & 3) == 0 ? "\npemu:     " : " ", (unsigned long long) *(volatile u64*)(t + 8 * i));
+            fprintf(stderr, "\n");
+            FILE *m2 = fopen("/proc/self/maps", "r");
+            if (m2) {
+                char ln[512], prev[512] = ""; unsigned long long lo, hi; int after = 0;
+                while (fgets(ln, sizeof ln, m2)) {
+                    if (after) { fprintf(stderr, "pemu:   next  %s", ln); after = 0; }
+                    if (sscanf(ln, "%llx-%llx", &lo, &hi) == 2 && t >= lo && t < hi) { fprintf(stderr, "pemu:   prev  %spemu:   tail  %s", prev, ln); after = 1; }
+                    memcpy(prev, ln, sizeof prev);
+                }
+                fclose(m2);
+            }
+        }
     }
     signal(s, SIG_DFL); raise(s);
     _exit(128 + s);
