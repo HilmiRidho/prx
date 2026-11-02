@@ -1,0 +1,18 @@
+--- a/src/pemu_x64.c	2026-11-02 03:27:55.358023125 +0000
++++ b/src/pemu_x64.c	2026-11-02 03:27:55.359612347 +0000
+@@ -612,7 +612,14 @@
+         return hs(SYS_fcntl, (long) a0, (long) a1, (long) a2, 0, 0, 0);
+     case 63: { struct utsname u; r = hs(SYS_uname, (long) &u, 0, 0, 0, 0, 0); if (r == 0) { strcpy(u.machine, "x86_64"); memcpy((void*) a0, &u, sizeof u); } return r; }
+     case 12:
+-        if (a0 >= brk_base && a0 <= brk_end) brk_cur = a0;
++        if (a0 >= brk_base && a0 <= brk_end) {
++            if (a0 < brk_cur) {                         /* shrinking: the kernel frees the pages, so growing again must give zeroes (glibc calloc relies on it) */
++                u64 lo = a0, hi = brk_cur, plo = (lo + 4095) & ~4095ULL, phi = hi & ~4095ULL;
++                if (plo < phi) { memset((void*) lo, 0, plo - lo); memset((void*) phi, 0, hi - phi); madvise((void*) plo, phi - plo, MADV_DONTNEED); }
++                else memset((void*) lo, 0, hi - lo);
++            }
++            brk_cur = a0;
++        }
+         return (long) brk_cur;
+     case 131: {                                       /* sigaltstack(const stack_t *ss, stack_t *old): sp@0 flags@8 size@16 */
+         int on = g_ss_size && c->r[RSP] >= g_ss_sp && c->r[RSP] - g_ss_sp < g_ss_size;
