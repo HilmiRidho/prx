@@ -1,0 +1,336 @@
+diff --git a/README.md b/README.md
+index d2ae008..80befcf 100644
+--- a/README.md
++++ b/README.md
+@@ -189,7 +189,7 @@ If pemu does not compile, `prx build` retries without `-pthread` and then with `
+ - **Superblocks**: translation continues across direct `jmp` and forward `jcc` on the same page (the taken path becomes an out-of-line side exit that writes the lazy flags only when it is taken), up to 64 guest instructions.
+ - **Return stack buffer**: `call` is a host `bl` and `ret` a host `ret` after the guest return address was checked against a 64-entry shadow stack (a mismatch, e.g. after `longjmp`, falls back to the inline cache), so the CPU's own return predictor works. Indirect calls use `blr`.
+ - **Threads**: the JIT stays on with guest threads. One code cache is shared; translation is serialised, lookups are lock-free, every thread has its own inline cache and signal word, and a flush stops the other threads at their next poll (stop-the-world). Once a second thread exists, translated loads/stores carry `dmb` barriers for x86 (TSO) ordering.
+-- `PEMU_JIT_OPT=<mask>` switches parts off to bisect a problem: 1 flags of immediate shifts, 2 scalar SSE float, 4 pinning, 8 superblocks, 16 return stack buffer (default 31).
++- `PEMU_JIT_OPT=<mask>` switches parts off to bisect a problem: 1 flags of immediate shifts, 2 scalar SSE float, 4 pinning, 8 superblocks, 16 return stack buffer, 32 `comiss`/`comisd`/`ucomiss`/`ucomisd` with the host flags of `fcmp`, 64 32/64-bit `div`/`idiv` through `udiv`/`sdiv` (default 127).
+ - Disable with `PEMU_JIT=0` or `pemu -nojit`; `PEMU_JIT_STATS=1` prints statistics. Use `PEMU_JIT=0` as the workaround when reporting problems.
+ 
+ **Testing the JIT without an aarch64 machine.** `make pemu-x64-jit` (x86_64 host) builds `pemu_x64` with `-DPEMU_JIT_EMBED`, linked with `pemu.c` built as an *AArch64 interpreter*: the JIT emits real AArch64 machine code and that code is executed by `pemu.c`, so the actual back end is exercised (slowly). `make check` runs the x86 self-tests (`tests/pemu_x64_test.sh`), plus `tests/pemu_x64_fuzz.py`, which generates random x86-64 programs (ALU at all sizes, moves, shifts, `imul`, `setcc/cmov`, push/pop, loops, calls, SSE, `fs:`/rip-relative/SIB operands) and compares registers, flags and memory between the interpreter and the JIT. Not covered by that setup, and therefore **not yet verified on real hardware**: instruction-cache maintenance (`__builtin___clear_cache`), writable+executable anonymous mappings (SELinux/Android policy), and the real signal context (`uc_mcontext.pc`).
+diff --git a/src/pemu_x64.c b/src/pemu_x64.c
+index df06625..a5f4849 100644
+--- a/src/pemu_x64.c
++++ b/src/pemu_x64.c
+@@ -19,8 +19,9 @@
+  * JIT (aarch64 hosts): guest basic blocks are translated to AArch64 code (see the "JIT" section below). Anything the
+  * translator does not know runs through the interpreter from inside the translated block, so behaviour is identical.
+  * Disable it with PEMU_JIT=0 or -nojit. The JIT works with guest threads (one shared cache, see JT).
+- * PEMU_JIT_OPT=<mask> (default 31) toggles optional translations: 1 = lazy flags for shift-by-immediate, 2 = scalar SSE float,
+- * 4 = guest rax..rdi pinned to host registers, 8 = superblocks, 16 = return stack buffer.
++ * PEMU_JIT_OPT=<mask> (default 127) toggles optional translations: 1 = lazy flags for shift-by-immediate, 2 = scalar SSE float,
++ * 4 = guest rax..rdi pinned to host registers, 8 = superblocks, 16 = return stack buffer, 32 = comiss/comisd/ucomiss/ucomisd with the host
++ * flags of fcmp, 64 = div/idiv through udiv/sdiv (only when the dividend fits and the divisor is not 0 or -1; the rest is interpreted).
+  * Not a security boundary. */
+ #define _GNU_SOURCE
+ #include <stdio.h>
+@@ -130,7 +131,7 @@ static void mwr(u64 a, u64 v, int n) {
+ 
+ /* ---- lazy flags: add/sub/logic only record their operands; CF/OF/AF/ZF/SF/PF are computed when somebody reads them.
+  * RF(c) is an lvalue that first materialises any pending flags, so every other use of the flags stays unchanged. */
+-enum { LZ_NONE, LZ_ADD, LZ_SUB, LZ_LOGIC, LZ_SHL, LZ_SHR, LZ_SAR };   /* LZ_SH*: la = value, lb = count (1..bits-1), lr = result (only recorded by the JIT) */
++enum { LZ_NONE, LZ_ADD, LZ_SUB, LZ_LOGIC, LZ_SHL, LZ_SHR, LZ_SAR, LZ_FCMP };   /* LZ_SH*: la = value, lb = count (1..bits-1), lr = result (only recorded by the JIT); LZ_FCMP: la, lb = the two operands of comiss/comisd (bit patterns, lsz 4 or 8), only recorded by the JIT */
+ static const u8 g_par[256] = {
+ #define PT2(n) n, n ^ 1, n ^ 1, n
+ #define PT4(n) PT2(n), PT2(n ^ 1), PT2(n ^ 1), PT2(n)
+@@ -143,6 +144,12 @@ static const u8 g_par[256] = {
+ static void mat(CPU*c) {
+     int sz = c->lsz, sb = sz * 8 - 1; u64 m = mskz(sz), a = c->la, b = c->lb, r = c->lr;
+     u64 f = c->rf & ~(u64)(CF_ | OF_ | AF_ | ZF_ | SF_ | PF_);
++    if (c->lop == LZ_FCMP) {                                    /* same flags as the interpreter's comisd: unordered 111, below CF, equal ZF */
++        double x, y;
++        if (sz == 8) { memcpy(&x, &a, 8); memcpy(&y, &b, 8); } else { float fx, fy; u32 ua = (u32) a, ub = (u32) b; memcpy(&fx, &ua, 4); memcpy(&fy, &ub, 4); x = fx; y = fy; }
++        if (isnan(x) || isnan(y)) f |= ZF_ | PF_ | CF_; else if (x < y) f |= CF_; else if (x == y) f |= ZF_;
++        c->rf = f; c->lop = LZ_NONE; return;
++    }
+     switch (c->lop) {
+     case LZ_ADD:
+         if (c->lcin ? r <= a : r < a) f |= CF_;
+@@ -1611,7 +1618,9 @@ static int g_jstats;
+ #define JOPT_PIN  4u                    /* guest rax..rdi live in host registers while translated code runs */
+ #define JOPT_SB   8u                    /* superblocks: translation continues across direct jmp and forward jcc */
+ #define JOPT_RSB  16u                   /* return stack buffer: call/ret are host bl/ret, checked against a shadow stack */
+-static unsigned g_jopt = JOPT_SHFL | JOPT_FP | JOPT_PIN | JOPT_SB | JOPT_RSB;   /* PEMU_JIT_OPT=<mask> overrides (0 = none): handy to bisect a misbehaving guest */
++#define JOPT_FCMP 32u                   /* comiss/comisd/ucomiss/ucomisd with the host flags of fcmp (jb/jae/jbe/ja/jp/jnp/setcc/cmovcc) */
++#define JOPT_DIV  64u                   /* 32/64-bit div and idiv with udiv/sdiv when the dividend fits and the divisor is not 0 or -1 */
++static unsigned g_jopt = JOPT_SHFL | JOPT_FP | JOPT_PIN | JOPT_SB | JOPT_RSB | JOPT_FCMP | JOPT_DIV;   /* PEMU_JIT_OPT=<mask> overrides (0 = none): handy to bisect a misbehaving guest */
+ /* Register pinning: guest rax,rcx,rdx,rbx,rsp,rbp,rsi,rdi (numbers 0..7) are kept in callee-saved host registers, so
+  * they survive helper calls and chained block-to-block branches. The CPU struct is only written back when translated
+  * code is left (jepi), around an interpreter fallback (j_pin_spill / j_pin_fill) and, after a fault, from the signal
+@@ -1691,6 +1700,12 @@ static void jpatch19(u32 *at) { *at |= ((u32)(jcur - at) & 0x7ffff) << 5; }
+ static void a_adr_at(u32 *at, int rd, u32 *target) { s64 d = (s64)((u8*) target - (u8*) at); *at = 0x10000000u | ((u32) d & 3) << 29 | (((u32)(d >> 2)) & 0x7ffff) << 5 | (u32) rd; }
+ static void a_bl(u32 *t) { E(0x94000000u | ((u32)(t - jcur) & 0x3ffffff)); }
+ static void a_ret(void) { E(0xD65F03C0u); }
++static void a_div(int sf, int sgn, int rd, int rn, int rm) { E(SFB(sf) | 0x1AC00800u | (sgn ? 0x400u : 0u) | (u32) rm << 16 | (u32) rn << 5 | (u32) rd); }       /* udiv / sdiv */
++static void a_msub(int sf, int rd, int rn, int rm, int ra) { E(SFB(sf) | 0x1B008000u | (u32) rm << 16 | (u32) ra << 10 | (u32) rn << 5 | (u32) rd); }     /* rd = ra - rn * rm */
++static u32 *a_b_fwd(void) { E(0x14000000u); return jcur - 1; }
++static void jpatch26(u32 *at) { *at |= (u32)(jcur - at) & 0x3ffffff; }
++static void f_cmp(int sz, int vn, int vm) { E((sz == 8 ? 0x1E602000u : 0x1E202000u) | (u32) vm << 16 | (u32) vn << 5); }          /* fcmp dn, dm */
++static void f_tox(int sz, int rd, int vn) { E((sz == 8 ? 0x9E660000u : 0x1E260000u) | (u32) vn << 5 | (u32) rd); }                  /* fmov xd, dn / fmov wd, sn */
+ static void a_br(int rn) { E(0xD61F0000u | (u32) rn << 5); }
+ static void a_adr(int rd, u32 *target) { s64 d = (s64)((u8*) target - (u8*) jcur); E(0x10000000u | ((u32) d & 3) << 29 | (((u32)(d >> 2)) & 0x7ffff) << 5 | (u32) rd); }
+ static void j_callabs(void *f) {                                /* call a C helper; x0..x5 = arguments */
+@@ -1844,7 +1859,7 @@ static void jit_note_rwx(u64 start, u64 len) {                  /* jmu held */
+ /* ------------------------------------------------------------ decoder (static, no guest state) */
+ enum { OT_NONE, OT_REG, OT_MEM, OT_IMM };
+ enum { JO_FB, JO_FBT, JO_NOP, JO_MOV, JO_MOVX, JO_LEA, JO_PUSH, JO_POP, JO_ALU, JO_NOT, JO_NEG, JO_SHIFT, JO_IMUL,
+-       JO_SETCC, JO_CMOV, JO_CWDE, JO_CDQ, JO_LEAVE, JO_XLD, JO_XST, JO_XLOG, JO_XMOVDLD, JO_XMOVDST, JO_XVEC, JO_PMOVMSKB, JO_XSHI, JO_FMOV, JO_FARITH, JO_CVTSI2F, JO_JMP, JO_JCC, JO_CALL, JO_RET, JO_JMPI, JO_CALLI };
++       JO_SETCC, JO_CMOV, JO_CWDE, JO_CDQ, JO_LEAVE, JO_XLD, JO_XST, JO_XLOG, JO_XMOVDLD, JO_XMOVDST, JO_XVEC, JO_PMOVMSKB, JO_XSHI, JO_FMOV, JO_FARITH, JO_CVTSI2F, JO_FCMP, JO_DIV, JO_JMP, JO_JCC, JO_CALL, JO_RET, JO_JMPI, JO_CALLI };
+ typedef struct {
+     u64 ip, imm, target; s64 disp;
+     u8 len, op, sz, sz2, t, fr, fw, at, bt, ar, br, rex, lva, lvb, scale, seg, sx, cnt, nost;
+@@ -2055,8 +2070,10 @@ static int jdecode(JI *j, u64 ip) {
+     case 0xEB: { s8 rel = (s8) *p++; j->len = (u8)(p - s); j->op = JO_JMP; j->target = ip + j->len + (u64)(s64) rel; return 1; }
+     case 0xF6: case 0xF7: {
+         int ext = (*p >> 3) & 7, sz = (op & 1) ? opsz : 1;
+-        jmodrm(&p, j, &m, ext < 2 ? (sz == 1 ? 1 : (opsz == 2 ? 2 : 4)) : 0); if (BADM(m) || ext > 3) FB();
++        jmodrm(&p, j, &m, ext < 2 ? (sz == 1 ? 1 : (opsz == 2 ? 2 : 4)) : 0);
++        if (BADM(m) || (ext > 3 && !(ext >= 6 && (g_jopt & JOPT_DIV) && (sz == 4 || sz == 8)))) FB();
+         j->sz = (u8) sz; SETRM(m, 0);
++        if (ext >= 6) { j->op = JO_DIV; j->t = (u8) ext; break; }
+         if (ext < 2) { j->op = JO_ALU; j->t = 4; j->nost = 1; j->fw = 1; j->bt = OT_IMM; if (sz == 1) j->imm = (u8) *p++; else IMMZ(j->imm); }
+         else if (ext == 2) j->op = JO_NOT; else { j->op = JO_NEG; j->fw = 1; }
+         break; }
+@@ -2110,6 +2127,10 @@ static int jdecode(JI *j, u64 ip) {
+             if (!(g_jopt & JOPT_FP) || pf2 == pf3) FB();
+             jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
+             j->op = JO_CVTSI2F; j->sz2 = pf2 ? 8 : 4; j->sz = w ? 8 : 4; j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break;
++        case 0x2E: case 0x2F:                                /* ucomiss/ucomisd/comiss/comisd */
++            if (!(g_jopt & JOPT_FCMP) || pf3 || pf2) FB();
++            jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
++            j->op = JO_FCMP; j->sz2 = p66 ? 8 : 4; j->fw = 1; j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break;
+         case 0xEF: case 0xEB: case 0xDB: case 0xDF:
+             if (!(p66 && !pf3 && !pf2)) FB();
+             jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
+@@ -2174,7 +2195,10 @@ static int jmapcc(int x86cc, int *cc) {
+     static const s8 add_t[16] = { 6, 7, 2, 3, 0, 1, -1, -1, 4, 5, -1, -1, 11, 10, 13, 12 };
+     static const s8 log_t[16] = { -2, -3, -2, -3, 0, 1, 0, 1, 4, 5, -1, -1, 11, 10, 13, 12 };
+     static const s8 sh_t[16] = { -1, -1, -1, -1, 0, 1, -1, -1, 4, 5, -1, -1, -1, -1, -1, -1 };   /* after shl/shr/sar only e/ne/s/ns come from the host flags */
+-    int v = fl.kind == LZ_SUB ? sub_t[x86cc] : fl.kind == LZ_ADD ? add_t[x86cc] : fl.kind >= LZ_SHL ? sh_t[x86cc] : log_t[x86cc];
++    /* after comis*: CF = below or unordered, ZF = equal or unordered, PF = unordered, OF = SF = 0. fcmp leaves unordered V=1 N=0 Z=0 C=1, equal Z=1 C=1, less N=1,
++     * greater C=1: below = lt, ae = ge, be = le, a = gt, p = vs, np = vc. e/ne/le/g also need the unordered case of ZF: not one A64 condition. */
++    static const s8 fc_t[16] = { -2, -3, 11, 10, -1, -1, 13, 12, -2, -3, 6, 7, -2, -3, -1, -1 };
++    int v = fl.kind == LZ_FCMP ? fc_t[x86cc] : fl.kind == LZ_SUB ? sub_t[x86cc] : fl.kind == LZ_ADD ? add_t[x86cc] : fl.kind >= LZ_SHL ? sh_t[x86cc] : log_t[x86cc];
+     if (v == -2) return 2;
+     if (v == -3) return 1;
+     if (v < 0) return -1;
+@@ -2532,19 +2556,49 @@ static int jemit(const JI *j) {          /* returns 1 when it ended the block (t
+         if (j->bt == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); m_ld(sz, 0, 0, 0, rb, off); } else g_ld(0, j->br, sz, 0);
+         f_scvtf(j->sz2, sz == 8, 0, 0);
+         f_stc(j->sz2, 0, OFF_X(j->ar)); break;
++    case JO_FCMP:
++        fl_flush(j->lvb); fl.nz = 0;
++        if (j->bt == OT_MEM) { j_ea(j, &rb, &off); f_ldm(j->sz2, 1, rb, off); } else f_ldc(j->sz2, 1, OFF_X(j->br));
++        if (!j->lva) break;                                              /* flags dead: nothing but the (possibly faulting) load */
++        f_ldc(j->sz2, 0, OFF_X(j->ar));
++        f_cmp(j->sz2, 0, 1); f_tox(j->sz2, 9, 0); f_tox(j->sz2, 10, 1);   /* host flags for jcc/setcc/cmov; the operands for the lazy spill */
++        fl.kind = LZ_FCMP; fl.sz = j->sz2; fl.nz = 1; fl.pend = 1;
++        break;
++    case JO_DIV: {                                                       /* rdx:rax / r/m, only when it cannot trap: the interpreter does the rest */
++        fl_flush(j->lvb); fl.nz = 0;
++        int sg = j->t == 7;
++        if (j->at == OT_MEM) { j_ea(j, &rb, &off); m_ld(sz, 0, 0, 1, rb, off); } else g_ld(1, j->ar, sz, j->rex);
++        u32 *sl[4]; int ns = 0;
++        sl[ns++] = a_cbz_fwd(0, 1);                                      /* divisor 0 */
++        g_ld(0, RAX, sz, 0); g_ld(2, RDX, sz, 0);
++        if (!sg) sl[ns++] = a_cbz_fwd(1, 2);                             /* rdx != 0: wide dividend */
++        else {
++            a_asr(sf, 5, 0, sf ? 63 : 31); a_log(1, 2, 0, 6, 2, 5);        /* rdx must be the sign of rax */
++            sl[ns++] = a_cbz_fwd(1, 6);
++            a_addi(0, 5, 1, 1, 0); if (!sf) a_lsr(1, 5, 5, 32);          /* divisor -1 (INT_MIN / -1 traps) */
++            sl[ns++] = a_cbz_fwd(sf ? 0 : 1, 5);
++        }
++        a_div(sf, sg, 3, 0, 1); a_msub(sf, 4, 3, 1, 0);
++        g_st(3, RAX, sz, 0); g_st(4, RDX, sz, 0);
++        u32 *done = a_b_fwd();
++        for (int k = 0; k < ns; k++) jpatch19(sl[k]);
++        j_fb(j);
++        jpatch26(done);
++        fl.nz = 0;
++        break; }
+     case JO_JMP: fl_flush(j->lvb); jx_direct(j->ip, j->target); return 1;
+     case JO_JCC: {
+         int cc = 0, m = fl.nz ? jmapcc(j->t, &cc) : -1;
+         u64 next = j->ip + j->len;
+         if (j->cnt) {                                    /* superblock: the fall-through path continues, the taken path is an out-of-line side exit */
+-            if (m < 0) { fl_flush(1); a_movi(0, j->ip); c_st(0, OFF_RIP); a_movi(0, 1); c_st(0, OFF_PATCH); a_b(jepi); return 1; }
++            if (m < 0) { fl_flush(1); j_fb(j); c_ld(0, OFF_RIP); jx_indirect(); return 1; }       /* flags not expressible: the interpreter decides, the inline cache jumps */
+             if (m == 1) { fl_flush(1); jx_direct(j->ip, j->target); return 1; }
+             if (m == 2) break;
+             jstub_add(JS_SIDE, a_bcond_fwd(cc), NULL, j->ip, j->target);       /* the stub is entered by the branch itself: x9-x11 still hold the lazy flags */
+             break;
+         }
+         fl_flush(1);
+-        if (m < 0) { a_movi(0, j->ip); c_st(0, OFF_RIP); a_movi(0, 1); c_st(0, OFF_PATCH); a_b(jepi); }       /* flags not expressible: the dispatcher interprets the jcc */
++        if (m < 0) { j_fb(j); c_ld(0, OFF_RIP); jx_indirect(); }       /* flags not expressible: the interpreter decides, the inline cache jumps */
+         else if (m == 1) jx_direct(j->ip, j->target);
+         else if (m == 2) jx_direct(j->ip, next);
+         else { u32 *bt = a_bcond_fwd(cc); jx_direct(j->ip, next); jpatch19(bt); jx_direct(j->ip, j->target); }
+diff --git a/tests/pemu_x64/jitfp.c b/tests/pemu_x64/jitfp.c
+new file mode 100644
+index 0000000..90e6600
+--- /dev/null
++++ b/tests/pemu_x64/jitfp.c
+@@ -0,0 +1,62 @@
++/* comiss, comisd, ucomiss and ucomisd followed by every condition (setcc, jcc, cmovcc), and div/idiv: normal, wide dividend, zero divisor, overflow.
++ * The expected output is what a real x86-64 prints. */
++#include <stdio.h>
++#include <string.h>
++#include <math.h>
++#include <stdint.h>
++#include <signal.h>
++#include <setjmp.h>
++
++#define SETALL "seto 0(%[o])\n setno 1(%[o])\n setb 2(%[o])\n setae 3(%[o])\n sete 4(%[o])\n setne 5(%[o])\n setbe 6(%[o])\n seta 7(%[o])\n" \
++               "sets 8(%[o])\n setns 9(%[o])\n setp 10(%[o])\n setnp 11(%[o])\n setl 12(%[o])\n setge 13(%[o])\n setle 14(%[o])\n setg 15(%[o])\n"
++static unsigned mask16(unsigned char *o) { unsigned m = 0; for (int i = 0; i < 16; i++) m |= (unsigned) (o[i] & 1) << i; return m; }
++static unsigned t_comisd(double a, double b)  { unsigned char o[16]; __asm__ volatile("comisd %[b], %[a]\n" SETALL :: [a]"x"(a), [b]"x"(b), [o]"r"(o) : "memory", "cc"); return mask16(o); }
++static unsigned t_ucomisd(double a, double b) { unsigned char o[16]; __asm__ volatile("ucomisd %[b], %[a]\n" SETALL :: [a]"x"(a), [b]"x"(b), [o]"r"(o) : "memory", "cc"); return mask16(o); }
++static unsigned t_comiss(float a, float b)    { unsigned char o[16]; __asm__ volatile("comiss %[b], %[a]\n" SETALL :: [a]"x"(a), [b]"x"(b), [o]"r"(o) : "memory", "cc"); return mask16(o); }
++static unsigned t_ucomiss(float a, float b)   { unsigned char o[16]; __asm__ volatile("ucomiss %[b], %[a]\n" SETALL :: [a]"x"(a), [b]"x"(b), [o]"r"(o) : "memory", "cc"); return mask16(o); }
++static unsigned t_mem(double a, double *b)    { unsigned char o[16]; __asm__ volatile("comisd (%[b]), %[a]\n" SETALL :: [a]"x"(a), [b]"r"(b), [o]"r"(o) : "memory", "cc"); return mask16(o); }
++static unsigned t_jcc(double a, double b) {                       /* jb/jae/jbe/ja/jp/jnp/je/jne as real branches */
++    unsigned r = 0, k;
++#define J(cc, bit) k = 0; __asm__ volatile("comisd %[b], %[a]\n j" cc " 1f\n jmp 2f\n 1: movl $1, %[k]\n 2:\n" : [k]"+r"(k) : [a]"x"(a), [b]"x"(b) : "cc"); r |= k << bit;
++    J("b", 0) J("ae", 1) J("be", 2) J("a", 3) J("p", 4) J("np", 5) J("e", 6) J("ne", 7)
++#undef J
++    return r;
++}
++static unsigned t_cmov(double a, double b) {
++    unsigned x = 0, y = 0, z = 0;
++    __asm__ volatile("comisd %[b], %[a]\n movl $7, %%eax\n cmovb %[c], %[x]\n cmovnp %[c], %[y]\n cmova %[c], %[z]\n"
++                     : [x]"+r"(x), [y]"+r"(y), [z]"+r"(z) : [a]"x"(a), [b]"x"(b), [c]"r"(5u) : "cc", "eax");
++    return x * 100 + y * 10 + z;
++}
++
++static sigjmp_buf jb; static volatile int got;
++static void on_fpe(int s) { (void) s; got = 1; siglongjmp(jb, 1); }
++#define DIVT(name, ty, ins) \
++static void name(ty rdx_in, ty rax_in, ty dv) { ty q = 0, r = 0; got = 0; \
++    if (!sigsetjmp(jb, 1)) { ty a = rax_in, h = rdx_in; __asm__ volatile(ins " %[dd]" : "+a"(a), "+d"(h) : [dd]"r"(dv) : "cc"); q = a; r = h; } \
++    if (got) printf(#name " %lld:%lld / %lld -> SIGFPE\n", (long long) rdx_in, (long long) rax_in, (long long) dv); \
++    else printf(#name " %lld:%lld / %lld -> %lld r %lld\n", (long long) rdx_in, (long long) rax_in, (long long) dv, (long long) q, (long long) r); }
++DIVT(udiv64, uint64_t, "divq")
++DIVT(idiv64, int64_t, "idivq")
++DIVT(udiv32, uint32_t, "divl")
++DIVT(idiv32, int32_t, "idivl")
++
++int main(void) {
++    double v[] = { 0.0, -0.0, 1.0, -1.0, 2.5, 1e300, -1e300, INFINITY, -INFINITY, NAN, 1.0000000001 };
++    int n = sizeof v / sizeof v[0]; unsigned h = 0;
++    for (int i = 0; i < n; i++) for (int k = 0; k < n; k++) {
++        double a = v[i], b = v[k]; float fa = (float) a, fb = (float) b;
++        unsigned m[7] = { t_comisd(a, b), t_ucomisd(a, b), t_comiss(fa, fb), t_ucomiss(fa, fb), t_mem(a, &b), t_jcc(a, b), t_cmov(a, b) };
++        for (int j = 0; j < 7; j++) h = h * 31 + m[j];
++        if (i < 4 || k == 9) printf("%d %d: %#x %#x %#x %#x %#x %#x %u\n", i, k, m[0], m[1], m[2], m[3], m[4], m[5], m[6]);
++    }
++    printf("hash %u\n", h);
++    signal(SIGFPE, on_fpe);
++    udiv64(0, 100, 7); udiv64(0, 100, 0); udiv64(1, 0, 3); udiv64(0, ~0ULL, 1); udiv64(5, 0, 3); udiv64(3, 5, 3);
++    idiv64(0, -100, 7); idiv64(-1, -100, 7); idiv64(0, 100, -7); idiv64(0, INT64_MIN, -1); idiv64(-1, INT64_MIN, -1); idiv64(0, 1, 0); idiv64(1, 0, 5); idiv64(0, 100, -1);
++    udiv32(0, 100, 7); udiv32(0, 100, 0); udiv32(1, 0, 3); udiv32(0, 0xffffffffu, 0xffffffffu); udiv32(7, 0, 7); udiv32(0, 12345, 1);
++    idiv32(0, -100, 7); idiv32(-1, -100, 7); idiv32(0, 100, -7); idiv32(0, INT32_MIN, -1); idiv32(-1, INT32_MIN, -1); idiv32(0, 1, 0); idiv32(1, 0, 5);
++    uint64_t s = 0; for (uint64_t c = 2; c < 3000; c++) { uint64_t nn = 1000003; s += nn % c; if ((double) c > sqrt((double) nn)) break; }
++    printf("loop %llu\n", (unsigned long long) s);
++    return 0;
++}
+diff --git a/tests/pemu_x64/jitfp.expect b/tests/pemu_x64/jitfp.expect
+new file mode 100644
+index 0000000..533fcba
+--- /dev/null
++++ b/tests/pemu_x64/jitfp.expect
+@@ -0,0 +1,80 @@
++0 0: 0x6a5a 0x6a5a 0x6a5a 0x6a5a 0x6a5a 0x66 50
++0 1: 0x6a5a 0x6a5a 0x6a5a 0x6a5a 0x6a5a 0x66 50
++0 2: 0xaa66 0xaa66 0xaa66 0xaa66 0xaa66 0xa5 550
++0 3: 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaa 55
++0 4: 0xaa66 0xaa66 0xaa66 0xaa66 0xaa66 0xa5 550
++0 5: 0xaa66 0xaa66 0xaa66 0xaa66 0xaa66 0xa5 550
++0 6: 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaa 55
++0 7: 0xaa66 0xaa66 0xaa66 0xaa66 0xaa66 0xa5 550
++0 8: 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaa 55
++0 9: 0x6656 0x6656 0x6656 0x6656 0x6656 0x55 500
++0 10: 0xaa66 0xaa66 0xaa66 0xaa66 0xaa66 0xa5 550
++1 0: 0x6a5a 0x6a5a 0x6a5a 0x6a5a 0x6a5a 0x66 50
++1 1: 0x6a5a 0x6a5a 0x6a5a 0x6a5a 0x6a5a 0x66 50
++1 2: 0xaa66 0xaa66 0xaa66 0xaa66 0xaa66 0xa5 550
++1 3: 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaa 55
++1 4: 0xaa66 0xaa66 0xaa66 0xaa66 0xaa66 0xa5 550
++1 5: 0xaa66 0xaa66 0xaa66 0xaa66 0xaa66 0xa5 550
++1 6: 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaa 55
++1 7: 0xaa66 0xaa66 0xaa66 0xaa66 0xaa66 0xa5 550
++1 8: 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaa 55
++1 9: 0x6656 0x6656 0x6656 0x6656 0x6656 0x55 500
++1 10: 0xaa66 0xaa66 0xaa66 0xaa66 0xaa66 0xa5 550
++2 0: 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaa 55
++2 1: 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaa 55
++2 2: 0x6a5a 0x6a5a 0x6a5a 0x6a5a 0x6a5a 0x66 50
++2 3: 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaa 55
++2 4: 0xaa66 0xaa66 0xaa66 0xaa66 0xaa66 0xa5 550
++2 5: 0xaa66 0xaa66 0xaa66 0xaa66 0xaa66 0xa5 550
++2 6: 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaa 55
++2 7: 0xaa66 0xaa66 0xaa66 0xaa66 0xaa66 0xa5 550
++2 8: 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaa 55
++2 9: 0x6656 0x6656 0x6656 0x6656 0x6656 0x55 500
++2 10: 0xaa66 0xaa66 0x6a5a 0x6a5a 0xaa66 0xa5 550
++3 0: 0xaa66 0xaa66 0xaa66 0xaa66 0xaa66 0xa5 550
++3 1: 0xaa66 0xaa66 0xaa66 0xaa66 0xaa66 0xa5 550
++3 2: 0xaa66 0xaa66 0xaa66 0xaa66 0xaa66 0xa5 550
++3 3: 0x6a5a 0x6a5a 0x6a5a 0x6a5a 0x6a5a 0x66 50
++3 4: 0xaa66 0xaa66 0xaa66 0xaa66 0xaa66 0xa5 550
++3 5: 0xaa66 0xaa66 0xaa66 0xaa66 0xaa66 0xa5 550
++3 6: 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaa 55
++3 7: 0xaa66 0xaa66 0xaa66 0xaa66 0xaa66 0xa5 550
++3 8: 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaaaa 0xaa 55
++3 9: 0x6656 0x6656 0x6656 0x6656 0x6656 0x55 500
++3 10: 0xaa66 0xaa66 0xaa66 0xaa66 0xaa66 0xa5 550
++4 9: 0x6656 0x6656 0x6656 0x6656 0x6656 0x55 500
++5 9: 0x6656 0x6656 0x6656 0x6656 0x6656 0x55 500
++6 9: 0x6656 0x6656 0x6656 0x6656 0x6656 0x55 500
++7 9: 0x6656 0x6656 0x6656 0x6656 0x6656 0x55 500
++8 9: 0x6656 0x6656 0x6656 0x6656 0x6656 0x55 500
++9 9: 0x6656 0x6656 0x6656 0x6656 0x6656 0x55 500
++10 9: 0x6656 0x6656 0x6656 0x6656 0x6656 0x55 500
++hash 2065101301
++udiv64 0:100 / 7 -> 14 r 2
++udiv64 0:100 / 0 -> SIGFPE
++udiv64 1:0 / 3 -> 6148914691236517205 r 1
++udiv64 0:-1 / 1 -> -1 r 0
++udiv64 5:0 / 3 -> SIGFPE
++udiv64 3:5 / 3 -> SIGFPE
++idiv64 0:-100 / 7 -> 2635249153387078788 r 0
++idiv64 -1:-100 / 7 -> -14 r -2
++idiv64 0:100 / -7 -> -14 r 2
++idiv64 0:-9223372036854775808 / -1 -> -9223372036854775808 r 0
++idiv64 -1:-9223372036854775808 / -1 -> SIGFPE
++idiv64 0:1 / 0 -> SIGFPE
++idiv64 1:0 / 5 -> 3689348814741910323 r 1
++idiv64 0:100 / -1 -> -100 r 0
++udiv32 0:100 / 7 -> 14 r 2
++udiv32 0:100 / 0 -> SIGFPE
++udiv32 1:0 / 3 -> 1431655765 r 1
++udiv32 0:4294967295 / 4294967295 -> 1 r 0
++udiv32 7:0 / 7 -> SIGFPE
++udiv32 0:12345 / 1 -> 12345 r 0
++idiv32 0:-100 / 7 -> 613566742 r 2
++idiv32 -1:-100 / 7 -> -14 r -2
++idiv32 0:100 / -7 -> -14 r 2
++idiv32 0:-2147483648 / -1 -> -2147483648 r 0
++idiv32 -1:-2147483648 / -1 -> SIGFPE
++idiv32 0:1 / 0 -> SIGFPE
++idiv32 1:0 / 5 -> 858993459 r 1
++loop 233171
+diff --git a/tests/pemu_x64_test.sh b/tests/pemu_x64_test.sh
+index 028381a..1d31191 100755
+--- a/tests/pemu_x64_test.sh
++++ b/tests/pemu_x64_test.sh
+@@ -31,5 +31,6 @@ ARGS="" run jit 0 -O1 -static "$D/jit.c"
+ ARGS="" run atomic 0 -O1 -static -pthread "$D/atomic.c"
+ ARGS="" run sigalt 0 -O1 -static -pthread "$D/sigalt.c"
+ ARGS="" run jitopt 0 -O1 -static -pthread "$D/jitopt.c"
++ARGS="" run jitfp 0 -O1 -static "$D/jitfp.c" -lm
+ [ $fail = 0 ] && echo "RESULT PASS" || echo "RESULT FAIL"
+ exit $fail
