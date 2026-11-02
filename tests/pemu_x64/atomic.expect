@@ -1,0 +1,8 @@
+add=160000 dec=-160000 xadd=480000 cas=160000
+b8=0 w16=28928 bits=8 or=1 locked=160000
+cmpxchg fail: x=5 rax=5 zf=0
+cmpxchg ok: x=9 zf=1
+btr: v=0 cf=1
+neg=-7
+not=-1
+xadd: mem=42 reg=40
