@@ -32,5 +32,8 @@ ARGS="" run atomic 0 -O1 -static -pthread "$D/atomic.c"
 ARGS="" run sigalt 0 -O1 -static -pthread "$D/sigalt.c"
 ARGS="" run jitopt 0 -O1 -static -pthread "$D/jitopt.c"
 ARGS="" run jitfp 0 -O1 -static "$D/jitfp.c" -lm
+ARGS="" run sse42 0 -O1 -static -msse4.2 -mcx16 -pthread "$D/sse42.c"
+ARGS="" run x87save 0 -O1 -static "$D/x87save.c"
+ARGS="" run sys2 0 -O1 -static "$D/sys2.c"
 [ $fail = 0 ] && echo "RESULT PASS" || echo "RESULT FAIL"
 exit $fail

@@ -163,7 +163,7 @@ qemu stays the default; pemu is only used when you ask for it.
 | host | guest rootfs | source | notes |
 |------|--------------|--------|-------|
 | x86_64  | aarch64 | `src/pemu.c`     | JIT + interpreter; integer ISA, scalar FP, tiny NEON subset; no threads |
-| aarch64 | x86_64  | `src/pemu_x64.c` | JIT + interpreter; integer ISA, SSE2, x87 subset; threads; runs real glibc programs |
+| aarch64 | x86_64  | `src/pemu_x64.c` | JIT + interpreter; integer ISA, SSE2 to SSE4.2 (no AVX), x87 subset; threads; runs real glibc programs |
 
     prx build                       # also builds $PRX_HOME/lib/pemu for your host
     PRX_QEMU=pemu prx login debian
@@ -203,7 +203,7 @@ If pemu does not compile, `prx build` retries without `-pthread` and then with `
 
 ### Not implemented
 
-Threads in `pemu.c` (aarch64 guest), AVX/SSE3+/BMI (cpuid reports a baseline x86-64 CPU), most NEON/SVE/LSE for `pemu.c`, 32-bit guests. Not a security boundary. Use `qemu-user` for anything serious.
+Threads in `pemu.c` (aarch64 guest), AVX/AVX2/FMA/BMI/AES/PCLMUL/XSAVE (cpuid reports an x86-64-v2 CPU: SSE3, SSSE3, SSE4.1, SSE4.2, CMPXCHG16B, POPCNT), most NEON/SVE/LSE for `pemu.c`, 32-bit guests. Not a security boundary. Use `qemu-user` for anything serious.
 
 ## Known limits (by design)
 
@@ -216,6 +216,14 @@ Threads in `pemu.c` (aarch64 guest), AVX/SSE3+/BMI (cpuid reports a baseline x86
 ## Changelog
 
 ### Unreleased
+
+**Added (`pemu_x64`)**
+
+- x86-64-v2 CPU model: SSE3, SSSE3, SSE4.1, SSE4.2 (`0F 38` / `0F 3A`: `pshufb`, `pcmp{e,i}str{i,m}`, `roundss/sd`, `ptest`, `pmulld`, `crc32`, ...), `cmpxchg8b`/`cmpxchg16b`, `popcnt` advertised, `movnti`, `xgetbv`, `rdtscp`, `rcpps`/`rsqrtps`, `maskmovdqu`, and `fisttp`, `fbld`/`fbstp`, `fnsave`/`frstor`. Binaries built for `x86-64-v2` and glibc's `x86-64-v2` hwcaps directories now work.
+- `fxsave`/`fxrstor` and the signal frame carry ST(0..7) and TOP; before, an x87 stack in use was lost across a signal handler.
+- Syscalls that returned `-ENOSYS`: SysV IPC (`shm*`, `sem*`, `msg*`), `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `mknod`, `utime`, `futimesat`, `inotify_init`, `signalfd`, `preadv2`/`pwritev2`, `membarrier`, `mlock2`, `faccessat2`, `epoll_pwait2`, `openat2`, aio, POSIX message queues, keyrings, NUMA policy calls and a few more. `MAP_32BIT` is emulated by searching the first 2 GiB.
+- Tests `sse42`, `x87save`, `sys2`; the expected output of `sse42` and `x87save` was produced on a real x86-64 CPU.
+- Not done: `ptrace`, `perf_event_open`, `io_uring`, AVX. `xsave`/`xrstor` stay unimplemented (not advertised). The x87 tag word is not tracked (saved as empty).
 
 **Removed**
 
@@ -245,7 +253,7 @@ Threads in `pemu.c` (aarch64 guest), AVX/SSE3+/BMI (cpuid reports a baseline x86
 - `sigaltstack` is implemented (it used to return success without doing anything), `SA_ONSTACK` is honoured and `uc_stack` is filled in the signal frame.
 - A signal that arrives on a guest thread is now delivered in that thread (pending signals and `siginfo` are per-thread); before, any thread could pick it up.
 - `epoll_wait` checks its allocation, and a dead syscall case was removed.
-- `PEMU_JIT_STATS` now also counts how often each interpreter fallback is *executed* (the old per-opcode list only counted code sites, which says little about what is hot), and the report is printed for guests that created a thread too (the JIT is off then, which the report says).
+- `PEMU_JIT_STATS` now also counts how often each interpreter fallback is *executed* (the old per-opcode list only counted code sites, which says little about what is hot), and the report is printed for guests that created a thread too.
 
 **Added**
 

@@ -11,10 +11,10 @@
  * Environment: QEMU_SET_ENV, QEMU_UNSET_ENV, QEMU_STRACE.
  *
  * Arithmetic flags are evaluated lazily (see mat()/RF()), and jcc/setcc/cmov after cmp/test read the operands directly.
- * CPU model: baseline x86-64 (SSE2) with a small x87 stub. cpuid reports only
- * what is implemented, so glibc selects its SSE2 code paths.
+ * CPU model: x86-64-v2 (SSE2 to SSE4.2, CMPXCHG16B, POPCNT) with an x87 subset. cpuid reports only
+ * what is implemented: every instruction of an advertised feature must exist, because glibc picks its code paths from it.
  * Threads (CLONE_THREAD) are supported: each guest thread runs on its own host pthread with its own CPU state.
- * NOT supported: AVX/SSE3+/BMI, most x87, 32-bit code.
+ * NOT supported: AVX/AVX2/FMA/BMI/AES/XSAVE, parts of x87, 32-bit code.
  *
  * JIT (aarch64 hosts): guest basic blocks are translated to AArch64 code (see the "JIT" section below). Anything the
  * translator does not know runs through the interpreter from inside the translated block, so behaviour is identical.
@@ -320,6 +320,8 @@ static void hsegv(int s, siginfo_t*si, void*u) {
     signal(s, SIG_DFL); raise(s);
     _exit(128 + s);
 }
+static void fx_save(CPU*c, u8*p);                      /* FXSAVE image: fxsave, signal frame (defined with the x87 code) */
+static void fx_restore(CPU*c, const u8*p);
 static const int gidx[16] = {8, 9, 10, 11, 12, 13, 14, 15, 7, 6, 5, 3, 2, 0, 1, 4};
 #define SFRAME 1088
 static void deliver_sig(CPU*c, int s) {
@@ -339,7 +341,7 @@ static void deliver_sig(CPU*c, int s) {
     *(u64*)(mc + 8 * 16) = c->rip; *(u64*)(mc + 8 * 17) = RF(c);
     *(u64*)(mc + 8 * 22) = g_fault == s ? g_faddr : 0;
     *(u64*)(mc + 8 * 23) = fp;
-    memcpy((void*)(fp + 160), c->x, 256); *(u32*)(fp + 24) = c->mxcsr;
+    fx_save(c, (u8*) fp);
     u64 nm = old | h->mask | ((h->flags & 0x40000000) ? 0 : (1ULL << (s - 1)));
     syscall(SYS_rt_sigprocmask, SIG_SETMASK, &nm, NULL, 8);
     *(u64*) sp = (h->flags & 0x04000000) ? h->restorer : g_tramp;
@@ -352,7 +354,7 @@ static void g_sigreturn(CPU*c) {
     u64 sp = c->r[RSP] - 8, uc = sp + 8, mc = uc + 40, fp = *(u64*)(mc + 8 * 23);
     for (int i = 0; i < 16; i++) c->r[gidx[i]] = *(u64*)(mc + 8 * (u64) i);
     c->rip = *(u64*)(mc + 8 * 16); RF(c) = *(u64*)(mc + 8 * 17);
-    if (fp) { memcpy(c->x, (void*)(fp + 160), 256); c->mxcsr = *(u32*)(fp + 24); }
+    if (fp) fx_restore(c, (const u8*) fp);
     u64 m = *(u64*)(uc + 296);
     syscall(SYS_rt_sigprocmask, SIG_SETMASK, &m, NULL, 8);
 }
@@ -444,6 +446,181 @@ static long pass_nr2(u64 n) {
 #endif
 #ifdef SYS_pidfd_open
     P2(434, SYS_pidfd_open) P2(424, SYS_pidfd_send_signal)
+#endif
+/* more pass-through syscalls (structures have the same layout on x86_64 and the generic aarch64 ABI) */
+#ifdef SYS_shmget
+    P2(29, SYS_shmget)
+#endif
+#ifdef SYS_shmat
+    P2(30, SYS_shmat)
+#endif
+#ifdef SYS_shmdt
+    P2(67, SYS_shmdt)
+#endif
+#ifdef SYS_semget
+    P2(64, SYS_semget)
+#endif
+#ifdef SYS_semop
+    P2(65, SYS_semop)
+#endif
+#ifdef SYS_semtimedop
+    P2(220, SYS_semtimedop)
+#endif
+#ifdef SYS_msgget
+    P2(68, SYS_msgget)
+#endif
+#ifdef SYS_msgsnd
+    P2(69, SYS_msgsnd)
+#endif
+#ifdef SYS_msgrcv
+    P2(70, SYS_msgrcv)
+#endif
+#ifdef SYS_rt_sigqueueinfo
+    P2(129, SYS_rt_sigqueueinfo)
+#endif
+#ifdef SYS_rt_tgsigqueueinfo
+    P2(297, SYS_rt_tgsigqueueinfo)
+#endif
+#ifdef SYS_settimeofday
+    P2(164, SYS_settimeofday)
+#endif
+#ifdef SYS_adjtimex
+    P2(159, SYS_adjtimex)
+#endif
+#ifdef SYS_syslog
+    P2(103, SYS_syslog)
+#endif
+#ifdef SYS_setdomainname
+    P2(171, SYS_setdomainname)
+#endif
+#ifdef SYS_vhangup
+    P2(153, SYS_vhangup)
+#endif
+#ifdef SYS_readahead
+    P2(187, SYS_readahead)
+#endif
+#ifdef SYS_ioprio_set
+    P2(251, SYS_ioprio_set)
+#endif
+#ifdef SYS_ioprio_get
+    P2(252, SYS_ioprio_get)
+#endif
+#ifdef SYS_unshare
+    P2(272, SYS_unshare)
+#endif
+#ifdef SYS_setns
+    P2(308, SYS_setns)
+#endif
+#ifdef SYS_process_vm_readv
+    P2(310, SYS_process_vm_readv)
+#endif
+#ifdef SYS_process_vm_writev
+    P2(311, SYS_process_vm_writev)
+#endif
+#ifdef SYS_sched_setattr
+    P2(314, SYS_sched_setattr)
+#endif
+#ifdef SYS_sched_getattr
+    P2(315, SYS_sched_getattr)
+#endif
+#ifdef SYS_fanotify_init
+    P2(300, SYS_fanotify_init)
+#endif
+#ifdef SYS_fanotify_mark
+    P2(301, SYS_fanotify_mark)
+#endif
+#ifdef SYS_name_to_handle_at
+    P2(303, SYS_name_to_handle_at)
+#endif
+#ifdef SYS_open_by_handle_at
+    P2(304, SYS_open_by_handle_at)
+#endif
+#ifdef SYS_clock_adjtime
+    P2(305, SYS_clock_adjtime)
+#endif
+#ifdef SYS_membarrier
+    P2(324, SYS_membarrier)
+#endif
+#ifdef SYS_mlock2
+    P2(325, SYS_mlock2)
+#endif
+#ifdef SYS_preadv2
+    P2(327, SYS_preadv2)
+#endif
+#ifdef SYS_pwritev2
+    P2(328, SYS_pwritev2)
+#endif
+#ifdef SYS_userfaultfd
+    P2(323, SYS_userfaultfd)
+#endif
+#ifdef SYS_io_setup
+    P2(206, SYS_io_setup)
+#endif
+#ifdef SYS_io_destroy
+    P2(207, SYS_io_destroy)
+#endif
+#ifdef SYS_io_getevents
+    P2(208, SYS_io_getevents)
+#endif
+#ifdef SYS_io_submit
+    P2(209, SYS_io_submit)
+#endif
+#ifdef SYS_io_cancel
+    P2(210, SYS_io_cancel)
+#endif
+#ifdef SYS_mq_open
+    P2(240, SYS_mq_open)
+#endif
+#ifdef SYS_mq_unlink
+    P2(241, SYS_mq_unlink)
+#endif
+#ifdef SYS_mq_timedsend
+    P2(242, SYS_mq_timedsend)
+#endif
+#ifdef SYS_mq_timedreceive
+    P2(243, SYS_mq_timedreceive)
+#endif
+#ifdef SYS_mq_notify
+    P2(244, SYS_mq_notify)
+#endif
+#ifdef SYS_mq_getsetattr
+    P2(245, SYS_mq_getsetattr)
+#endif
+#ifdef SYS_add_key
+    P2(248, SYS_add_key)
+#endif
+#ifdef SYS_request_key
+    P2(249, SYS_request_key)
+#endif
+#ifdef SYS_keyctl
+    P2(250, SYS_keyctl)
+#endif
+#ifdef SYS_mbind
+    P2(237, SYS_mbind)
+#endif
+#ifdef SYS_set_mempolicy
+    P2(238, SYS_set_mempolicy)
+#endif
+#ifdef SYS_get_mempolicy
+    P2(239, SYS_get_mempolicy)
+#endif
+#ifdef SYS_migrate_pages
+    P2(256, SYS_migrate_pages)
+#endif
+#ifdef SYS_move_pages
+    P2(279, SYS_move_pages)
+#endif
+#ifdef SYS_faccessat2
+    P2(439, SYS_faccessat2)
+#endif
+#ifdef SYS_epoll_pwait2
+    P2(441, SYS_epoll_pwait2)
+#endif
+#ifdef SYS_pidfd_getfd
+    P2(438, SYS_pidfd_getfd)
+#endif
+#ifdef SYS_openat2
+    P2(437, SYS_openat2)
 #endif
     default: return -1;
     }
@@ -540,6 +717,27 @@ static long clone_thread(CPU*c, u64 flags, u64 stack, u64 ptid, u64 ctid, u64 tl
     int tid;
     while (!(tid = __atomic_load_n(&tidv, __ATOMIC_SEQ_CST))) sched_yield();
     return tid;
+}
+
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+/* MAP_32BIT: x86-64 guests ask for an address in the first 2 GiB (JIT code, some allocators). The aarch64 host has no such
+ * flag, so look for a free range there ourselves; the guest is mapped 1:1, so any address that mmap accepts is valid. */
+static long mmap32(u64 len, u64 prot, u64 flags, u64 fd, u64 off) {
+    static u64 next = 0x10000000ULL;
+    const u64 lo = 0x10000000ULL, hi = 0x80000000ULL, pg = (u64) sysconf(_SC_PAGESIZE);
+    u64 n = (len + pg - 1) & ~(pg - 1), a = __atomic_load_n(&next, __ATOMIC_RELAXED);
+    if (!n) return -EINVAL;
+    for (int k = 0; k < 8192; k++) {
+        if (a < lo || a + n > hi) a = lo;
+        long r = hs(SYS_mmap, (long) a, (long) len, (long) prot, (long) (flags | MAP_FIXED_NOREPLACE), (long) fd, (long) off);
+        if (r == (long) a) { __atomic_store_n(&next, a + n, __ATOMIC_RELAXED); return r; }
+        if (r >= 0) munmap((void*) r, n);                 /* a kernel without MAP_FIXED_NOREPLACE took it as a hint */
+        else if (r != -EEXIST) return r;
+        a += n < 0x10000 ? 0x10000 : n;
+    }
+    return -ENOMEM;
 }
 
 static long gsys(CPU*c, int*noset) {
@@ -670,6 +868,27 @@ static long gsys(CPU*c, int*noset) {
         return pid;
     }
     case 59: return do_execve((const char*) a0, (char**) a1, (char**) a2);
+    case 9:
+        if (a3 & 0x40 /*MAP_32BIT*/ && !a0) return mmap32(a1, a2, a3 & ~0x40UL & ~(u64) MAP_FIXED, a4, a5);
+        return hs(SYS_mmap, (long) a0, (long) a1, (long) a2, (long)(a3 & ~0x40UL), (long) a4, (long) a5);
+#ifdef SYS_shmctl
+    case 31: return hs(SYS_shmctl, (long) a0, (long)(a1 & ~0x100UL), (long) a2, 0, 0, 0);                   /* IPC_64 is implied on 64-bit; the generic ABI rejects the flag */
+#endif
+#ifdef SYS_semctl
+    case 66: return hs(SYS_semctl, (long) a0, (long) a1, (long)(a2 & ~0x100UL), (long) a3, 0, 0);
+#endif
+#ifdef SYS_msgctl
+    case 71: return hs(SYS_msgctl, (long) a0, (long)(a1 & ~0x100UL), (long) a2, 0, 0, 0);
+#endif
+    case 132: { struct timespec ts[2], *tp = NULL;                                                          /* utime(path, struct utimbuf*) */
+                if (a1) { const s64*u = (const s64*) a1; ts[0].tv_sec = (time_t) u[0]; ts[0].tv_nsec = 0; ts[1].tv_sec = (time_t) u[1]; ts[1].tv_nsec = 0; tp = ts; }
+                return hs(SYS_utimensat, AT_FDCWD, (long) a0, (long) tp, 0, 0, 0); }
+    case 133: return hs(SYS_mknodat, AT_FDCWD, (long) a0, (long) a1, (long) a2, 0, 0);
+    case 261: { struct timespec ts[2], *tp = NULL;                                                          /* futimesat(dirfd, path, struct timeval[2]) */
+                if (a2) { struct timeval*tv = (struct timeval*) a2; for (int i = 0; i < 2; i++) { ts[i].tv_sec = tv[i].tv_sec; ts[i].tv_nsec = tv[i].tv_usec * 1000L; } tp = ts; }
+                return hs(SYS_utimensat, (long) a0, (long) a1, (long) tp, 0, 0, 0); }
+    case 253: return hs(SYS_inotify_init1, 0, 0, 0, 0, 0, 0);
+    case 282: return hs(SYS_signalfd4, (long) a0, (long) a1, (long) a2, 0, 0, 0);
     case 322: case 435: case 334: case 317: return -ENOSYS;
     case 273: case 274: return -ENOSYS;               /* set/get_robust_list: blocked by Android seccomp; glibc ignores the error */
     default:
@@ -863,9 +1082,16 @@ static int sse(CPU*c, I*in, int op) {
         else if (m.ismem) memcpy((void*) m.ea, d, pf == 3 ? 4 : 8);
         else memcpy(&c->x[m.rm], d, pf == 3 ? 4 : 8);
         break;
-    case 0x12: if (m.ismem) d->q[0] = *(u64u*) m.ea; else d->q[0] = c->x[m.rm].q[1]; break;
+    case 0x12:
+        if (pf == 3) { SRC(16); d->d[0] = d->d[1] = s->d[0]; d->d[2] = d->d[3] = s->d[2]; }       /* movsldup */
+        else if (pf == 2) { SRC(8); d->q[0] = d->q[1] = s->q[0]; }                                 /* movddup */
+        else if (m.ismem) d->q[0] = *(u64u*) m.ea; else d->q[0] = c->x[m.rm].q[1];
+        break;
     case 0x13: if (!m.ismem) return -1; *(u64u*) m.ea = d->q[0]; break;
-    case 0x16: if (m.ismem) d->q[1] = *(u64u*) m.ea; else d->q[1] = c->x[m.rm].q[0]; break;
+    case 0x16:
+        if (pf == 3) { SRC(16); d->d[0] = d->d[1] = s->d[1]; d->d[2] = d->d[3] = s->d[3]; }       /* movshdup */
+        else if (m.ismem) d->q[1] = *(u64u*) m.ea; else d->q[1] = c->x[m.rm].q[0];
+        break;
     case 0x17: if (!m.ismem) return -1; *(u64u*) m.ea = d->q[1]; break;
     case 0x14: SRC(16); if (pf == 0) { V t = *d; d->f[0] = t.f[0]; d->f[1] = s->f[0]; d->f[2] = t.f[1]; d->f[3] = s->f[1]; } else { d->q[1] = s->q[0]; } break;
     case 0x15: SRC(16); if (pf == 0) { V t = *d; d->f[0] = t.f[2]; d->f[1] = s->f[2]; d->f[2] = t.f[3]; d->f[3] = s->f[3]; } else { d->q[0] = d->q[1]; d->q[1] = s->q[1]; } break;
@@ -958,12 +1184,229 @@ static int sse(CPU*c, I*in, int op) {
         else if (pf == 3) { SRC(8); d->q[0] = s->q[0]; d->q[1] = 0; }
         else return -1;
         break;
+    case 0x52: case 0x53:                                         /* rsqrtps/ss, rcpps/ss: computed exactly (hardware gives a 12-bit estimate) */
+        if (pf == 0) { SRC(16); for (int i = 0; i < 4; i++) d->f[i] = op == 0x52 ? 1.0f / sqrtf(s->f[i]) : 1.0f / s->f[i]; }
+        else if (pf == 3) { SRC(4); d->f[0] = op == 0x52 ? 1.0f / sqrtf(s->f[0]) : 1.0f / s->f[0]; }
+        else return -1;
+        break;
+    case 0x7C: case 0x7D: {                                       /* SSE3 haddpd/hsubpd (66), haddps/hsubps (F2) */
+        if (pf != 1 && pf != 2) return -1;
+        SRC(16); V t = *d;
+        if (pf == 2) { float a[4] = {t.f[0], t.f[2], s->f[0], s->f[2]}, b[4] = {t.f[1], t.f[3], s->f[1], s->f[3]};
+                       for (int i = 0; i < 4; i++) d->f[i] = op == 0x7C ? a[i] + b[i] : a[i] - b[i]; }
+        else { double a[2] = {t.df[0], s->df[0]}, b[2] = {t.df[1], s->df[1]};
+               for (int i = 0; i < 2; i++) d->df[i] = op == 0x7C ? a[i] + b[i] : a[i] - b[i]; }
+        break; }
+    case 0xD0: {                                                  /* SSE3 addsubpd (66), addsubps (F2) */
+        if (pf != 1 && pf != 2) return -1;
+        SRC(16); V t = *d;
+        if (pf == 2) { for (int i = 0; i < 4; i++) d->f[i] = (i & 1) ? t.f[i] + s->f[i] : t.f[i] - s->f[i]; }
+        else { d->df[0] = t.df[0] - s->df[0]; d->df[1] = t.df[1] + s->df[1]; }
+        break; }
+    case 0xF0: if (pf != 2 || !m.ismem) return -1; SRC(16); *d = *s; break;       /* lddqu */
+    case 0xF7: {                                                  /* maskmovdqu: byte-masked store to [rdi] */
+        if (pf != 1 || m.ismem) return -1;
+        V*mk = &c->x[m.rm]; u8*dst = (u8*)(c->r[RDI] + in->seg);
+        for (int i = 0; i < 16; i++) if (mk->b[i] & 0x80) dst[i] = d->b[i];
+        break; }
     case 0x77: break;
     default:
         if (pf != 1) return -1;
         SRC(16);
         pint(op, d, s, &ok);
         if (!ok) return -1;
+    }
+    return 0;
+}
+
+
+/* ------------------------------------------------------------ SSSE3 / SSE4.1 / SSE4.2 (0F 38 xx, 0F 3A xx)
+ * Only the 66-prefixed XMM forms exist here (the MMX forms are not emulated), plus crc32 (F2 0F 38 F0/F1). */
+static inline s16 sat16(s32 v) { return (s16)(v > 32767 ? 32767 : v < -32768 ? -32768 : v); }
+static inline u16 satu16(s32 v) { return (u16)(v > 65535 ? 65535 : v < 0 ? 0 : v); }
+static inline float rnd_f(float v, int md) { switch (md & 3) { case 0: return nearbyintf(v); case 1: return floorf(v); case 2: return ceilf(v); default: return truncf(v); } }
+static inline double rnd_d(double v, int md) { switch (md & 3) { case 0: return nearbyint(v); case 1: return floor(v); case 2: return ceil(v); default: return trunc(v); } }
+
+/* PCMP{E,I}STR{I,M} (SDM vol. 2B "Intel SSE4.2 string and text instructions"). a = first operand (xmm1, its length is la),
+ * b = second operand (xmm2/m128, length lb). Returns IntRes2 and sets CF/ZF/SF/OF. */
+static int pc_elem(const V*r, int imm, int i) {
+    switch (imm & 3) { case 0: return r->b[i]; case 1: return r->w[i]; case 2: return r->sb[i]; default: return r->sw[i]; }
+}
+static int pc_bool(const V*a, const V*b, int imm, int la, int lb, int agg, int j, int i) {     /* BoolRes[j][i]: b[j] against a[i] */
+    int va = i < la, vb = j < lb;
+    if (agg == 2) { if (!va && !vb) return 1; if (!va || !vb) return 0; }          /* equal each: both invalid -> true, one invalid -> false */
+    else if (agg == 3) { if (!va) return 1; if (!vb) return 0; }                    /* equal ordered: invalid needle element -> true */
+    else if (!va || !vb) return 0;                                                  /* equal any, ranges */
+    int x = pc_elem(a, imm, i), y = pc_elem(b, imm, j);
+    if (agg == 1) return (i & 1) ? y <= x : y >= x;                                 /* ranges: even = lower bound, odd = upper bound */
+    return x == y;
+}
+static unsigned pcmpstr(CPU*c, const V*a, const V*b, int imm, int la, int lb) {
+    int n = (imm & 1) ? 8 : 16, agg = (imm >> 2) & 3, pol = (imm >> 4) & 3;
+    unsigned r1 = 0, all = (1u << n) - 1, r2;
+    for (int j = 0; j < n; j++) {
+        int v = 0;
+        switch (agg) {
+        case 0: for (int i = 0; i < n && !v; i++) v = pc_bool(a, b, imm, la, lb, agg, j, i); break;
+        case 1: for (int i = 0; i < n && !v; i += 2) v = pc_bool(a, b, imm, la, lb, agg, j, i) && pc_bool(a, b, imm, la, lb, agg, j, i + 1); break;
+        case 2: v = pc_bool(a, b, imm, la, lb, agg, j, j); break;
+        default: v = 1; for (int k = 0; j + k < n && v; k++) v = pc_bool(a, b, imm, la, lb, agg, j + k, k); break;
+        }
+        r1 |= (unsigned) v << j;
+    }
+    r2 = r1;
+    if (pol == 1) r2 = ~r1 & all;
+    else if (pol == 3) for (int j = 0; j < lb && j < n; j++) r2 ^= 1u << j;           /* masked negative: only valid elements of b are inverted */
+    RF(c) &= ~(u64)(OF_ | SF_ | AF_ | ZF_ | PF_ | CF_);
+    if (r2) RF(c) |= CF_;
+    if (lb < n) RF(c) |= ZF_;
+    if (la < n) RF(c) |= SF_;
+    if (r2 & 1) RF(c) |= OF_;
+    return r2;
+}
+static int pc_ilen(const V*r, int imm) { int n = (imm & 1) ? 8 : 16, k = 0; while (k < n && ((imm & 1) ? r->w[k] : r->b[k])) k++; return k; }
+static int pc_elen(CPU*c, int reg, int w, int imm) {
+    int n = (imm & 1) ? 8 : 16; s64 v = w ? (s64) c->r[reg] : (s64)(s32) c->r[reg];
+    if (v < 0) v = v == INT64_MIN ? INT64_MAX : -v;
+    return v > n ? n : (int) v;
+}
+
+static int sse38(CPU*c, I*in, int op, int is3a) {
+    M m; V sv, *s = NULL; int imm8 = 0;
+    if (!is3a && in->repne) {                                       /* crc32 (CRC-32C), F2 [66|REX.W] 0F 38 F0/F1 */
+        if (op != 0xF0 && op != 0xF1) return -1;
+        modrm(c, in, &m, 0);
+        int sz = op == 0xF0 ? 1 : in->w ? 8 : in->p66 ? 2 : 4;
+        u64 v = rdm(c, in, &m, sz); u32 crc = (u32) c->r[m.reg];
+        for (int i = 0; i < sz; i++) { crc ^= (u8)(v >> (8 * i)); for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0x82F63B78u & (0u - (crc & 1))); }
+        c->r[m.reg] = crc;
+        return 0;
+    }
+    if (!in->p66) return -1;
+    modrm(c, in, &m, is3a ? 1 : 0);
+    if (is3a) imm8 = *in->ip++;
+    V*d = &c->x[m.reg], t = *d;
+    if (!is3a) {
+        int pm = (op >= 0x20 && op <= 0x25) || (op >= 0x30 && op <= 0x35);
+        if (!pm) SRC(16);
+        switch (op) {
+        case 0x00: for (int i = 0; i < 16; i++) d->b[i] = (s->b[i] & 0x80) ? 0 : t.b[s->b[i] & 15]; break;                      /* pshufb */
+        case 0x01: case 0x02: case 0x03: case 0x05: case 0x06: case 0x07: {                                                    /* phadd/phsub w, d, sw */
+            int sub = op >= 5;
+            if (op == 0x02 || op == 0x06) {
+                u32 a[4] = {t.d[0], t.d[2], s->d[0], s->d[2]}, b[4] = {t.d[1], t.d[3], s->d[1], s->d[3]};
+                for (int i = 0; i < 4; i++) d->d[i] = sub ? a[i] - b[i] : a[i] + b[i];
+            } else {
+                s16 a[8] = {t.sw[0], t.sw[2], t.sw[4], t.sw[6], s->sw[0], s->sw[2], s->sw[4], s->sw[6]};
+                s16 b[8] = {t.sw[1], t.sw[3], t.sw[5], t.sw[7], s->sw[1], s->sw[3], s->sw[5], s->sw[7]};
+                for (int i = 0; i < 8; i++) { s32 r = sub ? a[i] - b[i] : a[i] + b[i]; d->sw[i] = (op == 0x03 || op == 0x07) ? sat16(r) : (s16) r; }
+            }
+            break; }
+        case 0x04: for (int i = 0; i < 8; i++) d->sw[i] = sat16((s32) t.b[2 * i] * s->sb[2 * i] + (s32) t.b[2 * i + 1] * s->sb[2 * i + 1]); break;   /* pmaddubsw */
+        case 0x08: for (int i = 0; i < 16; i++) d->sb[i] = s->sb[i] < 0 ? (s8)(0 - t.sb[i]) : s->sb[i] == 0 ? 0 : t.sb[i]; break;                /* psignb/w/d */
+        case 0x09: for (int i = 0; i < 8; i++) d->sw[i] = s->sw[i] < 0 ? (s16)(0 - t.sw[i]) : s->sw[i] == 0 ? 0 : t.sw[i]; break;
+        case 0x0A: for (int i = 0; i < 4; i++) d->sd[i] = s->sd[i] < 0 ? (s32)(0u - t.d[i]) : s->sd[i] == 0 ? 0 : t.sd[i]; break;
+        case 0x0B: for (int i = 0; i < 8; i++) d->sw[i] = (s16)(((((s32) t.sw[i] * s->sw[i]) >> 14) + 1) >> 1); break;                              /* pmulhrsw */
+        case 0x10: for (int i = 0; i < 16; i++) if (c->x[0].b[i] & 0x80) d->b[i] = s->b[i]; break;                                                /* pblendvb */
+        case 0x14: for (int i = 0; i < 4; i++) if (c->x[0].d[i] >> 31) d->d[i] = s->d[i]; break;                                                  /* blendvps */
+        case 0x15: for (int i = 0; i < 2; i++) if (c->x[0].q[i] >> 63) d->q[i] = s->q[i]; break;                                                  /* blendvpd */
+        case 0x17: {                                                                                                                              /* ptest */
+            int zf = !((t.q[0] & s->q[0]) | (t.q[1] & s->q[1])), cf = !((~t.q[0] & s->q[0]) | (~t.q[1] & s->q[1]));
+            RF(c) &= ~(u64)(OF_ | SF_ | AF_ | ZF_ | PF_ | CF_);
+            if (zf) RF(c) |= ZF_;
+            if (cf) RF(c) |= CF_;
+            break; }
+        case 0x1C: for (int i = 0; i < 16; i++) d->b[i] = (u8)(s->sb[i] < 0 ? 0 - s->sb[i] : s->sb[i]); break;                                     /* pabsb/w/d */
+        case 0x1D: for (int i = 0; i < 8; i++) d->w[i] = (u16)(s->sw[i] < 0 ? 0 - s->sw[i] : s->sw[i]); break;
+        case 0x1E: for (int i = 0; i < 4; i++) d->d[i] = s->sd[i] < 0 ? 0u - s->d[i] : s->d[i]; break;
+        case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25:                                                                         /* pmovsx*, pmovzx* */
+        case 0x30: case 0x31: case 0x32: case 0x33: case 0x34: case 0x35: {
+            static const u8 esz[6] = {1, 1, 1, 2, 2, 4}, dsz[6] = {2, 4, 8, 4, 8, 8};
+            int k = op & 15, es = esz[k], ds = dsz[k], cnt = 16 / ds, zx = op >= 0x30;
+            SRC(cnt * es);
+            for (int i = 0; i < cnt; i++) {
+                u64 v = 0; memcpy(&v, s->b + i * es, (size_t) es);
+                if (!zx) v = (u64) sx(v, es);
+                memcpy(d->b + i * ds, &v, (size_t) ds);
+            }
+            break; }
+        case 0x28: d->sq[0] = (s64) t.sd[0] * s->sd[0]; d->sq[1] = (s64) t.sd[2] * s->sd[2]; break;                                               /* pmuldq */
+        case 0x29: for (int i = 0; i < 2; i++) d->q[i] = t.q[i] == s->q[i] ? ~0ULL : 0; break;                                                   /* pcmpeqq */
+        case 0x37: for (int i = 0; i < 2; i++) d->q[i] = t.sq[i] > s->sq[i] ? ~0ULL : 0; break;                                                   /* pcmpgtq */
+        case 0x2A: if (!m.ismem) return -1; *d = *s; break;                                                                                       /* movntdqa */
+        case 0x2B: for (int i = 0; i < 4; i++) { d->w[i] = satu16(t.sd[i]); d->w[4 + i] = satu16(s->sd[i]); } break;                              /* packusdw */
+        case 0x38: for (int i = 0; i < 16; i++) d->sb[i] = t.sb[i] < s->sb[i] ? t.sb[i] : s->sb[i]; break;                                        /* pmins/u b,w,d */
+        case 0x39: for (int i = 0; i < 4; i++) d->sd[i] = t.sd[i] < s->sd[i] ? t.sd[i] : s->sd[i]; break;
+        case 0x3A: for (int i = 0; i < 8; i++) d->w[i] = t.w[i] < s->w[i] ? t.w[i] : s->w[i]; break;
+        case 0x3B: for (int i = 0; i < 4; i++) d->d[i] = t.d[i] < s->d[i] ? t.d[i] : s->d[i]; break;
+        case 0x3C: for (int i = 0; i < 16; i++) d->sb[i] = t.sb[i] > s->sb[i] ? t.sb[i] : s->sb[i]; break;                                        /* pmaxs/u b,w,d */
+        case 0x3D: for (int i = 0; i < 4; i++) d->sd[i] = t.sd[i] > s->sd[i] ? t.sd[i] : s->sd[i]; break;
+        case 0x3E: for (int i = 0; i < 8; i++) d->w[i] = t.w[i] > s->w[i] ? t.w[i] : s->w[i]; break;
+        case 0x3F: for (int i = 0; i < 4; i++) d->d[i] = t.d[i] > s->d[i] ? t.d[i] : s->d[i]; break;
+        case 0x40: for (int i = 0; i < 4; i++) d->d[i] = t.d[i] * s->d[i]; break;                                                                 /* pmulld */
+        case 0x41: {                                                                                                                              /* phminposuw */
+            u16 mn = s->w[0]; int ix = 0;
+            for (int i = 1; i < 8; i++) if (s->w[i] < mn) { mn = s->w[i]; ix = i; }
+            memset(d, 0, 16); d->w[0] = mn; d->w[1] = (u16) ix; break; }
+        default: return -1;
+        }
+        return 0;
+    }
+    int md = (imm8 & 4) ? (int)((c->mxcsr >> 13) & 3) : (imm8 & 3);       /* round*: MXCSR.RC when imm8 bit 2 is set */
+    switch (op) {
+    case 0x08: SRC(16); for (int i = 0; i < 4; i++) d->f[i] = rnd_f(s->f[i], md); break;                                       /* roundps/pd/ss/sd */
+    case 0x09: SRC(16); for (int i = 0; i < 2; i++) d->df[i] = rnd_d(s->df[i], md); break;
+    case 0x0A: SRC(4); d->f[0] = rnd_f(s->f[0], md); break;
+    case 0x0B: SRC(8); d->df[0] = rnd_d(s->df[0], md); break;
+    case 0x0C: SRC(16); for (int i = 0; i < 4; i++) if ((imm8 >> i) & 1) d->d[i] = s->d[i]; break;                               /* blendps/pd, pblendw */
+    case 0x0D: SRC(16); for (int i = 0; i < 2; i++) if ((imm8 >> i) & 1) d->q[i] = s->q[i]; break;
+    case 0x0E: SRC(16); for (int i = 0; i < 8; i++) if ((imm8 >> i) & 1) d->w[i] = s->w[i]; break;
+    case 0x0F: {                                                                                                                /* palignr: (dest:src) >> imm8 bytes */
+        SRC(16); u8 cat[32]; memcpy(cat, s->b, 16); memcpy(cat + 16, t.b, 16);
+        for (int i = 0; i < 16; i++) { int j = i + imm8; d->b[i] = j < 32 ? cat[j] : 0; }
+        break; }
+    case 0x14: case 0x15: case 0x16: case 0x17: {                                                                               /* pextrb/w/d/q, extractps */
+        int sz = op == 0x14 ? 1 : op == 0x15 ? 2 : (op == 0x16 && in->w) ? 8 : 4;
+        u64 v = sz == 1 ? t.b[imm8 & 15] : sz == 2 ? t.w[imm8 & 7] : sz == 8 ? t.q[imm8 & 1] : t.d[imm8 & 3];
+        if (m.ismem) mwr(m.ea, v, sz); else setr(c, m.rm, sz == 8 ? 8 : 4, 0, v);
+        break; }
+    case 0x20: d->b[imm8 & 15] = (u8)(m.ismem ? mrd(m.ea, 1) : getr(c, m.rm, 4, 0)); break;                                      /* pinsrb */
+    case 0x21: {                                                                                                                /* insertps */
+        int cd = (imm8 >> 4) & 3, cs; if (m.ismem) { SRC(4); cs = 0; } else { SRC(16); cs = (imm8 >> 6) & 3; }
+        d->d[cd] = s->d[cs];
+        for (int i = 0; i < 4; i++) if ((imm8 >> i) & 1) d->d[i] = 0;
+        break; }
+    case 0x22: if (in->w) d->q[imm8 & 1] = rdm(c, in, &m, 8); else d->d[imm8 & 3] = (u32) rdm(c, in, &m, 4); break;             /* pinsrd/q */
+    case 0x40: {                                                                                                                /* dpps */
+        SRC(16); volatile float p[4];                                       /* volatile: no fused multiply-add, the sums must round like the hardware's */
+        for (int i = 0; i < 4; i++) p[i] = (imm8 & (0x10 << i)) ? d->f[i] * s->f[i] : 0.0f;
+        float lo = p[0] + p[1], hi = p[2] + p[3], sum = lo + hi;
+        for (int i = 0; i < 4; i++) d->f[i] = ((imm8 >> i) & 1) ? sum : 0.0f;
+        break; }
+    case 0x41: {                                                                                                                /* dppd */
+        SRC(16); volatile double p[2];
+        for (int i = 0; i < 2; i++) p[i] = (imm8 & (0x10 << i)) ? d->df[i] * s->df[i] : 0.0;
+        double sum = p[0] + p[1];
+        for (int i = 0; i < 2; i++) d->df[i] = ((imm8 >> i) & 1) ? sum : 0.0;
+        break; }
+    case 0x42: {                                                                                                                /* mpsadbw */
+        SRC(16); int so = (imm8 & 3) * 4, dof = ((imm8 >> 2) & 1) * 4;
+        for (int i = 0; i < 8; i++) { int sum = 0; for (int k = 0; k < 4; k++) { int df = (int) t.b[dof + i + k] - (int) s->b[so + k]; sum += df < 0 ? -df : df; } d->w[i] = (u16) sum; }
+        break; }
+    case 0x60: case 0x61: case 0x62: case 0x63: {                                                                               /* pcmpestrm/i, pcmpistrm/i */
+        SRC(16);
+        int n = (imm8 & 1) ? 8 : 16, la, lb;
+        if (op < 0x62) { la = pc_elen(c, RAX, in->w, imm8); lb = pc_elen(c, RDX, in->w, imm8); }
+        else { la = pc_ilen(&t, imm8); lb = pc_ilen(s, imm8); }
+        unsigned r = pcmpstr(c, &t, s, imm8, la, lb);
+        if (op & 1) c->r[RCX] = !r ? (u32) n : (imm8 & 0x40) ? (u32)(31 - __builtin_clz(r)) : (u32) __builtin_ctz(r);
+        else {
+            V*x0 = &c->x[0]; memset(x0, 0, 16);
+            if (imm8 & 0x40) { for (int j = 0; j < n; j++) if ((r >> j) & 1) { if (n == 8) x0->w[j] = 0xffff; else x0->b[j] = 0xff; } }
+            else x0->q[0] = r;
+        }
+        break; }
+    default: return -1;
     }
     return 0;
 }
@@ -995,6 +1438,22 @@ static void ld_to80(long double v, u8*p) {
     }
     *(u64u*) p = m; *(u16u*)(p + 8) = se;
 }
+/* FXSAVE image (512 bytes), shared by fxsave/fxrstor, the signal frame and sigreturn. Layout: 0 fcw, 2 fsw (TOP in bits 11-13),
+ * 4 abridged tag word (tags are not tracked: 0), 24 mxcsr, 28 mxcsr_mask, 32 ST(0..7) at 16 bytes each in stack order, 160 xmm0-15. */
+static void fx_save(CPU*c, u8*p) {
+    memset(p, 0, 512);
+    *(u16u*) p = c->fcw; *(u16u*)(p + 2) = (u16)((c->fsw & ~0x3800) | (c->top << 11));
+    *(u32u*)(p + 24) = c->mxcsr; *(u32u*)(p + 28) = 0xffff;
+    for (int i = 0; i < 8; i++) ld_to80(c->st[(c->top + i) & 7], p + 32 + 16 * i);
+    memcpy(p + 160, c->x, 256);
+}
+static void fx_restore(CPU*c, const u8*p) {
+    u16 sw = *(const u16u*)(p + 2);
+    c->fcw = *(const u16u*) p; c->fsw = sw & 0x4700; c->top = (sw >> 11) & 7;
+    c->mxcsr = *(const u32u*)(p + 24);
+    for (int i = 0; i < 8; i++) c->st[(c->top + i) & 7] = ld_from80(p + 32 + 16 * i);
+    memcpy(c->x, p + 160, 256);
+}
 static void xpush(CPU*c, long double v) { c->top = (c->top - 1) & 7; c->st[c->top] = v; }
 static void xpop(CPU*c) { c->top = (c->top + 1) & 7; }
 static long double xround(CPU*c, long double v) {
@@ -1013,6 +1472,11 @@ static void x_flags(CPU*c, long double a, long double b) {
 }
 static u64 x_toint(CPU*c, long double v, int sz) {
     long double r = xround(c, v), lim = sz == 2 ? 32768.0L : sz == 4 ? 2147483648.0L : 9223372036854775808.0L;
+    if (isnan(r) || r >= lim || r < -lim) return sz == 2 ? 0x8000 : sz == 4 ? 0x80000000ULL : 0x8000000000000000ULL;
+    return (u64)(s64) r;
+}
+static u64 x_tointt(long double v, int sz) {            /* fisttp: truncate toward zero, whatever the rounding mode says */
+    long double r = truncl(v), lim = sz == 2 ? 32768.0L : sz == 4 ? 2147483648.0L : 9223372036854775808.0L;
     if (isnan(r) || r >= lim || r < -lim) return sz == 2 ? 0x8000 : sz == 4 ? 0x80000000ULL : 0x8000000000000000ULL;
     return (u64)(s64) r;
 }
@@ -1046,6 +1510,17 @@ static int x87(CPU*c, I*in, u8 op) {
             case 0: { double d; memcpy(&d, (void*) ea, 8); xpush(c, d); return 0; }
             case 2: case 3: { double d = (double) ST(0); memcpy((void*) ea, &d, 8); if (r == 3) xpop(c); return 0; }
             case 7: mwr(ea, (u64)((c->fsw & ~0x3800) | (c->top << 11)), 2); return 0;
+            case 1: mwr(ea, x_tointt(ST(0), 8), 8); xpop(c); return 0;                          /* fisttp m64int (SSE3) */
+            case 4: {                                                                          /* frstor: 28-byte environment, then ST(0..7) as 80-bit */
+                u16 sw = (u16) mrd(ea + 4, 2);
+                c->fcw = (u16) mrd(ea, 2); c->fsw = sw & 0x4700; c->top = (sw >> 11) & 7;
+                for (int i = 0; i < 8; i++) ST(i) = ld_from80((u8*)(ea + 28 + 10 * (u64) i));
+                return 0; }
+            case 6:                                                                            /* fnsave: environment + ST(0..7), then fninit */
+                memset((void*) ea, 0, 28); mwr(ea, c->fcw, 2); mwr(ea + 4, (u64)((c->fsw & ~0x3800) | (c->top << 11)), 2); mwr(ea + 8, 0xffff, 2);
+                for (int i = 0; i < 8; i++) ld_to80(ST(i), (u8*)(ea + 28 + 10 * (u64) i));
+                c->fcw = 0x37f; c->fsw = 0; c->top = 0;
+                return 0;
             }
             return -1;
         case 0xDB:
@@ -1054,6 +1529,7 @@ static int x87(CPU*c, I*in, u8 op) {
             case 2: case 3: mwr(ea, x_toint(c, ST(0), 4), 4); if (r == 3) xpop(c); return 0;
             case 5: xpush(c, ld_from80((u8*) ea)); return 0;
             case 7: ld_to80(ST(0), (u8*) ea); xpop(c); return 0;
+            case 1: mwr(ea, x_tointt(ST(0), 4), 4); xpop(c); return 0;                          /* fisttp m32int (SSE3) */
             }
             return -1;
         case 0xDF:
@@ -1062,6 +1538,17 @@ static int x87(CPU*c, I*in, u8 op) {
             case 2: case 3: mwr(ea, x_toint(c, ST(0), 2), 2); if (r == 3) xpop(c); return 0;
             case 5: xpush(c, (long double)(s64) mrd(ea, 8)); return 0;
             case 7: mwr(ea, x_toint(c, ST(0), 8), 8); xpop(c); return 0;
+            case 1: mwr(ea, x_tointt(ST(0), 2), 2); xpop(c); return 0;                          /* fisttp m16int (SSE3) */
+            case 4: {                                                                          /* fbld: 18 packed BCD digits (low nibble first), sign in bit 7 of byte 9 */
+                const u8*b = (const u8*) ea; long double v = 0;
+                for (int i = 8; i >= 0; i--) v = v * 100 + (b[i] >> 4) * 10 + (b[i] & 15);
+                xpush(c, (b[9] & 0x80) ? -v : v); return 0; }
+            case 6: {                                                                          /* fbstp */
+                u8*b = (u8*) ea; long double v = xround(c, ST(0)); int neg = signbit(v) != 0;
+                if (neg) v = -v;
+                if (isnan(v) || v >= 1e18L) { memset(b, 0, 10); b[7] = 0xC0; b[8] = 0xFF; b[9] = 0xFF; }   /* packed-BCD indefinite */
+                else { u64 n = (u64) v; for (int i = 0; i < 9; i++) { b[i] = (u8)((n % 10) | ((n / 10 % 10) << 4)); n /= 100; } b[9] = neg ? 0x80 : 0; }
+                xpop(c); return 0; }
             }
             return -1;
         }
@@ -1169,10 +1656,47 @@ static void do_div(CPU*c, int sz, u64 src, int sgd, const u8*ip) {
     (void) ip;
 }
 
+static u64 tsc_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (u64) ts.tv_sec * 1000000000ULL + (u64) ts.tv_nsec; }
+
+/* 128-bit compare-and-swap on a 16-byte aligned location (cmpxchg16b). exp[0..1] = expected (rax, rdx); on failure it receives
+ * the value found. Inline assembly because gcc would call libatomic for a 16-byte __atomic builtin on aarch64. */
+static int cas16(u64*p, u64*exp, u64 n0, u64 n1) {
+#if defined(__aarch64__)
+    u64 o0, o1; u32 st; int ok;
+    __asm__ __volatile__(
+        "1: ldaxp %[o0], %[o1], [%[p]]\n"
+        "   cmp %[o0], %[e0]\n"
+        "   ccmp %[o1], %[e1], #0, eq\n"
+        "   b.ne 2f\n"
+        "   stlxp %w[st], %[n0], %[n1], [%[p]]\n"
+        "   cbnz %w[st], 1b\n"
+        "   mov %w[ok], #1\n"
+        "   dmb ish\n"
+        "   b 3f\n"
+        "2: clrex\n"
+        "   mov %w[ok], #0\n"
+        "3:\n"
+        : [o0] "=&r"(o0), [o1] "=&r"(o1), [st] "=&r"(st), [ok] "=&r"(ok)
+        : [p] "r"(p), [e0] "r"(exp[0]), [e1] "r"(exp[1]), [n0] "r"(n0), [n1] "r"(n1)
+        : "cc", "memory");
+    exp[0] = o0; exp[1] = o1;
+    return ok;
+#elif defined(__x86_64__)
+    unsigned char ok; u64 a = exp[0], d = exp[1];
+    __asm__ __volatile__("lock cmpxchg16b %[m]\n\tsetz %[ok]"
+        : [m] "+m"(*(unsigned __int128*) p), "+a"(a), "+d"(d), [ok] "=q"(ok) : "b"(n0), "c"(n1) : "cc", "memory");
+    exp[0] = a; exp[1] = d;
+    return ok;
+#else
+#error "cas16: unsupported host"
+#endif
+}
+
 static void cpuid(CPU*c) {
     u32 leaf = (u32) c->r[RAX], sub = (u32) c->r[RCX], a = 0, b = 0, cc = 0, d = 0;
     if (leaf == 0) { a = 4; b = 0x756e6547; d = 0x49656e69; cc = 0x6c65746e; }          /* "GenuineIntel": glibc only reads leaf 1 for known vendors */
-    else if (leaf == 1) { a = 0x000306a9; b = 0x00010800; cc = 0; d = (1 << 0) | (1 << 4) | (1 << 8) | (1 << 15) | (1 << 23) | (1 << 24) | (1 << 25) | (1 << 26); }
+    else if (leaf == 1) { a = 0x000306a9; b = 0x00010800; cc = (1 << 0) | (1 << 9) | (1 << 13) | (1 << 19) | (1 << 20) | (1 << 23);     /* SSE3 SSSE3 CX16 SSE4.1 SSE4.2 POPCNT = x86-64-v2; no XSAVE/AVX */
+        d = (1 << 0) | (1 << 4) | (1 << 8) | (1 << 15) | (1 << 23) | (1 << 24) | (1 << 25) | (1 << 26); }
     else if (leaf == 2) { a = 1; }                                                      /* one round, no cache descriptors */
     else if (leaf == 4) {                                                               /* deterministic cache parameters */
         static const u32 e[4][4] = {
@@ -1403,7 +1927,44 @@ static void step(CPU*c) {
         case 0x0B: goto bad;
         case 0x0D: case 0x18: case 0x19: case 0x1A: case 0x1B: case 0x1C: case 0x1D: case 0x1E: case 0x1F:
             modrm(c, &in, &m, 0); break;
-        case 0x31: { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); u64 t = (u64) ts.tv_sec * 1000000000ULL + (u64) ts.tv_nsec; c->r[RAX] = (u32) t; c->r[RDX] = t >> 32; break; }
+        case 0x31: { u64 t = tsc_now(); c->r[RAX] = (u32) t; c->r[RDX] = t >> 32; break; }
+        case 0x01: {                                          /* the register forms xgetbv (0F 01 D0) and rdtscp (0F 01 F9); the rest is privileged */
+            u8 b = *in.ip++;
+            if (b == 0xD0) { c->r[RAX] = 3; c->r[RDX] = 0; }                                   /* XCR0 = x87 | SSE (no AVX state is emulated) */
+            else if (b == 0xF9) { u64 t = tsc_now(); c->r[RAX] = (u32) t; c->r[RDX] = t >> 32; c->r[RCX] = 0; }
+            else goto bad;
+            break; }
+        case 0xA0: case 0xA8: push(c, 0); break;              /* push fs / gs: the selector reads as 0 */
+        case 0xA1: case 0xA9: (void) pop(c); break;           /* pop fs / gs: ignored (the base is set with arch_prctl) */
+        case 0xC3: {                                          /* movnti */
+            modrm(c, &in, &m, 0);
+            if (!m.ismem) goto bad;
+            mwr(m.ea, getr(c, m.reg, opsz, in.rex), opsz); break; }
+        case 0xC7: {                                          /* cmpxchg8b / cmpxchg16b (REX.W) */
+            modrm(c, &in, &m, 0);
+            if (!m.ismem || (m.reg & 7) != 1) goto bad;       /* rdrand/rdseed are not advertised */
+            int ok;
+            if (in.w) {
+                u64 e[2] = { c->r[RAX], c->r[RDX] };
+                if (!(m.ea & 15)) ok = cas16((u64*) m.ea, e, c->r[RBX], c->r[RCX]);
+                else {                                        /* real hardware raises #GP; do it non-atomically instead */
+                    u64 p0 = *(u64u*) m.ea, p1 = *(u64u*)(m.ea + 8);
+                    ok = p0 == e[0] && p1 == e[1];
+                    if (ok) { *(u64u*) m.ea = c->r[RBX]; *(u64u*)(m.ea + 8) = c->r[RCX]; } else { e[0] = p0; e[1] = p1; }
+                }
+                if (!ok) { c->r[RAX] = e[0]; c->r[RDX] = e[1]; }
+            } else {
+                u64 old = ((u64)(u32) c->r[RDX] << 32) | (u32) c->r[RAX], nv = ((u64)(u32) c->r[RCX] << 32) | (u32) c->r[RBX];
+                if (!(m.ea & 7)) ok = __atomic_compare_exchange_n((u64*) m.ea, &old, nv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+                else { u64 cur = *(u64u*) m.ea; ok = cur == old; if (ok) *(u64u*) m.ea = nv; else old = cur; }
+                if (!ok) { c->r[RAX] = (u32) old; c->r[RDX] = old >> 32; }
+            }
+            if (ok) RF(c) |= ZF_; else RF(c) &= ~(u64) ZF_;
+            break; }
+        case 0x38: case 0x3A: {                               /* SSSE3 / SSE4.1 / SSE4.2 / crc32 */
+            u8 o3 = *in.ip++;
+            if (sse38(c, &in, o3, o2 == 0x3A) < 0) undef(c, start, o2 == 0x3A ? "0F3A" : "0F38");
+            break; }
         case 0xA2: cpuid(c); break;
         case 0x40: case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: case 0x46: case 0x47:
         case 0x48: case 0x49: case 0x4A: case 0x4B: case 0x4C: case 0x4D: case 0x4E: case 0x4F: {
@@ -1456,8 +2017,8 @@ static void step(CPU*c) {
             modrm(c, &in, &m, 0);
             int ext = m.reg & 7;
             if (!m.ismem) { if (ext >= 5) { __atomic_thread_fence(__ATOMIC_SEQ_CST); break; } goto bad; }   /* lfence/mfence/sfence */
-            if (ext == 0) { memset((void*) m.ea, 0, 512); *(u16u*) m.ea = c->fcw; *(u32u*)(m.ea + 24) = c->mxcsr; *(u32u*)(m.ea + 28) = 0xffff; memcpy((void*)(m.ea + 160), c->x, 256); }
-            else if (ext == 1) { c->fcw = *(u16u*) m.ea; c->mxcsr = *(u32u*)(m.ea + 24); memcpy(c->x, (void*)(m.ea + 160), 256); }
+            if (ext == 0) fx_save(c, (u8*) m.ea);
+            else if (ext == 1) fx_restore(c, (const u8*) m.ea);
             else if (ext == 2) c->mxcsr = *(u32u*) m.ea;
             else if (ext == 3) *(u32u*) m.ea = c->mxcsr;
             else if (ext == 7) { }

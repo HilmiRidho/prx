@@ -1,0 +1,12 @@
+shm: ok
+sem: ok
+msg: ok
+utime: ok
+futimesat: ok
+mknod: ok
+inotify_init: ok
+signalfd: ok
+sigqueue: ok
+preadv2: ok
+faccessat2: ok
+map32bit: ok

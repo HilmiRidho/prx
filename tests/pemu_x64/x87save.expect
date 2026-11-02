@@ -1,0 +1,19 @@
+fsw.top after fxsave: 5
+image.st0=-3.0000
+image.st1=2.2500
+image.st2=1.5000
+fxrstor.st0=-3.0000
+fxrstor.st1=2.2500
+fxrstor.st2=1.5000
+signal.st0=-3.0000
+signal.st1=2.2500
+signal.st2=1.5000
+fcw after fnsave: 037f
+save.st0=2.2500
+save.st1=1.5000
+frstor.st0=2.2500
+frstor.st1=1.5000
+fisttp: -2 3 3
+80001234567890123456
+fbld back: -1234567890123456.0
+00000000000000012346
