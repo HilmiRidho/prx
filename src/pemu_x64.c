@@ -674,6 +674,10 @@ static long gsys(CPU*c, int*noset) {
         free(ev); return r;
     }
     case 213: return hs(SYS_epoll_create1, 0, 0, 0, 0, 0, 0);
+    case 233: {                                       /* epoll_ctl: the guest's struct epoll_event is packed (events@0, data@4, 12 bytes), the host's is not (data@8) */
+        struct epoll_event ev, *ep = NULL;
+        if (a3) { const u8*g = (const u8*) a3; ev.events = *(const u32*) g; ev.data.u64 = *(const u64u*)(g + 4); ep = &ev; }
+        return hs(SYS_epoll_ctl, (long) a0, (long) a1, (long) a2, (long) ep, 0, 0); }
     case 284: return hs(SYS_eventfd2, (long) a0, 0, 0, 0, 0, 0);
     case 56: case 57: case 58: {                      /* clone / fork / vfork */
         u64 flags = n == 56 ? a0 : SIGCHLD;
