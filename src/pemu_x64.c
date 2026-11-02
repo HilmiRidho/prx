@@ -19,8 +19,9 @@
  * JIT (aarch64 hosts): guest basic blocks are translated to AArch64 code (see the "JIT" section below). Anything the
  * translator does not know runs through the interpreter from inside the translated block, so behaviour is identical.
  * Disable it with PEMU_JIT=0 or -nojit. The JIT works with guest threads (one shared cache, see JT).
- * PEMU_JIT_OPT=<mask> (default 31) toggles optional translations: 1 = lazy flags for shift-by-immediate, 2 = scalar SSE float,
- * 4 = guest rax..rdi pinned to host registers, 8 = superblocks, 16 = return stack buffer.
+ * PEMU_JIT_OPT=<mask> (default 127) toggles optional translations: 1 = lazy flags for shift-by-immediate, 2 = scalar SSE float,
+ * 4 = guest rax..rdi pinned to host registers, 8 = superblocks, 16 = return stack buffer, 32 = comiss/comisd/ucomiss/ucomisd with the host
+ * flags of fcmp, 64 = div/idiv through udiv/sdiv (only when the dividend fits and the divisor is not 0 or -1; the rest is interpreted).
  * Not a security boundary. */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -130,7 +131,7 @@ static void mwr(u64 a, u64 v, int n) {
 
 /* ---- lazy flags: add/sub/logic only record their operands; CF/OF/AF/ZF/SF/PF are computed when somebody reads them.
  * RF(c) is an lvalue that first materialises any pending flags, so every other use of the flags stays unchanged. */
-enum { LZ_NONE, LZ_ADD, LZ_SUB, LZ_LOGIC, LZ_SHL, LZ_SHR, LZ_SAR };   /* LZ_SH*: la = value, lb = count (1..bits-1), lr = result (only recorded by the JIT) */
+enum { LZ_NONE, LZ_ADD, LZ_SUB, LZ_LOGIC, LZ_SHL, LZ_SHR, LZ_SAR, LZ_FCMP };   /* LZ_SH*: la = value, lb = count (1..bits-1), lr = result (only recorded by the JIT); LZ_FCMP: la, lb = the two operands of comiss/comisd (bit patterns, lsz 4 or 8), only recorded by the JIT */
 static const u8 g_par[256] = {
 #define PT2(n) n, n ^ 1, n ^ 1, n
 #define PT4(n) PT2(n), PT2(n ^ 1), PT2(n ^ 1), PT2(n)
@@ -143,6 +144,12 @@ static const u8 g_par[256] = {
 static void mat(CPU*c) {
     int sz = c->lsz, sb = sz * 8 - 1; u64 m = mskz(sz), a = c->la, b = c->lb, r = c->lr;
     u64 f = c->rf & ~(u64)(CF_ | OF_ | AF_ | ZF_ | SF_ | PF_);
+    if (c->lop == LZ_FCMP) {                                    /* same flags as the interpreter's comisd: unordered 111, below CF, equal ZF */
+        double x, y;
+        if (sz == 8) { memcpy(&x, &a, 8); memcpy(&y, &b, 8); } else { float fx, fy; u32 ua = (u32) a, ub = (u32) b; memcpy(&fx, &ua, 4); memcpy(&fy, &ub, 4); x = fx; y = fy; }
+        if (isnan(x) || isnan(y)) f |= ZF_ | PF_ | CF_; else if (x < y) f |= CF_; else if (x == y) f |= ZF_;
+        c->rf = f; c->lop = LZ_NONE; return;
+    }
     switch (c->lop) {
     case LZ_ADD:
         if (c->lcin ? r <= a : r < a) f |= CF_;
@@ -1611,7 +1618,9 @@ static int g_jstats;
 #define JOPT_PIN  4u                    /* guest rax..rdi live in host registers while translated code runs */
 #define JOPT_SB   8u                    /* superblocks: translation continues across direct jmp and forward jcc */
 #define JOPT_RSB  16u                   /* return stack buffer: call/ret are host bl/ret, checked against a shadow stack */
-static unsigned g_jopt = JOPT_SHFL | JOPT_FP | JOPT_PIN | JOPT_SB | JOPT_RSB;   /* PEMU_JIT_OPT=<mask> overrides (0 = none): handy to bisect a misbehaving guest */
+#define JOPT_FCMP 32u                   /* comiss/comisd/ucomiss/ucomisd with the host flags of fcmp (jb/jae/jbe/ja/jp/jnp/setcc/cmovcc) */
+#define JOPT_DIV  64u                   /* 32/64-bit div and idiv with udiv/sdiv when the dividend fits and the divisor is not 0 or -1 */
+static unsigned g_jopt = JOPT_SHFL | JOPT_FP | JOPT_PIN | JOPT_SB | JOPT_RSB | JOPT_FCMP | JOPT_DIV;   /* PEMU_JIT_OPT=<mask> overrides (0 = none): handy to bisect a misbehaving guest */
 /* Register pinning: guest rax,rcx,rdx,rbx,rsp,rbp,rsi,rdi (numbers 0..7) are kept in callee-saved host registers, so
  * they survive helper calls and chained block-to-block branches. The CPU struct is only written back when translated
  * code is left (jepi), around an interpreter fallback (j_pin_spill / j_pin_fill) and, after a fault, from the signal
@@ -1691,6 +1700,12 @@ static void jpatch19(u32 *at) { *at |= ((u32)(jcur - at) & 0x7ffff) << 5; }
 static void a_adr_at(u32 *at, int rd, u32 *target) { s64 d = (s64)((u8*) target - (u8*) at); *at = 0x10000000u | ((u32) d & 3) << 29 | (((u32)(d >> 2)) & 0x7ffff) << 5 | (u32) rd; }
 static void a_bl(u32 *t) { E(0x94000000u | ((u32)(t - jcur) & 0x3ffffff)); }
 static void a_ret(void) { E(0xD65F03C0u); }
+static void a_div(int sf, int sgn, int rd, int rn, int rm) { E(SFB(sf) | 0x1AC00800u | (sgn ? 0x400u : 0u) | (u32) rm << 16 | (u32) rn << 5 | (u32) rd); }       /* udiv / sdiv */
+static void a_msub(int sf, int rd, int rn, int rm, int ra) { E(SFB(sf) | 0x1B008000u | (u32) rm << 16 | (u32) ra << 10 | (u32) rn << 5 | (u32) rd); }     /* rd = ra - rn * rm */
+static u32 *a_b_fwd(void) { E(0x14000000u); return jcur - 1; }
+static void jpatch26(u32 *at) { *at |= (u32)(jcur - at) & 0x3ffffff; }
+static void f_cmp(int sz, int vn, int vm) { E((sz == 8 ? 0x1E602000u : 0x1E202000u) | (u32) vm << 16 | (u32) vn << 5); }          /* fcmp dn, dm */
+static void f_tox(int sz, int rd, int vn) { E((sz == 8 ? 0x9E660000u : 0x1E260000u) | (u32) vn << 5 | (u32) rd); }                  /* fmov xd, dn / fmov wd, sn */
 static void a_br(int rn) { E(0xD61F0000u | (u32) rn << 5); }
 static void a_adr(int rd, u32 *target) { s64 d = (s64)((u8*) target - (u8*) jcur); E(0x10000000u | ((u32) d & 3) << 29 | (((u32)(d >> 2)) & 0x7ffff) << 5 | (u32) rd); }
 static void j_callabs(void *f) {                                /* call a C helper; x0..x5 = arguments */
@@ -1844,7 +1859,7 @@ static void jit_note_rwx(u64 start, u64 len) {                  /* jmu held */
 /* ------------------------------------------------------------ decoder (static, no guest state) */
 enum { OT_NONE, OT_REG, OT_MEM, OT_IMM };
 enum { JO_FB, JO_FBT, JO_NOP, JO_MOV, JO_MOVX, JO_LEA, JO_PUSH, JO_POP, JO_ALU, JO_NOT, JO_NEG, JO_SHIFT, JO_IMUL,
-       JO_SETCC, JO_CMOV, JO_CWDE, JO_CDQ, JO_LEAVE, JO_XLD, JO_XST, JO_XLOG, JO_XMOVDLD, JO_XMOVDST, JO_XVEC, JO_PMOVMSKB, JO_XSHI, JO_FMOV, JO_FARITH, JO_CVTSI2F, JO_JMP, JO_JCC, JO_CALL, JO_RET, JO_JMPI, JO_CALLI };
+       JO_SETCC, JO_CMOV, JO_CWDE, JO_CDQ, JO_LEAVE, JO_XLD, JO_XST, JO_XLOG, JO_XMOVDLD, JO_XMOVDST, JO_XVEC, JO_PMOVMSKB, JO_XSHI, JO_FMOV, JO_FARITH, JO_CVTSI2F, JO_FCMP, JO_DIV, JO_JMP, JO_JCC, JO_CALL, JO_RET, JO_JMPI, JO_CALLI };
 typedef struct {
     u64 ip, imm, target; s64 disp;
     u8 len, op, sz, sz2, t, fr, fw, at, bt, ar, br, rex, lva, lvb, scale, seg, sx, cnt, nost;
@@ -2055,8 +2070,10 @@ static int jdecode(JI *j, u64 ip) {
     case 0xEB: { s8 rel = (s8) *p++; j->len = (u8)(p - s); j->op = JO_JMP; j->target = ip + j->len + (u64)(s64) rel; return 1; }
     case 0xF6: case 0xF7: {
         int ext = (*p >> 3) & 7, sz = (op & 1) ? opsz : 1;
-        jmodrm(&p, j, &m, ext < 2 ? (sz == 1 ? 1 : (opsz == 2 ? 2 : 4)) : 0); if (BADM(m) || ext > 3) FB();
+        jmodrm(&p, j, &m, ext < 2 ? (sz == 1 ? 1 : (opsz == 2 ? 2 : 4)) : 0);
+        if (BADM(m) || (ext > 3 && !(ext >= 6 && (g_jopt & JOPT_DIV) && (sz == 4 || sz == 8)))) FB();
         j->sz = (u8) sz; SETRM(m, 0);
+        if (ext >= 6) { j->op = JO_DIV; j->t = (u8) ext; break; }
         if (ext < 2) { j->op = JO_ALU; j->t = 4; j->nost = 1; j->fw = 1; j->bt = OT_IMM; if (sz == 1) j->imm = (u8) *p++; else IMMZ(j->imm); }
         else if (ext == 2) j->op = JO_NOT; else { j->op = JO_NEG; j->fw = 1; }
         break; }
@@ -2110,6 +2127,10 @@ static int jdecode(JI *j, u64 ip) {
             if (!(g_jopt & JOPT_FP) || pf2 == pf3) FB();
             jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
             j->op = JO_CVTSI2F; j->sz2 = pf2 ? 8 : 4; j->sz = w ? 8 : 4; j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break;
+        case 0x2E: case 0x2F:                                /* ucomiss/ucomisd/comiss/comisd */
+            if (!(g_jopt & JOPT_FCMP) || pf3 || pf2) FB();
+            jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
+            j->op = JO_FCMP; j->sz2 = p66 ? 8 : 4; j->fw = 1; j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break;
         case 0xEF: case 0xEB: case 0xDB: case 0xDF:
             if (!(p66 && !pf3 && !pf2)) FB();
             jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
@@ -2174,7 +2195,10 @@ static int jmapcc(int x86cc, int *cc) {
     static const s8 add_t[16] = { 6, 7, 2, 3, 0, 1, -1, -1, 4, 5, -1, -1, 11, 10, 13, 12 };
     static const s8 log_t[16] = { -2, -3, -2, -3, 0, 1, 0, 1, 4, 5, -1, -1, 11, 10, 13, 12 };
     static const s8 sh_t[16] = { -1, -1, -1, -1, 0, 1, -1, -1, 4, 5, -1, -1, -1, -1, -1, -1 };   /* after shl/shr/sar only e/ne/s/ns come from the host flags */
-    int v = fl.kind == LZ_SUB ? sub_t[x86cc] : fl.kind == LZ_ADD ? add_t[x86cc] : fl.kind >= LZ_SHL ? sh_t[x86cc] : log_t[x86cc];
+    /* after comis*: CF = below or unordered, ZF = equal or unordered, PF = unordered, OF = SF = 0. fcmp leaves unordered V=1 N=0 Z=0 C=1, equal Z=1 C=1, less N=1,
+     * greater C=1: below = lt, ae = ge, be = le, a = gt, p = vs, np = vc. e/ne/le/g also need the unordered case of ZF: not one A64 condition. */
+    static const s8 fc_t[16] = { -2, -3, 11, 10, -1, -1, 13, 12, -2, -3, 6, 7, -2, -3, -1, -1 };
+    int v = fl.kind == LZ_FCMP ? fc_t[x86cc] : fl.kind == LZ_SUB ? sub_t[x86cc] : fl.kind == LZ_ADD ? add_t[x86cc] : fl.kind >= LZ_SHL ? sh_t[x86cc] : log_t[x86cc];
     if (v == -2) return 2;
     if (v == -3) return 1;
     if (v < 0) return -1;
@@ -2532,19 +2556,49 @@ static int jemit(const JI *j) {          /* returns 1 when it ended the block (t
         if (j->bt == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); m_ld(sz, 0, 0, 0, rb, off); } else g_ld(0, j->br, sz, 0);
         f_scvtf(j->sz2, sz == 8, 0, 0);
         f_stc(j->sz2, 0, OFF_X(j->ar)); break;
+    case JO_FCMP:
+        fl_flush(j->lvb); fl.nz = 0;
+        if (j->bt == OT_MEM) { j_ea(j, &rb, &off); f_ldm(j->sz2, 1, rb, off); } else f_ldc(j->sz2, 1, OFF_X(j->br));
+        if (!j->lva) break;                                              /* flags dead: nothing but the (possibly faulting) load */
+        f_ldc(j->sz2, 0, OFF_X(j->ar));
+        f_cmp(j->sz2, 0, 1); f_tox(j->sz2, 9, 0); f_tox(j->sz2, 10, 1);   /* host flags for jcc/setcc/cmov; the operands for the lazy spill */
+        fl.kind = LZ_FCMP; fl.sz = j->sz2; fl.nz = 1; fl.pend = 1;
+        break;
+    case JO_DIV: {                                                       /* rdx:rax / r/m, only when it cannot trap: the interpreter does the rest */
+        fl_flush(j->lvb); fl.nz = 0;
+        int sg = j->t == 7;
+        if (j->at == OT_MEM) { j_ea(j, &rb, &off); m_ld(sz, 0, 0, 1, rb, off); } else g_ld(1, j->ar, sz, j->rex);
+        u32 *sl[4]; int ns = 0;
+        sl[ns++] = a_cbz_fwd(0, 1);                                      /* divisor 0 */
+        g_ld(0, RAX, sz, 0); g_ld(2, RDX, sz, 0);
+        if (!sg) sl[ns++] = a_cbz_fwd(1, 2);                             /* rdx != 0: wide dividend */
+        else {
+            a_asr(sf, 5, 0, sf ? 63 : 31); a_log(1, 2, 0, 6, 2, 5);        /* rdx must be the sign of rax */
+            sl[ns++] = a_cbz_fwd(1, 6);
+            a_addi(0, 5, 1, 1, 0); if (!sf) a_lsr(1, 5, 5, 32);          /* divisor -1 (INT_MIN / -1 traps) */
+            sl[ns++] = a_cbz_fwd(sf ? 0 : 1, 5);
+        }
+        a_div(sf, sg, 3, 0, 1); a_msub(sf, 4, 3, 1, 0);
+        g_st(3, RAX, sz, 0); g_st(4, RDX, sz, 0);
+        u32 *done = a_b_fwd();
+        for (int k = 0; k < ns; k++) jpatch19(sl[k]);
+        j_fb(j);
+        jpatch26(done);
+        fl.nz = 0;
+        break; }
     case JO_JMP: fl_flush(j->lvb); jx_direct(j->ip, j->target); return 1;
     case JO_JCC: {
         int cc = 0, m = fl.nz ? jmapcc(j->t, &cc) : -1;
         u64 next = j->ip + j->len;
         if (j->cnt) {                                    /* superblock: the fall-through path continues, the taken path is an out-of-line side exit */
-            if (m < 0) { fl_flush(1); a_movi(0, j->ip); c_st(0, OFF_RIP); a_movi(0, 1); c_st(0, OFF_PATCH); a_b(jepi); return 1; }
+            if (m < 0) { fl_flush(1); j_fb(j); c_ld(0, OFF_RIP); jx_indirect(); return 1; }       /* flags not expressible: the interpreter decides, the inline cache jumps */
             if (m == 1) { fl_flush(1); jx_direct(j->ip, j->target); return 1; }
             if (m == 2) break;
             jstub_add(JS_SIDE, a_bcond_fwd(cc), NULL, j->ip, j->target);       /* the stub is entered by the branch itself: x9-x11 still hold the lazy flags */
             break;
         }
         fl_flush(1);
-        if (m < 0) { a_movi(0, j->ip); c_st(0, OFF_RIP); a_movi(0, 1); c_st(0, OFF_PATCH); a_b(jepi); }       /* flags not expressible: the dispatcher interprets the jcc */
+        if (m < 0) { j_fb(j); c_ld(0, OFF_RIP); jx_indirect(); }       /* flags not expressible: the interpreter decides, the inline cache jumps */
         else if (m == 1) jx_direct(j->ip, j->target);
         else if (m == 2) jx_direct(j->ip, next);
         else { u32 *bt = a_bcond_fwd(cc); jx_direct(j->ip, next); jpatch19(bt); jx_direct(j->ip, j->target); }
