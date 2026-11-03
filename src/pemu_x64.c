@@ -619,9 +619,6 @@ static long pass_nr2(u64 n) {
 #ifdef SYS_pidfd_getfd
     P2(438, SYS_pidfd_getfd)
 #endif
-#ifdef SYS_openat2
-    P2(437, SYS_openat2)
-#endif
     default: return -1;
     }
 }
@@ -745,6 +742,38 @@ static long mmap32(u64 len, u64 prot, u64 flags, u64 fd, u64 off) {
     return -ENOMEM;
 }
 
+/* /proc/cpuinfo as an x86 CPU. The host's file lists ARM flags (asimd, fp, ...), so a guest that decides what the CPU can do by
+ * parsing it finds no sse3/pni and refuses to run. The text is consistent with cpuid (see cpuid()). */
+static const char cpuinfo_flags[] = "fpu tsc cx8 cmov mmx fxsr sse sse2 syscall nx lm constant_tsc nopl pni ssse3 cx16 sse4_1 sse4_2 popcnt lahf_lm";
+static long cpuinfo_fd(long hostflags) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN); if (n < 1) n = 1; if (n > 256) n = 256;
+    size_t cap = (size_t) n * 1100 + 64, len = 0; char*b = malloc(cap);
+    if (!b) return -ENOMEM;
+    for (int i = 0; i < n; i++)
+        len += (size_t) snprintf(b + len, cap - len,
+            "processor\t: %d\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 26\nmodel name\t: Intel(R) Core(TM) i7 CPU (pemu, emulated x86-64)\n"
+            "stepping\t: 5\ncpu MHz\t\t: 2000.000\ncache size\t: 8192 KB\nphysical id\t: 0\nsiblings\t: %ld\ncore id\t\t: %d\ncpu cores\t: %ld\n"
+            "apicid\t\t: %d\ninitial apicid\t: %d\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 4\nwp\t\t: yes\nflags\t\t: %s\n"
+            "bogomips\t: 4000.00\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 40 bits physical, 48 bits virtual\npower management:\n\n",
+            i, n, i, n, i, i, cpuinfo_flags);
+    int cloexec = (hostflags & O_CLOEXEC) != 0; long fd = -1;
+#ifdef SYS_memfd_create
+    fd = syscall(SYS_memfd_create, "pemu-cpuinfo", cloexec ? 1 /*MFD_CLOEXEC*/ : 0);
+    if (fd >= 0) {
+        if (write((int) fd, b, len) != (ssize_t) len || lseek((int) fd, 0, SEEK_SET) < 0) { close((int) fd); fd = -1; }
+    }
+#endif
+    if (fd < 0 && len <= 60000) {                       /* no memfd (blocked, old kernel): a pipe is enough for reading it once */
+        int p[2];
+        if (pipe2(p, cloexec ? O_CLOEXEC : 0) == 0) {
+            if (write(p[1], b, len) == (ssize_t) len) { close(p[1]); fd = p[0]; } else { close(p[0]); close(p[1]); }
+        }
+    }
+    free(b);
+    return fd >= 0 ? fd : -EACCES;
+}
+static int is_cpuinfo(const char*p, long hostflags) { return p && !strcmp(p, "/proc/cpuinfo") && (hostflags & O_ACCMODE) == O_RDONLY; }
+
 static long gsys(CPU*c, int*noset) {
     u64 n = c->r[RAX], a0 = c->r[RDI], a1 = c->r[RSI], a2 = c->r[RDX], a3 = c->r[10], a4 = c->r[8], a5 = c->r[9];
     long r, nr;
@@ -760,9 +789,20 @@ static long gsys(CPU*c, int*noset) {
         jit_report();
 #endif
         return hs(SYS_exit_group, (long) a0, 0, 0, 0, 0, 0);
-    case 2: return hs(SYS_openat, AT_FDCWD, (long) a0, fl_g2h((long) a1), (long) a2, 0, 0);
+    case 2: { long hf = fl_g2h((long) a1); if (is_cpuinfo((const char*) a0, hf)) return cpuinfo_fd(hf);
+              return hs(SYS_openat, AT_FDCWD, (long) a0, hf, (long) a2, 0, 0); }
     case 85: return hs(SYS_openat, AT_FDCWD, (long) a0, O_CREAT | O_WRONLY | O_TRUNC, (long) a1, 0, 0);
-    case 257: return hs(SYS_openat, (long) a0, (long) a1, fl_g2h((long) a2), (long) a3, 0, 0);
+    case 257: { long hf = fl_g2h((long) a2); if (is_cpuinfo((const char*) a1, hf)) return cpuinfo_fd(hf);
+                return hs(SYS_openat, (long) a0, (long) a1, hf, (long) a3, 0, 0); }
+#ifdef SYS_openat2
+    case 437: {                                                                                             /* openat2: how->flags holds O_* flags, which differ between x86_64 and arm64 */
+        u64 how[8] = {0}; u64 sz = a3;
+        if (sz < 24) return -EINVAL;
+        if (sz > sizeof how) return -E2BIG;
+        memcpy(how, (const void*) a2, (size_t) sz); how[0] = (u64) fl_g2h((long) how[0]);
+        if (is_cpuinfo((const char*) a1, (long) how[0])) return cpuinfo_fd((long) how[0]);
+        return hs(SYS_openat2, (long) a0, (long) a1, (long) how, (long) sz, 0, 0); }
+#endif
     case 4: return g_stat(AT_FDCWD, (const char*) a0, (u8*) a1, 0);
     case 6: return g_stat(AT_FDCWD, (const char*) a0, (u8*) a1, AT_SYMLINK_NOFOLLOW);
     case 262: return g_stat((long) a0, (const char*) a1, (u8*) a2, (long) a3);

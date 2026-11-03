@@ -39,5 +39,6 @@ ARGS="" run sys2 0 -O1 -static "$D/sys2.c"
 ARGS="" run robust 0 -O1 -static -pthread "$D/robust.c"
 ARGS="" run uring 0 -O1 -static "$D/uring.c"
 ARGS="" run sse2jit 0 -O1 -static -msse2 "$D/sse2jit.c"
+ARGS="" run cpuinfo 0 -O1 -static "$D/cpuinfo.c"
 [ $fail = 0 ] && echo "RESULT PASS" || echo "RESULT FAIL"
 exit $fail

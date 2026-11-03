@@ -1,0 +1,7 @@
+flags consistent with cpuid: yes
+processors listed: >=1
+seek and reread: same
+fopen + fgets: flags line found
+openat2 directory: ok
+openat2 cpuinfo consistent: yes
+openat2 short struct: rejected
