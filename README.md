@@ -181,8 +181,8 @@ If pemu does not compile, `prx build` retries without `-pthread` and then with `
 **JIT** (on by default on aarch64 hosts):
 
 - Guest basic blocks are compiled to AArch64 code and chained; indirect branches go through an inline cache. A compare followed by `jcc`/`setcc`/`cmov` uses the host flags directly (`cmp` + `b.cond`), and the lazy flag state of the interpreter is only written when the flags can still be observed.
-- Translated natively: moves (all sizes, `fs:` and rip-relative operands, `movzx/movsx/movsxd`, `lea`), `push/pop`, `call/ret/jmp/jcc` (direct and indirect), add/or/and/sub/xor/cmp/test, `neg/not`, shifts and `imul` when their flags are not needed, `setcc/cmovcc`, the `cdq` family, SSE data moves, `pxor/por/pand/pandn`, `movd/movq`.
-- Everything else (x87, most SSE, string instructions, `div`, `adc/sbb`, `inc/dec`, ...) runs through the interpreter from inside the translated block, so behaviour is identical.
+- Translated natively: moves (all sizes, `fs:` and rip-relative operands, `movzx/movsx/movsxd`, `lea`), `push/pop`, `call/ret/jmp/jcc` (direct and indirect), add/or/and/sub/xor/cmp/test, `neg/not`, shifts and `imul` when their flags are not needed, `setcc/cmovcc`, the `cdq` family, SSE data moves, `pxor/por/pand/pandn`, `movd/movq`, the SSE2 packed-integer arithmetic and compare family (`pminub`, `pmaxub`, `pminsw`, `pmaxsw`, `pavgb/w`, saturating add/sub, `pcmpgt*`, `pmullw`, `punpck{l,h}*`), `pshufd` that broadcasts one dword, and `bsf/bsr` (also with `rep`: `tzcnt/lzcnt`, when their flags are not needed).
+- Everything else (x87, the rest of SSE, string instructions, `div`, `adc/sbb`, `inc/dec`, ...) runs through the interpreter from inside the translated block, so behaviour is identical.
 - Faults inside translated code report the exact guest `rip` and flags; pending signals are polled on backward and indirect branches.
 - The cache is flushed when translated pages are unmapped, re-protected or `MAP_FIXED`-overwritten. Pages that are writable *and* executable are never translated (they are interpreted).
 - **Register pinning**: guest `rax rcx rdx rbx rsp rbp rsi rdi` live in callee-saved host registers (`x19-x25`, `x29`) while translated code runs, so they survive block-to-block branches and interpreter fallbacks; `r8-r15` stay in the CPU struct. After a fault the pinned registers are recovered from the signal context.
@@ -217,13 +217,20 @@ Threads in `pemu.c` (aarch64 guest), AVX/AVX2/FMA/BMI/AES/PCLMUL/XSAVE (cpuid re
 
 ### Unreleased
 
+**Changed (`pemu_x64`)**
+
+- cpuid reports family 6 model 0x1a (Nehalem), the Intel core whose features are exactly SSE4.2 without AVX. With the earlier Ivy Bridge signature glibc chose its SSSE3 `memmove`, which is built on `palignr` and jump tables and ran through the interpreter; on the same program the fallbacks executed by the JIT went from 239k (before x86-64-v2) to 353k with that signature, and are back to 243k with this one.
+- The JIT now translates the SSE2 packed-integer family used by glibc's string functions, `pshufd` broadcasts and `bsf/bsr`. On a string/`memcpy`/`snprintf`/`qsort` workload the fallbacks executed fell from 243k to 46k.
+- `set_robust_list`/`get_robust_list` are passed to the host. A thread that exited holding a robust mutex used to leave it locked forever.
+- `io_uring_setup/enter/register` are passed to the host; a successful setup switches on the x86 memory-ordering barriers, because the kernel writes the rings behind the guest's back. Hosts that block io_uring (Android, default Docker) still answer `ENOSYS`.
+
 **Added (`pemu_x64`)**
 
 - x86-64-v2 CPU model: SSE3, SSSE3, SSE4.1, SSE4.2 (`0F 38` / `0F 3A`: `pshufb`, `pcmp{e,i}str{i,m}`, `roundss/sd`, `ptest`, `pmulld`, `crc32`, ...), `cmpxchg8b`/`cmpxchg16b`, `popcnt` advertised, `movnti`, `xgetbv`, `rdtscp`, `rcpps`/`rsqrtps`, `maskmovdqu`, and `fisttp`, `fbld`/`fbstp`, `fnsave`/`frstor`. Binaries built for `x86-64-v2` and glibc's `x86-64-v2` hwcaps directories now work.
 - `fxsave`/`fxrstor` and the signal frame carry ST(0..7) and TOP; before, an x87 stack in use was lost across a signal handler.
 - Syscalls that returned `-ENOSYS`: SysV IPC (`shm*`, `sem*`, `msg*`), `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `mknod`, `utime`, `futimesat`, `inotify_init`, `signalfd`, `preadv2`/`pwritev2`, `membarrier`, `mlock2`, `faccessat2`, `epoll_pwait2`, `openat2`, aio, POSIX message queues, keyrings, NUMA policy calls and a few more. `MAP_32BIT` is emulated by searching the first 2 GiB.
-- Tests `sse42`, `x87save`, `sys2`; the expected output of `sse42` and `x87save` was produced on a real x86-64 CPU.
-- Not done: `ptrace`, `perf_event_open`, `io_uring`, AVX. `xsave`/`xrstor` stay unimplemented (not advertised). The x87 tag word is not tracked (saved as empty).
+- Tests `sse42`, `x87save`, `sys2`, `robust`, `uring`, `sse2jit`; the expected output of `sse42`, `x87save` and `sse2jit` was produced on a real x86-64 CPU. A test that exits with 77 is reported as SKIP (the host refuses what it tests).
+- Not done: `ptrace`, `perf_event_open`, AVX. `xsave`/`xrstor` stay unimplemented (not advertised). The x87 tag word is not tracked (saved as empty).
 
 **Removed**
 

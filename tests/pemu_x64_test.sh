@@ -16,6 +16,7 @@ run() {  # name, expected_rc, build-args...; program args via ARGS
     local n="$1" rc="$2"; shift 2
     if ! "$CC" "$@" -o "$T/$n" 2>"$T/$n.cc"; then echo "SKIP $n (does not build: $(head -1 "$T/$n.cc"))"; return; fi
     timeout 60 "$PEMU" "$T/$n" $ARGS >"$T/$n.out" 2>"$T/$n.err"; local got=$?
+    if [ "$got" = 77 ]; then echo "SKIP $n (the host refuses what it tests)"; return; fi
     local exp="$D/$n.expect"
     # x87 is computed in IEEE quad on aarch64 hosts (see README), so a few last digits and the sign of a NaN differ
     [ -f "$exp.$(uname -m)" ] && exp="$exp.$(uname -m)"
@@ -35,5 +36,8 @@ ARGS="" run jitfp 0 -O1 -static "$D/jitfp.c" -lm
 ARGS="" run sse42 0 -O1 -static -msse4.2 -mcx16 -pthread "$D/sse42.c"
 ARGS="" run x87save 0 -O1 -static "$D/x87save.c"
 ARGS="" run sys2 0 -O1 -static "$D/sys2.c"
+ARGS="" run robust 0 -O1 -static -pthread "$D/robust.c"
+ARGS="" run uring 0 -O1 -static "$D/uring.c"
+ARGS="" run sse2jit 0 -O1 -static -msse2 "$D/sse2jit.c"
 [ $fail = 0 ] && echo "RESULT PASS" || echo "RESULT FAIL"
 exit $fail

@@ -696,14 +696,19 @@ static void*thread_main(void*p) {
     run(c);
     return NULL;
 }
+/* From now on emulate x86 memory ordering: another agent (a second guest thread, or the kernel writing an io_uring ring) is
+ * about to touch guest memory concurrently, and an aarch64 host would otherwise reorder the interpreted and translated accesses. */
+static void mt_barriers(void) {
+#ifdef HAVE_JIT
+    if (g_jit_on) jit_mt_enable();                        /* translated code from now on carries the memory barriers of x86 ordering */
+#endif
+    __atomic_store_n(&g_mt, 1, __ATOMIC_SEQ_CST);        /* see mrd/mwr */
+}
 static long clone_thread(CPU*c, u64 flags, u64 stack, u64 ptid, u64 ctid, u64 tls) {
     if ((flags & 0x100) == 0 || (flags & 0x800) == 0) return -EINVAL;   /* threads need CLONE_VM | CLONE_SIGHAND */
     ThArg*t = malloc(sizeof *t);
     if (!t) return -ENOMEM;
-#ifdef HAVE_JIT
-    if (g_jit_on) jit_mt_enable();                        /* translated code from now on carries the memory barriers of x86 ordering */
-#endif
-    __atomic_store_n(&g_mt, 1, __ATOMIC_SEQ_CST);        /* from now on emulate x86 memory ordering (see mrd/mwr) */
+    mt_barriers();
     t->cpu = *c; t->flags = flags; t->ptid = ptid; t->ctid = ctid; volatile int tidv = 0; t->tidout = &tidv;
     if (stack) t->cpu.r[RSP] = stack;
     if (flags & 0x00080000) t->cpu.fs = tls;                            /* SETTLS */
@@ -890,7 +895,11 @@ static long gsys(CPU*c, int*noset) {
     case 253: return hs(SYS_inotify_init1, 0, 0, 0, 0, 0, 0);
     case 282: return hs(SYS_signalfd4, (long) a0, (long) a1, (long) a2, 0, 0, 0);
     case 322: case 435: case 334: case 317: return -ENOSYS;
-    case 273: case 274: return -ENOSYS;               /* set/get_robust_list: blocked by Android seccomp; glibc ignores the error */
+    case 425: { long r = hs(425 /*io_uring_setup; same number on x86_64 and aarch64*/, (long) a0, (long) a1, 0, 0, 0, 0);
+                if (r >= 0) mt_barriers();                                                                  /* the kernel now writes the rings behind our back */
+                return r; }
+    case 426: return hs(426, (long) a0, (long) a1, (long) a2, (long) a3, (long) a4, (long) a5);         /* io_uring_enter */
+    case 427: return hs(427, (long) a0, (long) a1, (long) a2, (long) a3, 0, 0);                         /* io_uring_register */
     default:
         nr = pass_nr(n);
         if (nr >= 0) return hs(nr, (long) a0, (long) a1, (long) a2, (long) a3, (long) a4, (long) a5);
@@ -1695,7 +1704,8 @@ static int cas16(u64*p, u64*exp, u64 n0, u64 n1) {
 static void cpuid(CPU*c) {
     u32 leaf = (u32) c->r[RAX], sub = (u32) c->r[RCX], a = 0, b = 0, cc = 0, d = 0;
     if (leaf == 0) { a = 4; b = 0x756e6547; d = 0x49656e69; cc = 0x6c65746e; }          /* "GenuineIntel": glibc only reads leaf 1 for known vendors */
-    else if (leaf == 1) { a = 0x000306a9; b = 0x00010800; cc = (1 << 0) | (1 << 9) | (1 << 13) | (1 << 19) | (1 << 20) | (1 << 23);     /* SSE3 SSSE3 CX16 SSE4.1 SSE4.2 POPCNT = x86-64-v2; no XSAVE/AVX */
+    else if (leaf == 1) { a = 0x000106a5; b = 0x00010800;      /* family 6 model 0x1a (Nehalem): the one Intel core with exactly SSE4.2 and no AVX; glibc then picks its SSE2 unaligned memmove */
+           cc = (1 << 0) | (1 << 9) | (1 << 13) | (1 << 19) | (1 << 20) | (1 << 23);     /* SSE3 SSSE3 CX16 SSE4.1 SSE4.2 POPCNT = x86-64-v2; no XSAVE/AVX */
         d = (1 << 0) | (1 << 4) | (1 << 8) | (1 << 15) | (1 << 23) | (1 << 24) | (1 << 25) | (1 << 26); }
     else if (leaf == 2) { a = 1; }                                                      /* one round, no cache descriptors */
     else if (leaf == 4) {                                                               /* deterministic cache parameters */
@@ -2248,6 +2258,8 @@ static void a_sxth(int sf, int rd, int rn) { a_bfm(sf, 1, rd, rn, 0, 15); }
 static void a_sxtw(int rd, int rn) { a_bfm(1, 1, rd, rn, 0, 31); }
 static void a_mul(int sf, int rd, int rn, int rm) { E(SFB(sf) | 0x1B007C00u | (u32) rm << 16 | (u32) rn << 5 | (u32) rd); }
 static void a_csel(int sf, int cc, int rd, int rn, int rm) { E(SFB(sf) | 0x1A800000u | (u32) rm << 16 | (u32) cc << 12 | (u32) rn << 5 | (u32) rd); }
+static void a_rbit(int sf, int rd, int rn) { E(SFB(sf) | 0x5AC00000u | (u32) rn << 5 | (u32) rd); }   /* rbit */
+static void a_clz(int sf, int rd, int rn) { E(SFB(sf) | 0x5AC01000u | (u32) rn << 5 | (u32) rd); }    /* clz */
 static void a_cset(int rd, int cc) { E(0x1A9F07E0u | (u32)(cc ^ 1) << 12 | (u32) rd); }              /* cset wd, cc */
 /* loads and stores: size 0 b, 1 h, 2 w, 3 x;  opc 0 store, 1 load, 2 load sign-extended to x, 3 load sign-extended to w */
 static void a_ldst_u(int size, int opc, int rt, int rn, u32 off) { E((u32) size << 30 | 0x39000000u | (u32) opc << 22 | ((off >> size) & 0xfff) << 10 | (u32) rn << 5 | (u32) rt); }
@@ -2346,10 +2358,18 @@ static void q_log(int op, int vd, int vn, int vm) {                      /* 0 eo
     static const u32 base[4] = { 0x6E201C00u, 0x4EA01C00u, 0x4E201C00u, 0x4E601C00u };
     E(base[op] | (u32) vm << 16 | (u32) vn << 5 | (u32) vd);
 }
-static void q_v3(int kind, int size, int vd, int vn, int vm) {          /* 0 add 1 sub 2 cmeq: vd = vn op vm, lanes of 1<<size bytes (16b vector) */
-    static const u32 base[3] = { 0x4E208400u, 0x6E208400u, 0x6E208C00u };
+static void q_v3(int kind, int size, int vd, int vn, int vm) {          /* vd = vn op vm, lanes of 1<<size bytes (16b vector) */
+    /* "three same": 0x4E200400 | U << 29 | opcode << 11; "permute" (zip): 0x4E000800 | opcode << 12 */
+    static const u32 base[16] = {
+        0x4E208400u, 0x6E208400u, 0x6E208C00u,                                   /* 0 add   1 sub    2 cmeq   */
+        0x6E206C00u, 0x6E206400u, 0x4E206C00u, 0x4E206400u,                      /* 3 umin  4 umax   5 smin   6 smax  */
+        0x4E203400u,                                                             /* 7 cmgt (signed)               */
+        0x6E200C00u, 0x4E200C00u, 0x6E202C00u, 0x4E202C00u,                      /* 8 uqadd 9 sqadd 10 uqsub 11 sqsub */
+        0x6E201400u, 0x4E209C00u,                                                /* 12 urhadd (pavg)  13 mul      */
+        0x4E003800u, 0x4E007800u };                                              /* 14 zip1 (punpckl*) 15 zip2 (punpckh*) */
     E(base[kind] | (u32) size << 22 | (u32) vm << 16 | (u32) vn << 5 | (u32) vd);
 }
+static void q_dup4s(int vd, int vn, int lane) { E(0x4E040400u | (u32)(lane << 3) << 16 | (u32) vn << 5 | (u32) vd); }   /* dup vd.4s, vn.s[lane] */
 /* scalar float: sz 8 = double (d regs), 4 = single (s regs). Loads/stores touch only the low sz bytes of the xmm slot. */
 static void f_ldc(int sz, int vt, u32 off) { E((sz == 8 ? 0xFD400000u : 0xBD400000u) | ((off >> (sz == 8 ? 3 : 2)) & 0xfff) << 10 | (u32) RCPU << 5 | (u32) vt); }   /* ldr dt/st, [cpu, #off] */
 static void f_stc(int sz, int vt, u32 off) { E((sz == 8 ? 0xFD000000u : 0xBD000000u) | ((off >> (sz == 8 ? 3 : 2)) & 0xfff) << 10 | (u32) RCPU << 5 | (u32) vt); }   /* str dt/st, [cpu, #off] */
@@ -2420,7 +2440,7 @@ static void jit_note_rwx(u64 start, u64 len) {                  /* jmu held */
 /* ------------------------------------------------------------ decoder (static, no guest state) */
 enum { OT_NONE, OT_REG, OT_MEM, OT_IMM };
 enum { JO_FB, JO_FBT, JO_NOP, JO_MOV, JO_MOVX, JO_LEA, JO_PUSH, JO_POP, JO_ALU, JO_NOT, JO_NEG, JO_SHIFT, JO_IMUL,
-       JO_SETCC, JO_CMOV, JO_CWDE, JO_CDQ, JO_LEAVE, JO_XLD, JO_XST, JO_XLOG, JO_XMOVDLD, JO_XMOVDST, JO_XVEC, JO_PMOVMSKB, JO_XSHI, JO_FMOV, JO_FARITH, JO_CVTSI2F, JO_FCMP, JO_DIV, JO_JMP, JO_JCC, JO_CALL, JO_RET, JO_JMPI, JO_CALLI };
+       JO_SETCC, JO_CMOV, JO_CWDE, JO_CDQ, JO_LEAVE, JO_XLD, JO_XST, JO_XLOG, JO_XMOVDLD, JO_XMOVDST, JO_XVEC, JO_PMOVMSKB, JO_XSHI, JO_FMOV, JO_FARITH, JO_CVTSI2F, JO_FCMP, JO_DIV, JO_XDUP, JO_BSF, JO_JMP, JO_JCC, JO_CALL, JO_RET, JO_JMPI, JO_CALLI };
 typedef struct {
     u64 ip, imm, target; s64 disp;
     u8 len, op, sz, sz2, t, fr, fw, at, bt, ar, br, rex, lva, lvb, scale, seg, sx, cnt, nost;
@@ -2704,6 +2724,39 @@ static int jdecode(JI *j, u64 ip) {
             j->t = (o2 >= 0xF8 && o2 <= 0xFB) ? 1 : (o2 >= 0xFC || o2 == 0xD4) ? 0 : 2;   /* sub / add / cmpeq */
             j->sz = (u8)(o2 == 0xD4 || o2 == 0xFB ? 3 : o2 == 0xFE || o2 == 0xFA || o2 == 0x76 ? 2 : o2 == 0xFD || o2 == 0xF9 || o2 == 0x75 ? 1 : 0);
             j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break;
+        case 0xD5: case 0xD8: case 0xD9: case 0xDA: case 0xDC: case 0xDD: case 0xDE: case 0xE0: case 0xE3: case 0xE8: case 0xE9: case 0xEA: case 0xEC: case 0xED: case 0xEE:
+        case 0x60: case 0x61: case 0x62: case 0x64: case 0x65: case 0x66: case 0x68: case 0x69: case 0x6A: case 0x6C: case 0x6D: {
+            if (!(p66 && !pf3 && !pf2)) FB();
+            jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
+            int t, sz;                                       /* NEON kind (see q_v3) and lane size */
+            switch (o2) {
+            case 0xD5: t = 13; sz = 1; break;                                                                         /* pmullw */
+            case 0xD8: case 0xD9: t = 10; sz = o2 - 0xD8; break;                                                      /* psubusb/w */
+            case 0xDC: case 0xDD: t = 8; sz = o2 - 0xDC; break;                                                       /* paddusb/w */
+            case 0xE8: case 0xE9: t = 11; sz = o2 - 0xE8; break;                                                      /* psubsb/w */
+            case 0xEC: case 0xED: t = 9; sz = o2 - 0xEC; break;                                                       /* paddsb/w */
+            case 0xDA: t = 3; sz = 0; break;                                                                          /* pminub */
+            case 0xDE: t = 4; sz = 0; break;                                                                          /* pmaxub */
+            case 0xEA: t = 5; sz = 1; break;                                                                          /* pminsw */
+            case 0xEE: t = 6; sz = 1; break;                                                                          /* pmaxsw */
+            case 0xE0: t = 12; sz = 0; break;                                                                         /* pavgb */
+            case 0xE3: t = 12; sz = 1; break;                                                                         /* pavgw */
+            case 0x64: case 0x65: case 0x66: t = 7; sz = o2 - 0x64; break;                                            /* pcmpgtb/w/d */
+            case 0x60: case 0x61: case 0x62: t = 14; sz = o2 - 0x60; break;                                           /* punpcklbw/wd/dq */
+            case 0x6C: t = 14; sz = 3; break;                                                                         /* punpcklqdq */
+            case 0x68: case 0x69: case 0x6A: t = 15; sz = o2 - 0x68; break;                                           /* punpckhbw/wd/dq */
+            default: t = 15; sz = 3; break;                                                                           /* punpckhqdq */
+            }
+            j->op = JO_XVEC; j->t = (u8) t; j->sz = (u8) sz; j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break; }
+        case 0x70: {                                         /* pshufd that copies one dword to all four lanes: strchr/memchr broadcast the byte this way */
+            if (!(p66 && !pf3 && !pf2)) FB();
+            jmodrm(&p, j, &m, 1); if (BADM(m)) FB();
+            u8 im = *p++;
+            if (im != 0x00 && im != 0x55 && im != 0xAA && im != 0xFF) FB();
+            j->op = JO_XDUP; j->imm = im & 3; j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break; }
+        case 0xBC: case 0xBD:                                /* bsf/bsr, with F3: tzcnt/lzcnt (translated only when the flags are dead) */
+            jmodrm(&p, j, &m, 0); if (BADM(m) || opsz == 2 || pf2) FB();
+            j->op = JO_BSF; j->sz = (u8) opsz; j->t = (u8)(o2 & 1); j->sz2 = (u8) pf3; j->fw = 1; j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break;
         case 0xD7:
             if (!(p66 && !pf3 && !pf2)) FB();
             jmodrm(&p, j, &m, 0); if (m.ismem || lock) FB();
@@ -3063,6 +3116,28 @@ static int jemit(const JI *j) {          /* returns 1 when it ended the block (t
         q_ldc(0, OFF_X(j->ar));
         q_v3(j->t, j->sz, 0, 0, 1);
         q_stc(0, OFF_X(j->ar)); break;
+    case JO_XDUP:
+        if (j->bt == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); q_ldm(1, rb, off); } else q_ldc(1, OFF_X(j->br));
+        q_dup4s(0, 1, (int) j->imm);
+        q_stc(0, OFF_X(j->ar)); break;
+    case JO_BSF: {
+        if (j->lva && j->sz2) { fl_flush(j->lvb); j_fb(j); break; }          /* tzcnt/lzcnt flags (CF, ZF of the result) are not modelled: interpreter */
+        fl_flush(j->lvb); fl.nz = 0;                                         /* the compare below clobbers the host's flags; bsf defines ZF afresh */
+        if (j->bt == OT_MEM) j_ea(j, &rb, &off);
+        j_opld(0, j, 1, sz, rb, off);                                        /* x0 = source, zero-extended */
+        if (j->t == 0) { a_rbit(sf, 2, 0); a_clz(sf, 2, 2); }                /* bsf / tzcnt: clz(rbit(x)), the operand width for 0 */
+        else if (j->sz2) a_clz(sf, 2, 0);                                    /* lzcnt */
+        else { a_clz(sf, 2, 0); a_movi(3, (u64)(sz * 8 - 1)); a_addsub(sf, 1, 0, 2, 3, 2); }   /* bsr: width - 1 - clz */
+        if (j->sz2) g_st(2, j->ar, sz, 0);
+        else {                                                               /* plain bsf/bsr leave the destination alone for a zero source */
+            a_addsub(sf, 1, 1, 31, 0, 31);                                   /* cmp x0, #0 */
+            g_ld(3, j->ar, 8, 0); a_csel(1, 0, 2, 3, 2); g_st(2, j->ar, 8, 0);
+        }
+        if (j->lva) {                                                        /* ZF = (source == 0) is what tst x,x gives; the other flags are undefined after bsf */
+            a_mov(11, 0); a_log(sf, 3, 0, 31, 11, 11);
+            fl.kind = LZ_LOGIC; fl.sz = sz; fl.nz = 1; fl.pend = 1;
+        }
+        break; }
     case JO_PMOVMSKB:                                    /* bit i of the result = top bit of byte i: (x & 0x80..80) * 0x0002040810204081 >> 56 */
         c_ld(0, OFF_X(j->br)); c_ld(1, OFF_X(j->br) + 8);
         a_movi(2, 0x8080808080808080ULL); a_movi(3, 0x0002040810204081ULL);

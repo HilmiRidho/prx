@@ -515,6 +515,41 @@ static int simd_insn(CPU*c, u32 i) {
         }
         memcpy(d, t, 16); return 0;
     }
+    if ((i & 0x9F200400) == 0x0E200400) {                      /* 3-same, the other integer ops the x86-64 JIT emits */
+        int u = (i >> 29) & 1, sz = (i >> 22) & 3, op = (i >> 11) & 31, esz = 1 << sz, bits = esz * 8;
+        if (!(op == 1 || op == 2 || op == 5 || op == 6 || op == 12 || op == 13 || (op == 19 && !u))) return -1;
+        if (sz == 3 && (!q || op == 19)) return -1;
+        typedef __int128 i128;
+        i128 umaxv = ((i128) 1 << bits) - 1, smaxv = ((i128) 1 << (bits - 1)) - 1, sminv = -((i128) 1 << (bits - 1));
+        u8 *d = (u8*) c->v[rd], *n = (u8*) c->v[rn], *m = (u8*) c->v[rm], t[16] = {0};
+        for (int k = 0; k < (q ? 16 : 8) / esz; k++) {
+            u64 a = 0, b = 0; memcpy(&a, n + k * esz, (size_t) esz); memcpy(&b, m + k * esz, (size_t) esz);
+            i128 x = u ? (i128) a : (i128)((s64)(a << (64 - bits)) >> (64 - bits));      /* unsigned or sign-extended lanes */
+            i128 y = u ? (i128) b : (i128)((s64)(b << (64 - bits)) >> (64 - bits));
+            i128 lo = u ? 0 : sminv, hi = u ? umaxv : smaxv, r = 0;
+            switch (op) {
+            case 1: r = x + y; r = r < lo ? lo : r > hi ? hi : r; break;                  /* SQADD / UQADD */
+            case 2: r = (x + y + 1) >> 1; break;                                          /* SRHADD / URHADD */
+            case 5: r = x - y; r = r < lo ? lo : r > hi ? hi : r; break;                  /* SQSUB / UQSUB */
+            case 6: r = x > y ? -1 : 0; break;                                            /* CMGT / CMHI */
+            case 12: r = x > y ? x : y; break;                                            /* SMAX / UMAX */
+            case 13: r = x < y ? x : y; break;                                            /* SMIN / UMIN */
+            default: r = (i128)(a * b); break;                                            /* MUL (low half) */
+            }
+            u64 w = (u64) r; memcpy(t + k * esz, &w, (size_t) esz);
+        }
+        memcpy(d, t, 16); return 0;
+    }
+    if ((i & 0xBF20FC00) == 0x0E003800 || (i & 0xBF20FC00) == 0x0E007800) {   /* ZIP1 / ZIP2 */
+        int sz = (i >> 22) & 3, esz = 1 << sz, part = (i >> 14) & 1, lanes = (q ? 16 : 8) / esz, half = lanes / 2;
+        if (sz == 3 && !q) return -1;
+        u8 *d = (u8*) c->v[rd], *n = (u8*) c->v[rn], *m = (u8*) c->v[rm], t[16] = {0};
+        for (int k = 0; k < half; k++) {
+            memcpy(t + (2 * k) * esz, n + ((part ? half : 0) + k) * esz, (size_t) esz);
+            memcpy(t + (2 * k + 1) * esz, m + ((part ? half : 0) + k) * esz, (size_t) esz);
+        }
+        memcpy(d, t, 16); return 0;
+    }
     if ((i & 0x9FE08400) == 0x0E000400) {                      /* copy: DUP (element/general), INS, SMOV, UMOV */
         int imm5 = (i >> 16) & 31, imm4 = (i >> 11) & 15, op = (i >> 29) & 1;
         if (!(imm5 & 15)) return -1;
