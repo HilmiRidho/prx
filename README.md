@@ -8,289 +8,130 @@ Current version: **1.0.1** (see [Changelog](#changelog)).
 
 ## Requirements
 
-- A host running Linux on x86_64 or aarch64 (including Termux on Android).
-- `bash` 4.3 or newer, plus `coreutils`, `tar`, `findutils`, `sed` and `grep`.
-- `gcc` or `clang`, used to compile the shim.
+- Linux on x86_64 or aarch64 (including Termux on Android).
+- `bash` 4.3+, `coreutils`, `tar`, `findutils`, `sed`, `grep`.
+- `gcc` or `clang` (compiles the shim).
 - Optional:
-  - `curl`: installing from a URL.
-  - `xz`, `zstd`, `bzip2`: extracting rootfs archives compressed with those formats.
-  - `qemu-user`: running a rootfs of the other architecture (or an i386 rootfs, which is qemu-only). Alternatively use the built-in [pemu](#pemu-built-in-emulator-experimental) emulator.
-  - A cross toolchain to build the shim for the guest architecture: `clang` + `lld`, or a cross gcc (`aarch64-linux-gnu-gcc` / `x86_64-linux-gnu-gcc`; for i386 also `i686-linux-gnu-gcc` or `gcc -m32`).
+  - `curl`: install from a URL.
+  - `xz`, `zstd`, `bzip2`: extract rootfs archives in those formats.
+  - `qemu-user`: run a rootfs of the other architecture (or i386), or use the built-in [pemu](#pemu-built-in-emulator-experimental).
 
-## Install
+## Installation
 
-    make install                               # PREFIX=/usr/local by default
-    make install PREFIX=/usr DESTDIR=pkgroot   # for packagers
-    make uninstall                             # honours the same PREFIX / DESTDIR
-    make check                                 # lint + smoke tests + emulator self-tests (needs a C compiler)
+### Option 1: `.deb` package
 
-The shim is compiled per user on the first `prx login` (or explicitly with `prx build`). It is rebuilt automatically when `prx`, `src/prx.c`, `src/ldpatch.c` or any `src/shim/*.h` module change.
+Download the package from the releases page, or build it yourself:
 
-Prebuilt packages:
+    packaging/build-deb.sh debian    # -> prx_<ver>_all.deb        (Debian/Ubuntu, prefix /usr)
+    packaging/build-deb.sh termux    # -> prx_<ver>_termux_all.deb (Termux)
 
-    packaging/build-deb.sh debian    # -> prx_<ver>_all.deb      (prefix /usr)
-    packaging/build-deb.sh termux    # -> prx_<ver>_termux_all.deb
-                                     #    (prefix /data/data/com.termux/files/usr,
-                                     #     shebang rewritten; Termux has no /usr/bin/env)
+Then install it:
 
-Termux install: `apt install ./prx_<ver>_termux_all.deb` (or `dpkg -i`, then `apt -f install`).
+    sudo apt install ./prx_<ver>_all.deb          # Debian / Ubuntu
+    apt install ./prx_<ver>_termux_all.deb        # Termux
 
-The GitHub Actions workflow (`.github/workflows/build-deb.yml`) runs `make check` and builds both packages on every push and pull request. Pushing a tag `vX.Y.Z` that matches `PRX_VERSION` in `prx` publishes a release with the `.deb` files and `SHA256SUMS`.
+### Option 2: Manual (from source)
 
-### Make targets
+    make install                                  # PREFIX=/usr/local by default
+    make install PREFIX=/usr DESTDIR=pkgroot      # for packagers
+    make uninstall                                # same PREFIX / DESTDIR
+    make check                                    # lint + smoke tests + emulator self-tests
 
-| Target | Purpose |
-| --- | --- |
-| `install` / `uninstall` | Install or remove `prx`, the C sources, the man page (and `pemu` if it was built). |
-| `lint` | `bash -n`, `shellcheck` (if installed) and `-fsyntax-only` builds of the C sources. |
-| `check` | `lint`, the smoke tests, and the emulator self-tests and fuzzers for the host architecture. |
-| `pemu` | Build the built-in emulator for this host (`src/pemu.c` on x86_64, `src/pemu_x64.c` on aarch64). |
-| `pemu-x64` | Build the x86_64-guest emulator on any host (on x86_64 only useful for testing). |
-| `pemu-x64-jit` | Test build of the x86_64-guest JIT on a non-aarch64 machine (see below). |
-| `clean` | Remove test temporaries and built emulators. |
+The shim is compiled per user on the first `prx login` (or with `prx build`) and rebuilt automatically when its sources change.
 
 ## Quick start
 
     prx install debian rootfs.tar.gz --sha256 <HEX>   # or a URL instead of a file
     prx login debian                                  # shell as fake root
     prx login debian -- uname -a                      # run one command
-    prx login debian --no-root-id -b /sdcard          # run as the host user, bind a host path
+    prx login debian --no-root-id -b /sdcard          # run as host user, bind a host path
     prx list                                          # installed containers
 
-Always pass `--sha256`: without it `prx install` prints a warning that the archive's integrity and authenticity are not verified.
-
-See `man prx` or `prx help` for all commands and options.
+Always pass `--sha256`; without it the archive's integrity is not verified. See `man prx` or `prx help` for everything else.
 
 ## Commands
 
 | Command | Purpose |
 | --- | --- |
-| `prx build` | Compile the shim and the loader patcher (and the built-in emulator for your host, if it compiles). |
-| `prx install NAME FILE\|URL [--sha256 HEX]` | Extract a rootfs archive as container `NAME`; the checksum is verified before extraction. |
-| `prx login NAME [options] [-- cmd]` | Start a shell, or run one command, inside the container. |
+| `prx build` | Compile the shim, loader patcher and (if possible) the built-in emulator. |
+| `prx install NAME FILE\|URL [--sha256 HEX]` | Extract a rootfs archive as container `NAME`. |
+| `prx login NAME [options] [-- cmd]` | Start a shell, or run one command, in the container. |
 | `prx list` | List installed containers. |
 | `prx fixperm NAME` | Repair permissions and flush the library-path cache. |
-| `prx remove NAME` | Delete a container and its derived files. |
-| `prx --version` (`-V`, `version`) | Print the version. |
-| `prx help` (`-h`, `--help`) | Print usage. |
-
-Container names may only contain letters, digits, `.`, `_` and `-`, and cannot start with `-`.
+| `prx remove NAME` | Delete a container. |
+| `prx --version` / `prx help` | Print version / usage. |
 
 `prx login` options:
 
 | Option | Meaning |
 | --- | --- |
-| `-b, --bind PATH` / `HOST:GUEST` | Bind a host path into the guest (max 50 binds, each path < 1024 bytes, no `:` or `=`; `GUEST` must be absolute). |
-| `-w, --workdir DIR` | Initial working directory inside the guest (default `/root`). |
+| `-b, --bind PATH` / `HOST:GUEST` | Bind a host path into the guest (max 50; no `:` or `=` in paths). |
+| `-w, --workdir DIR` | Initial working directory (default `/root`). |
 | `-e, --env KEY=VAL` | Pass an environment variable. |
-| `--no-root-id` | Run as the host user instead of fake root; `sudo` and `su` still work. |
-| `--no-seccomp` | Skip the host-seccomp workarounds (see [Seccomp module](#seccomp-module)). |
+| `--no-root-id` | Run as the host user instead of fake root. |
+| `--no-seccomp` | Skip the host-seccomp workarounds. |
 | `--trace` | Debug syscall and seccomp tracing. |
-
-Unknown options are an error, not a command; put the command after `--`.
 
 ## Environment
 
 | Variable | Meaning |
 | --- | --- |
-| `PRX_HOME` | Data directory. Default: `$XDG_DATA_HOME/prx` (`~/.local/share/prx`). |
-| `PRX_SRCDIR` | Directory holding `prx.c`, `ldpatch.c` and `shim/`. |
-| `PRX_SECCOMP` | `0` disables the host-seccomp workarounds, same as `--no-seccomp` (default `1`). |
-| `PRX_SHIM_CFLAGS` | Extra compiler flags for the shim, e.g. `-DPRX_NO_SECCOMP`; run `prx build` afterwards. |
-| `PRX_DNS` | IPv4 / IPv6 nameservers for the guest, separated by `,`, `;` or blanks. Invalid entries and scoped addresses (`fe80::1%eth0`) are dropped with a warning. |
-| `PRX_QEMU` | Path (or name) of a specific `qemu-user` binary for cross-architecture rootfs. `PRX_QEMU=pemu` selects the built-in emulator from `$PRX_HOME/lib`. |
-| `QEMU_CPU`, `QEMU_STRACE`, `QEMU_LOG`, `QEMU_RESERVED_VA`, `QEMU_GUEST_BASE`, `QEMU_PAGESIZE` | Passed through to the emulator when one is used. |
-| `PRX_NO_ARGV0` | Set to `1` to never pass `--argv0` to the loader (detected automatically; glibc < 2.33 lacks it). |
-| `PRX_KEEP` | Set to `1` to leave guest processes running after `prx login` exits (by default they are cleaned up). |
-| `GLIBC_TUNABLES` | Defaults to `glibc.pthread.rseq=0` inside the guest unless you set it yourself. |
-| `PEMU_JIT` | Set to `0` to disable the JIT of the built-in emulator (same as `pemu -nojit`). `prx login` starts the emulator with a clean environment, so pass it as `prx login NAME -e PEMU_JIT=0`. |
-| `PEMU_JIT_STATS` | Set to `1` to print JIT statistics at exit (`pemu_x64`): translated blocks, the opcodes that fall back to the interpreter (by number of code sites) and the ones executed most often. Pass it as `prx login NAME -e PEMU_JIT_STATS=1 -- cmd`; the report goes to stderr, once per guest process. |
+| `PRX_HOME` | Data directory (default `~/.local/share/prx`). |
+| `PRX_SRCDIR` | Directory with `prx.c`, `ldpatch.c` and `shim/`. |
+| `PRX_SECCOMP` | `0` disables the seccomp workarounds (same as `--no-seccomp`). |
+| `PRX_SHIM_CFLAGS` | Extra shim compiler flags; run `prx build` afterwards. |
+| `PRX_DNS` | Guest nameservers (IPv4/IPv6), separated by `,`, `;` or blanks. |
+| `PRX_QEMU` | Specific `qemu-user` binary; `PRX_QEMU=pemu` selects the built-in emulator. |
+| `PRX_NO_ARGV0` | `1` never passes `--argv0` to the loader (auto-detected for glibc < 2.33). |
+| `PRX_KEEP` | `1` leaves guest processes running after `prx login` exits. |
+| `PEMU_JIT` | `0` disables the pemu JIT (pass with `-e PEMU_JIT=0`). |
 | `CC` | C compiler used to build the shim. |
 
 ## Layout
 
-    prx            shell front-end (pure bash, passes `bash -n` / shellcheck)
-    src/prx.c      shim entry point: includes the modules below, in order
-    src/shim/      shim modules (one concern each, see below)
+    prx            shell front-end (pure bash)
+    src/prx.c      shim entry point (includes src/shim/*.h)
     src/ldpatch.c  glibc loader/libc patcher
-    src/pemu.c     built-in emulator, aarch64 guest on x86_64 hosts
-    src/pemu_x64.c built-in emulator, x86_64 guest on aarch64 hosts
+    src/pemu.c     built-in emulator: aarch64 guest on x86_64 hosts
+    src/pemu_x64.c built-in emulator: x86_64 guest on aarch64 hosts
     man/prx.1      manual page
-    tests/         smoke.sh (offline smoke tests), shim_unit.c and shim_i386.c (shim tests),
-                   pemu_test.py / pemu_fuzz.py (aarch64 emulator), pemu_x64_test.sh, pemu_x64/ and
-                   pemu_x64_fuzz.py (x86_64 emulator)
+    tests/         smoke tests, shim tests, emulator self-tests and fuzzers
     packaging/     build-deb.sh [debian|termux]
-    examples/      debian: example Termux launcher script (PulseAudio + Termux:X11 + `prx login debian`)
-    .github/       workflows/build-deb.yml: CI (make check), .deb packages and releases
+    examples/      example Termux launcher script
+    .github/       CI workflow (make check, .deb build, releases)
     Makefile       install / uninstall / lint / check / pemu targets
-    LICENSE        Apache License 2.0
-
-### Shim modules
-
-The shim is compiled as a single translation unit (`src/prx.c` includes the
-modules in dependency order).
-
-| Module | Concern |
-| --- | --- |
-| `types.h`, `sysnum.h`, `sys.h`, `libc.h` | Types and constants, per-arch syscall numbers, raw syscalls, libc imports |
-| `state.h`, `seccomp.h`, `init.h` | Global state; host-seccomp workarounds; bind parsing, early init |
-| `path.h`, `procfs.h` | Guest/host path translation, fake `/proc` files |
-| `fs_open.h`, `fs_stat.h`, `fs_ops.h`, `tty.h`, `glob_tmp.h` | File-system interposers |
-| `net_unix.h`, `resolve.h` | AF_UNIX path translation, DNS and `/etc/hosts` |
-| `ipc_shm.h` | System V shared-memory emulation for kernels without SysV IPC |
-| `proc.h`, `cred.h`, `pwdb.h`, `exec.h` | Capabilities, prctl, uname, sysinfo, virtual credentials, passwd/group, exec and spawn |
-
-### Seccomp module
-
-Android applies a seccomp allow-list built for bionic to every app process. glibc also uses syscalls
-that list lacks (`rseq`, `clone3`, `faccessat2`, ...), and the kernel answers with `SIGSYS`. All the
-workarounds live in `src/shim/seccomp.h`: a `SIGSYS` handler that turns the blocked syscall into
-`-ENOSYS` (so glibc uses its fallback), hooks that keep the guest from replacing or blocking that
-handler, and fallbacks for `sched_{get,set}affinity` and `PR_SET_NO_NEW_PRIVS`. The launcher adds the
-loader/libc patch (`ldpatch`, aarch64) and the `glibc.pthread.rseq=0` default.
-
-- Run time: `prx login NAME --no-seccomp` (or `PRX_SECCOMP=0`) skips all of it, which helps tell a seccomp problem from another shim bug. The setting is inherited by guest child processes.
-- Build time: `PRX_SHIM_CFLAGS=-DPRX_NO_SECCOMP prx build` leaves the module out of the shim entirely.
-- It cannot lift the host policy: a syscall issued before the handler exists (static binaries, raw `svc`) is still killed.
 
 ## pemu: built-in emulator (experimental)
 
-A small, self-written user-mode emulator that can stand in for `qemu-user` when running a rootfs of
-the *other* architecture. It maps the guest 1:1 into the host address space and translates guest
-syscalls to the host kernel (stat/open-flag/epoll layouts, `brk`, `fork`/`execve`, signal frames).
-qemu stays the default; pemu is only used when you ask for it.
+A small user-mode emulator that can stand in for `qemu-user` when running a rootfs of the *other* architecture. qemu stays the default; pemu is used only when requested.
 
-| host | guest rootfs | source | notes |
-|------|--------------|--------|-------|
-| x86_64  | aarch64 | `src/pemu.c`     | JIT + interpreter; integer ISA, scalar FP, tiny NEON subset; no threads |
-| aarch64 | x86_64  | `src/pemu_x64.c` | JIT + interpreter; integer ISA, SSE2 to SSE4.2 (no AVX), x87 subset; threads; runs real glibc programs |
+| Host | Guest rootfs | Source | Notes |
+| --- | --- | --- | --- |
+| x86_64 | aarch64 | `src/pemu.c` | JIT + interpreter; integer ISA, scalar FP, small NEON subset; no threads |
+| aarch64 | x86_64 | `src/pemu_x64.c` | JIT + interpreter; integer ISA, SSE2 to SSE4.2 (no AVX), x87 subset; threads |
 
-    prx build                       # also builds $PRX_HOME/lib/pemu for your host
+    prx build                       # also builds $PRX_HOME/lib/pemu
     PRX_QEMU=pemu prx login debian
-    make check                      # runs the emulator self-tests too
 
-If pemu does not compile, `prx build` retries without `-pthread` and then with `-DPEMU_NO_JIT`; if all fail it prints the compiler errors and carries on without it.
+- The aarch64-host build has not been run on real aarch64 hardware or Android/Termux.
+- Without the JIT (`PEMU_JIT=0`) it is a plain interpreter, 50-1000x slower than native.
+- Not implemented: threads in `pemu.c`, AVX/AVX2/FMA/BMI/AES, most NEON/SVE, 32-bit guests.
+- Not a security boundary; use `qemu-user` for anything serious.
 
-### x86_64 guest on aarch64 (`pemu_x64`)
+## Known limits
 
-- Validated against native runs of static and dynamic glibc programs, bash, python3, perl, gcc and common coreutils (on an x86_64 host). The aarch64-host build is the same code using the generic syscall ABI, but has not been executed on a real aarch64 machine or on Android/Termux.
-- Threads (`CLONE_THREAD`: pthreads, futex, `pthread_join`) work; every guest thread runs on its own host pthread.
-- Without the JIT (`PEMU_JIT=0`, `-nojit`, or when the JIT cannot be built/enabled) it is a plain interpreter: expect it to be 50-1000x slower than native.
-- On aarch64 hosts x87 long double is computed in IEEE quad (slightly more precise than real x87).
-
-**JIT** (on by default on aarch64 hosts):
-
-- Guest basic blocks are compiled to AArch64 code and chained; indirect branches go through an inline cache. A compare followed by `jcc`/`setcc`/`cmov` uses the host flags directly (`cmp` + `b.cond`), and the lazy flag state of the interpreter is only written when the flags can still be observed.
-- Translated natively: moves (all sizes, `fs:` and rip-relative operands, `movzx/movsx/movsxd`, `lea`), `push/pop`, `call/ret/jmp/jcc` (direct and indirect), add/or/and/sub/xor/cmp/test, `neg/not`, shifts and `imul` when their flags are not needed, `setcc/cmovcc`, the `cdq` family, SSE data moves, `pxor/por/pand/pandn`, `movd/movq`, the SSE2 packed-integer arithmetic and compare family (`pminub`, `pmaxub`, `pminsw`, `pmaxsw`, `pavgb/w`, saturating add/sub, `pcmpgt*`, `pmullw`, `punpck{l,h}*`), `pshufd` that broadcasts one dword, and `bsf/bsr` (also with `rep`: `tzcnt/lzcnt`, when their flags are not needed).
-- Everything else (x87, the rest of SSE, string instructions, `div`, `adc/sbb`, `inc/dec`, ...) runs through the interpreter from inside the translated block, so behaviour is identical.
-- Faults inside translated code report the exact guest `rip` and flags; pending signals are polled on backward and indirect branches.
-- The cache is flushed when translated pages are unmapped, re-protected or `MAP_FIXED`-overwritten. Pages that are writable *and* executable are never translated (they are interpreted).
-- **Register pinning**: guest `rax rcx rdx rbx rsp rbp rsi rdi` live in callee-saved host registers (`x19-x25`, `x29`) while translated code runs, so they survive block-to-block branches and interpreter fallbacks; `r8-r15` stay in the CPU struct. After a fault the pinned registers are recovered from the signal context.
-- **Superblocks**: translation continues across direct `jmp` and forward `jcc` on the same page (the taken path becomes an out-of-line side exit that writes the lazy flags only when it is taken), up to 64 guest instructions.
-- **Return stack buffer**: `call` is a host `bl` and `ret` a host `ret` after the guest return address was checked against a 64-entry shadow stack (a mismatch, e.g. after `longjmp`, falls back to the inline cache), so the CPU's own return predictor works. Indirect calls use `blr`.
-- **Threads**: the JIT stays on with guest threads. One code cache is shared; translation is serialised, lookups are lock-free, every thread has its own inline cache and signal word, and a flush stops the other threads at their next poll (stop-the-world). Once a second thread exists, translated loads/stores carry `dmb` barriers for x86 (TSO) ordering.
-- `PEMU_JIT_OPT=<mask>` switches parts off to bisect a problem: 1 flags of immediate shifts, 2 scalar SSE float, 4 pinning, 8 superblocks, 16 return stack buffer, 32 `comiss`/`comisd`/`ucomiss`/`ucomisd` with the host flags of `fcmp`, 64 32/64-bit `div`/`idiv` through `udiv`/`sdiv` (default 127).
-- Disable with `PEMU_JIT=0` or `pemu -nojit`; `PEMU_JIT_STATS=1` prints statistics. Use `PEMU_JIT=0` as the workaround when reporting problems.
-
-**Testing the JIT without an aarch64 machine.** `make pemu-x64-jit` (x86_64 host) builds `pemu_x64` with `-DPEMU_JIT_EMBED`, linked with `pemu.c` built as an *AArch64 interpreter*: the JIT emits real AArch64 machine code and that code is executed by `pemu.c`, so the actual back end is exercised (slowly). `make check` runs the x86 self-tests (`tests/pemu_x64_test.sh`), plus `tests/pemu_x64_fuzz.py`, which generates random x86-64 programs (ALU at all sizes, moves, shifts, `imul`, `setcc/cmov`, push/pop, loops, calls, SSE, `fs:`/rip-relative/SIB operands) and compares registers, flags and memory between the interpreter and the JIT. Not covered by that setup, and therefore **not yet verified on real hardware**: instruction-cache maintenance (`__builtin___clear_cache`), writable+executable anonymous mappings (SELinux/Android policy), and the real signal context (`uc_mcontext.pc`).
-
-### aarch64 guest on x86_64 (`pemu`)
-
-- Block-translating **JIT**, on by default: guest basic blocks are compiled to x86_64 code, direct branches are chained, indirect branches go through an inline cache, and x86 flags are used directly (a compare followed by a branch/`csel` costs one `cmp` + `jcc`).
-- Translated natively: integer ALU, bitfield, multiply/divide, conditional select/compare, branches, and scalar and vector (`ldr q`, `ldp q`) loads/stores. Everything else (FP arithmetic, NEON ALU, exclusives, ...) runs through the interpreter from inside the translated block, so behaviour is identical. Roughly 20x faster than the interpreter on integer / memory loops.
-- The code cache is flushed when the guest unmaps, re-protects or `MAP_FIXED`-overwrites translated pages, and on `ic` instructions, so self-modifying code and `dlopen` work.
-- Disable with `PEMU_JIT=0` or `pemu -nojit` (the JIT also switches itself off if an executable mapping can't be created). `tests/pemu_test.py` and `tests/pemu_fuzz.py` run self-tests and random programs under both engines and compare all registers, NZCV and memory.
-
-### Not implemented
-
-Threads in `pemu.c` (aarch64 guest), AVX/AVX2/FMA/BMI/AES/PCLMUL/XSAVE (cpuid reports an x86-64-v2 CPU: SSE3, SSSE3, SSE4.1, SSE4.2, CMPXCHG16B, POPCNT), most NEON/SVE/LSE for `pemu.c`, 32-bit guests. Not a security boundary. Use `qemu-user` for anything serious.
-
-## Known limits (by design)
-
-- Not a security boundary (LD_PRELOAD + loader patching; static/raw-syscall binaries can bypass it). This cannot be fixed within an LD_PRELOAD design; it would need a ptrace / seccomp-unotify supervisor or user namespaces.
-- glibc rootfs only (no musl), on x86_64 or aarch64 hosts. A rootfs of the other architecture runs through `qemu-user` (or experimental pemu). An i386 (32-bit) rootfs is supported too, but only through `qemu-i386`; there is no native i386 mode.
-- Guest PAM is `pam_permit` and sudo is `NOPASSWD` because there is no real root to authenticate. Do not treat the guest as a sandbox for untrusted code.
+- Not a security boundary: LD_PRELOAD + loader patching can be bypassed by static or raw-syscall binaries.
+- glibc rootfs only (no musl). A rootfs of the other architecture needs `qemu-user` (or pemu); i386 needs `qemu-i386`.
+- Guest PAM is `pam_permit` and `sudo` is `NOPASSWD`. Do not run untrusted code in it.
 - Loader patching depends on glibc machine code and may fail on some versions.
-- Bind paths cannot contain `:` or `=` (the shim's `PRX_BIND` format uses them as separators).
 
 ## Changelog
 
-### Unreleased
-
-**Changed (`pemu_x64`)**
-
-- cpuid reports family 6 model 0x1a (Nehalem), the Intel core whose features are exactly SSE4.2 without AVX. With the earlier Ivy Bridge signature glibc chose its SSSE3 `memmove`, which is built on `palignr` and jump tables and ran through the interpreter; on the same program the fallbacks executed by the JIT went from 239k (before x86-64-v2) to 353k with that signature, and are back to 243k with this one.
-- The JIT now translates the SSE2 packed-integer family used by glibc's string functions, `pshufd` broadcasts and `bsf/bsr`. On a string/`memcpy`/`snprintf`/`qsort` workload the fallbacks executed fell from 243k to 46k.
-- `set_robust_list`/`get_robust_list` are passed to the host. A thread that exited holding a robust mutex used to leave it locked forever.
-- `io_uring_setup/enter/register` are passed to the host; a successful setup switches on the x86 memory-ordering barriers, because the kernel writes the rings behind the guest's back. Hosts that block io_uring (Android, default Docker) still answer `ENOSYS`.
-
-**Added (`pemu_x64`)**
-
-- x86-64-v2 CPU model: SSE3, SSSE3, SSE4.1, SSE4.2 (`0F 38` / `0F 3A`: `pshufb`, `pcmp{e,i}str{i,m}`, `roundss/sd`, `ptest`, `pmulld`, `crc32`, ...), `cmpxchg8b`/`cmpxchg16b`, `popcnt` advertised, `movnti`, `xgetbv`, `rdtscp`, `rcpps`/`rsqrtps`, `maskmovdqu`, and `fisttp`, `fbld`/`fbstp`, `fnsave`/`frstor`. Binaries built for `x86-64-v2` and glibc's `x86-64-v2` hwcaps directories now work.
-- `fxsave`/`fxrstor` and the signal frame carry ST(0..7) and TOP; before, an x87 stack in use was lost across a signal handler.
-- Syscalls that returned `-ENOSYS`: SysV IPC (`shm*`, `sem*`, `msg*`), `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `mknod`, `utime`, `futimesat`, `inotify_init`, `signalfd`, `preadv2`/`pwritev2`, `membarrier`, `mlock2`, `faccessat2`, `epoll_pwait2`, `openat2`, aio, POSIX message queues, keyrings, NUMA policy calls and a few more. `MAP_32BIT` is emulated by searching the first 2 GiB.
-- Tests `sse42`, `x87save`, `sys2`, `robust`, `uring`, `sse2jit`; the expected output of `sse42`, `x87save` and `sse2jit` was produced on a real x86-64 CPU. A test that exits with 77 is reported as SKIP (the host refuses what it tests).
-- Not done: `ptrace`, `perf_event_open`, AVX. `xsave`/`xrstor` stay unimplemented (not advertised). The x87 tag word is not tracked (saved as empty).
-
-**Removed**
-
-- `prx source` and `prx ldsource`; the sources are installed under `share/prx/src`.
-- Backward-compatibility code: the `~/.prx` data directory (now always `$XDG_DATA_HOME/prx`) and the `:`-separated `PRX_DNS` list.
-- Shim wrappers that only forwarded to glibc (`ioctl`, `fcntl`, `fcntl64`, `fchdir`, `fdopendir`, `ftruncate*`, `f{get,set,list,remove}xattr`, `futimes`, `fpathconf`, `fstatvfs*`, `socketpair`) and some unused constants.
-
-**Fixed (shim)**
-
-- `getservby*`, `getprotoby*`, `gethostbyname_r`/`gethostbyname2_r`, `shm_open`/`shm_unlink`, `mkostemps`, `ftok`, `setmntent` and `scandirat` used the host's files or paths; they now use the guest's.
-- The time zone came from the host's `/etc/localtime`; `prx login` now sets `TZDIR` and `TZ` from the guest (a `-e TZ=...` still wins).
-- `faccessat`/`faccessat2` ignored `AT_SYMLINK_NOFOLLOW` and `AT_EACCESS`.
-- `tmpfile()` wrote to the host's `/tmp`; `inotify_add_watch`, `ftw` and `nftw` did not translate paths.
-- `getpwent`/`getgrent`/`getgrouplist` read the host's databases, and `getpw*`/`getgr*` fell back to the host for users missing in the guest.
-- `sched_setaffinity` always succeeded, even with `--no-seccomp`; it now only hides errors that seccomp causes.
-- `sendmsg` with `SCM_CREDENTIALS` reported success but dropped the message; it is now resent without the forged credentials.
-- `SO_PEERCRED` reported host ids instead of the fake-root ids.
-- `getcwd(buf, 0)` returned `ERANGE` instead of `EINVAL`.
-- `shmget` emulation was not atomic across processes; `shmctl` no longer locks for real kernel segments.
-- `make lint` now also checks the shim.
-
-**Fixed (`pemu_x64`)**
-
-- Lock-prefixed instructions (`lock add/sub/and/or/xor/adc/sbb/inc/dec/neg/not`, `lock cmpxchg`, `lock xadd`, `lock bts/btr/btc`) and `xchg` with a memory operand were not atomic: the `lock` prefix was ignored, so guest threads could lose updates and pthread mutexes could deadlock. They now use host compare-and-swap. Misaligned (split-lock) operands still fall back to a plain read-modify-write.
-- `lfence`/`mfence`/`sfence` are real barriers now (they were no-ops).
-- Once the guest has created a second thread, interpreted and translated loads and stores carry acquire/release barriers so that an aarch64 host gives guest threads the x86 (TSO) memory ordering. SSE/x87 accesses are not covered.
-- `sigaltstack` is implemented (it used to return success without doing anything), `SA_ONSTACK` is honoured and `uc_stack` is filled in the signal frame.
-- A signal that arrives on a guest thread is now delivered in that thread (pending signals and `siginfo` are per-thread); before, any thread could pick it up.
-- `epoll_wait` checks its allocation, and a dead syscall case was removed.
-- `PEMU_JIT_STATS` now also counts how often each interpreter fallback is *executed* (the old per-opcode list only counted code sites, which says little about what is hot), and the report is printed for guests that created a thread too.
-
-**Added**
-
-- `tests/pemu_x64/atomic.c` and `tests/pemu_x64/sigalt.c` regression tests.
-- CI job `make check on aarch64` (non-blocking) on a native arm64 runner.
-
 ### 1.0.1
 
-**Added**
-
-- Built-in experimental emulator `pemu` (`PRX_QEMU=pemu`) as a `qemu-user` alternative: aarch64 guest on x86_64 hosts, x86_64 guest (with threads) on aarch64 hosts, both with a JIT and self-tests / fuzzers in `make check`.
-- Debian and Termux `.deb` packaging (`packaging/build-deb.sh`) and a CI workflow that checks, builds and publishes releases.
-- `prx install` warns when no `--sha256` is given.
-- The shim is rebuilt when any `src/shim/*.h` module changes.
-
-**Safer**
-
-- Writing into a rootfs (`install`, `login`) no longer follows symlinks out of it, so a link like `/var/lib/dbus/machine-id -> /etc/machine-id` can't make prx touch a file on your host. The same fix covers user, group and hosts lookups, and `login -w DIR`.
-- The patched loader is written to a temporary file and renamed, so two logins at the same time can't run a half-written one.
-
-**Fixed**
-
-- `--bind` silently ignored paths longer than 159 bytes. It now accepts up to 1023 bytes per path and 50 binds, and rejects anything invalid with a clear error.
-- A mistyped option such as `prx login NAME --typo` is now an error instead of being run as a command.
-- Rootfs with glibc older than 2.33 now start correctly (set `PRX_NO_ARGV0=1` to force this mode).
-- `sched_getaffinity` reports real errors instead of always succeeding.
-- `prx install` from a URL copes with `#fragments` and URLs that have no file name.
-- The library cache refreshes after the guest installs or removes packages, and the shim is rebuilt when only `src/ldpatch.c` changes.
-- `/etc/passwd`, `/etc/group` and `/etc/hosts` are read in full, and groups can have any number of members.
-- DNS: IPv6 nameservers now work and can be mixed with IPv4 in `PRX_DNS`; invalid entries are dropped with a warning.
+- **Added:** experimental emulator `pemu`; Debian and Termux `.deb` packaging with a CI workflow; a warning when `prx install` has no `--sha256`.
+- **Safer:** writing into a rootfs no longer follows symlinks out of it; the patched loader is written atomically.
+- **Fixed:** `--bind` path limits and validation; mistyped options are now errors; glibc < 2.33 rootfs; `sched_getaffinity` errors; URL installs with `#fragments`; library cache refresh; full reading of `/etc/passwd`, `/etc/group`, `/etc/hosts`; IPv6 nameservers in `PRX_DNS`.
 
 ## License
 
