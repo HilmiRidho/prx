@@ -297,7 +297,7 @@ EXP int fchmod(int fd, int m) {
     return (int) ret(sc(N_fchmod, fd, m, 0, 0, 0, 0));
 }
 EXP int fchmodat(int d, const char*p, int m, int f) {
-    if ((f&0x1000) && (!p || !*p)) return fchmod(d, m);
+    if ((f&AT_EMPTY_PATH) && (!p || !*p)) return fchmod(d, m);
     TR1(d, p, !(f&AT_SYMLINK_NOFOLLOW)) char st[256];
     if (f&AT_SYMLINK_NOFOLLOW) {
         long r = SC4(N_newfstatat, d, h1, st, AT_SYMLINK_NOFOLLOW);
