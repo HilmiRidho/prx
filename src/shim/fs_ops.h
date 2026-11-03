@@ -297,6 +297,7 @@ EXP int fchmod(int fd, int m) {
     return (int) ret(sc(N_fchmod, fd, m, 0, 0, 0, 0));
 }
 EXP int fchmodat(int d, const char*p, int m, int f) {
+    if ((f&0x1000) && (!p || !*p)) return fchmod(d, m);
     TR1(d, p, !(f&AT_SYMLINK_NOFOLLOW)) char st[256];
     if (f&AT_SYMLINK_NOFOLLOW) {
         long r = SC4(N_newfstatat, d, h1, st, AT_SYMLINK_NOFOLLOW);
@@ -315,7 +316,7 @@ EXP int fchmodat(int d, const char*p, int m, int f) {
 static int do_chown(int d, const char*p, u32 u, u32 g, int fl) {
     TR1(d, p, !(fl&AT_SYMLINK_NOFOLLOW)) if (VROOT()) {
         char cst[256];
-        long cr = SC4(N_newfstatat, d, h1, cst, fl&AT_SYMLINK_NOFOLLOW);
+        long cr = SC4(N_newfstatat, d, h1, cst, fl&(AT_SYMLINK_NOFOLLOW|AT_EMPTY_PATH));
         return cr<0 ? (int) ret(cr) : 0;
     }
     return (int) ret(SC5(N_fchownat, d, h1, u, g, fl));
