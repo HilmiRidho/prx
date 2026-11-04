@@ -866,8 +866,13 @@ static long gsys(CPU*c, int*noset) {
         case 0x1001: c->gs = a1; return 0;
         case 0x1003: *(u64*) a1 = c->fs; return 0;
         case 0x1004: *(u64*) a1 = c->gs; return 0;
+        case 0x1011: return 1;                        /* ARCH_GET_CPUID: cpuid is always enabled */
+        case 0x1012: return a1 ? 0 : -ENODEV;         /* ARCH_SET_CPUID: cpuid faulting cannot be emulated, like a CPU without it */
         default: return -EINVAL;
         }
+    case 157:                                         /* prctl: PR_SET_SYSCALL_USER_DISPATCH (Wine) would arm the host, not the guest: refuse like an old kernel */
+        if ((int) a0 == 59) return -EINVAL;
+        return hs(SYS_prctl, (long) a0, (long) a1, (long) a2, (long) a3, (long) a4, 0);
     case 13: {                                        /* rt_sigaction */
         int s = (int) a0;
         if (s < 1 || s > 64 || s == SIGKILL || s == SIGSTOP) return -EINVAL;

@@ -1,0 +1,6 @@
+set_gs ok
+gs:0x30 1122334455667788
+store via gs 42
+get_gs ok
+sud EINVAL
+get_cpuid 1
