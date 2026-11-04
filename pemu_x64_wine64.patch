@@ -1,0 +1,69 @@
+diff -ruN -x pemu -x pemu-x64 -x '*.o' a/src/pemu_x64.c b/src/pemu_x64.c
+--- a/src/pemu_x64.c	2026-11-04 23:13:02.553678341 +0000
++++ b/src/pemu_x64.c	2026-11-04 23:13:31.505192939 +0000
+@@ -866,8 +866,13 @@
+         case 0x1001: c->gs = a1; return 0;
+         case 0x1003: *(u64*) a1 = c->fs; return 0;
+         case 0x1004: *(u64*) a1 = c->gs; return 0;
++        case 0x1011: return 1;                        /* ARCH_GET_CPUID: cpuid is always enabled */
++        case 0x1012: return a1 ? 0 : -ENODEV;         /* ARCH_SET_CPUID: cpuid faulting cannot be emulated, like a CPU without it */
+         default: return -EINVAL;
+         }
++    case 157:                                         /* prctl: PR_SET_SYSCALL_USER_DISPATCH (Wine) would arm the host, not the guest: refuse like an old kernel */
++        if ((int) a0 == 59) return -EINVAL;
++        return hs(SYS_prctl, (long) a0, (long) a1, (long) a2, (long) a3, (long) a4, 0);
+     case 13: {                                        /* rt_sigaction */
+         int s = (int) a0;
+         if (s < 1 || s > 64 || s == SIGKILL || s == SIGSTOP) return -EINVAL;
+diff -ruN -x pemu -x pemu-x64 -x '*.o' a/tests/pemu_x64/winelike.c b/tests/pemu_x64/winelike.c
+--- a/tests/pemu_x64/winelike.c	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/pemu_x64/winelike.c	2026-11-04 23:13:31.509761389 +0000
+@@ -0,0 +1,28 @@
++/* Things Wine's 64-bit ntdll does at start-up: TEB through %gs, arch_prctl queries, and the
++ * syscall-user-dispatch probe, which the emulator must refuse (it would act on the host). */
++#define _GNU_SOURCE
++#include <stdio.h>
++#include <stdint.h>
++#include <errno.h>
++#include <unistd.h>
++#include <sys/syscall.h>
++
++int main(void) {
++    static uint64_t teb[16];
++    uint64_t v = 0, got = 0;
++    teb[6] = 0x1122334455667788ULL;                       /* gs:[0x30], the TEB self pointer slot */
++    teb[0] = 0xdeadbeefULL;
++    long r = syscall(SYS_arch_prctl, 0x1001 /*ARCH_SET_GS*/, (unsigned long) teb);
++    printf("set_gs %s\n", r == 0 ? "ok" : "fail");
++    __asm__ volatile("movq %%gs:0x30, %0" : "=r"(v));
++    printf("gs:0x30 %llx\n", (unsigned long long) v);
++    __asm__ volatile("movq $0x42, %%gs:0x38" ::: "memory");
++    printf("store via gs %llx\n", (unsigned long long) teb[7]);
++    r = syscall(SYS_arch_prctl, 0x1004 /*ARCH_GET_GS*/, (unsigned long) &got);
++    printf("get_gs %s\n", (r == 0 && got == (uint64_t)(unsigned long) teb) ? "ok" : "fail");
++    r = syscall(SYS_prctl, 59 /*PR_SET_SYSCALL_USER_DISPATCH*/, 1, 0, 0, 0);
++    printf("sud %s\n", (r == -1 && errno == EINVAL) ? "EINVAL" : "other");
++    r = syscall(SYS_arch_prctl, 0x1011 /*ARCH_GET_CPUID*/, 0);
++    printf("get_cpuid %ld\n", r);
++    return 0;
++}
+diff -ruN -x pemu -x pemu-x64 -x '*.o' a/tests/pemu_x64/winelike.expect b/tests/pemu_x64/winelike.expect
+--- a/tests/pemu_x64/winelike.expect	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/pemu_x64/winelike.expect	2026-11-04 23:13:31.511942541 +0000
+@@ -0,0 +1,6 @@
++set_gs ok
++gs:0x30 1122334455667788
++store via gs 42
++get_gs ok
++sud EINVAL
++get_cpuid 1
+diff -ruN -x pemu -x pemu-x64 -x '*.o' a/tests/pemu_x64_test.sh b/tests/pemu_x64_test.sh
+--- a/tests/pemu_x64_test.sh	2026-11-04 23:13:02.561649028 +0000
++++ b/tests/pemu_x64_test.sh	2026-11-04 23:13:31.517115338 +0000
+@@ -42,5 +42,6 @@
+ ARGS="" run uring 0 -O1 -static "$D/uring.c"
+ ARGS="" run sse2jit 0 -O1 -static -msse2 "$D/sse2jit.c"
+ ARGS="" run cpuinfo 0 -O1 -static "$D/cpuinfo.c"
++ARGS="" run winelike 0 -O1 -static "$D/winelike.c"
+ [ $fail = 0 ] && echo "RESULT PASS" || echo "RESULT FAIL"
+ exit $fail
