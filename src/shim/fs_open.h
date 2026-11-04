@@ -57,7 +57,12 @@ static int do_open(int dfd, const char*p, int fl, int mode) {
         if (strncmp(p, "/proc/self/fd/", 14) == 0 || strncmp(p, "/proc/thread-self/fd/", 21) == 0) return (int) ret(SC4(N_openat, dfd, p, fl, mode));
     }
     int fol = !((fl&O_NOFOLLOW) || ((fl&(O_CREAT|O_EXCL)) == (O_CREAT|O_EXCL)));
-    TR1(dfd, p, fol) return (int) ret(SC4(N_openat, dfd, h1, fl|O_LARGEFILE_, mode));
+    TR1(dfd, p, fol) long r = SC4(N_openat, dfd, h1, fl|O_LARGEFILE_, mode);
+    if (proc_denied(r) && p && p[0] == '/') {
+        int fb = proc_fallback_open(p, fl);
+        if (fb >= 0) return fb;
+    }
+    return (int) ret(r);
 }
 EXP int open(const char*p, int fl, int mode) {
     return do_open(AT_FDCWD, p, fl, mode);

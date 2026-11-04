@@ -1,0 +1,108 @@
+diff -ruN a/src/shim/fs_open.h b/src/shim/fs_open.h
+--- a/src/shim/fs_open.h	2026-11-04 21:23:59.426703155 +0000
++++ b/src/shim/fs_open.h	2026-11-04 21:23:59.427997067 +0000
+@@ -57,7 +57,12 @@
+         if (strncmp(p, "/proc/self/fd/", 14) == 0 || strncmp(p, "/proc/thread-self/fd/", 21) == 0) return (int) ret(SC4(N_openat, dfd, p, fl, mode));
+     }
+     int fol = !((fl&O_NOFOLLOW) || ((fl&(O_CREAT|O_EXCL)) == (O_CREAT|O_EXCL)));
+-    TR1(dfd, p, fol) return (int) ret(SC4(N_openat, dfd, h1, fl|O_LARGEFILE_, mode));
++    TR1(dfd, p, fol) long r = SC4(N_openat, dfd, h1, fl|O_LARGEFILE_, mode);
++    if (proc_denied(r) && p && p[0] == '/') {
++        int fb = proc_fallback_open(p, fl);
++        if (fb >= 0) return fb;
++    }
++    return (int) ret(r);
+ }
+ EXP int open(const char*p, int fl, int mode) {
+     return do_open(AT_FDCWD, p, fl, mode);
+diff -ruN a/src/shim/fs_ops.h b/src/shim/fs_ops.h
+--- a/src/shim/fs_ops.h	2026-11-04 21:23:59.432504092 +0000
++++ b/src/shim/fs_ops.h	2026-11-04 21:23:59.433892827 +0000
+@@ -11,6 +11,7 @@
+             return 0;
+         }
+     }
++    if (proc_denied(r) && mode == 0 && proc_fakeable(p)) return 0;
+     return (int) ret(r);
+ }
+ EXP int access(const char*p, int m) {
+diff -ruN a/src/shim/fs_stat.h b/src/shim/fs_stat.h
+--- a/src/shim/fs_stat.h	2026-11-04 21:23:59.429615873 +0000
++++ b/src/shim/fs_stat.h	2026-11-04 21:23:59.431052506 +0000
+@@ -44,8 +44,18 @@
+     if (u[0] == g_ruid) u[0] = 0;
+     if (u[1] == g_rgid) u[1] = 0;
+ }
++/* stat() of a /proc entry the host denies: stat an empty fake file instead. */
++static int stat_fake_proc(const char*p, void*buf) {
++    if (!proc_fakeable(p)) return 0;
++    int mfd = fake_proc_file("", 0);
++    if (mfd<0) return 0;
++    long r = SC3(N_fstat, mfd, buf, 0);
++    sc(N_close, mfd, 0, 0, 0, 0, 0);
++    return r == 0;
++}
+ static int do_stat(int dfd, const char*p, void*buf, int fl) {
+     TR1(dfd, p, !(fl&AT_SYMLINK_NOFOLLOW)) long r = SC4(N_newfstatat, dfd, h1, buf, fl);
++    if (proc_denied(r) && stat_fake_proc(p, buf)) return 0;
+     if (r == 0) fixstat_c(buf, g_user ? ((p && *p && h1[0] == '/') ? own_is_root_host(h1) : own_is_root_fd(dfd)) : 1);
+     return (int) ret(r);
+ }
+@@ -145,6 +155,14 @@
+ }
+ EXP int statx(int dfd, const char*p, int fl, unsigned mask, void*buf) {
+     TR1(dfd, p, !(fl&AT_SYMLINK_NOFOLLOW)) long r = SC5(N_statx, dfd, h1, fl, mask, buf);
++    if (proc_denied(r) && proc_fakeable(p)) {
++        int mfd = fake_proc_file("", 0);
++        if (mfd >= 0) {
++            r = SC5(N_statx, mfd, "", AT_EMPTY_PATH, mask, buf);
++            sc(N_close, mfd, 0, 0, 0, 0, 0);
++            if (r == 0) return 0;
++        }
++    }
+     if (r == 0) {
+         char*c = (char*) buf;
+         u32*nl = (u32*)(c+16);
+diff -ruN a/src/shim/procfs.h b/src/shim/procfs.h
+--- a/src/shim/procfs.h	2026-11-04 21:23:59.423694581 +0000
++++ b/src/shim/procfs.h	2026-11-04 21:23:59.425165272 +0000
+@@ -180,3 +180,39 @@
+     }
+     return n;
+ }
++
++/* ---- generic fallbacks for /proc entries the host denies (Android/Termux SELinux) ----
++   Existence checks (stat/statx/access F_OK) on a denied /proc file are answered as
++   "exists, empty regular file", so launchers that only probe /proc (LibreOffice's
++   oosplash does stat("/proc/version")) stop failing. The real open()/read() is not
++   changed by this: a program that then reads the file still gets the host's error.
++   Per-process paths (/proc/<pid>/..., /proc/self/...) are never faked. */
++static int proc_fakeable(const char*p) {
++    if (!p || strncmp(p, "/proc/", 6) != 0 || !p[6]) return 0;
++    if (p[6] >= '0' && p[6] <= '9') return 0;
++    if (strncmp(p+6, "self/", 5) == 0 || strcmp(p+6, "self") == 0) return 0;
++    if (strncmp(p+6, "thread-self", 11) == 0) return 0;
++    return 1;
++}
++static int proc_denied(long r) {
++    return r == -EACCES || r == -EPERM;
++}
++/* Contents served only when the host denies the real file. */
++static int proc_fallback_open(const char*p, int fl) {
++    static const struct {
++        const char*path, *txt;
++    } t[] = {
++        {"/proc/sys/kernel/cap_last_cap", "40\n"},
++        {"/proc/sys/fs/inotify/max_user_watches", "8192\n"},
++        {"/proc/sys/fs/inotify/max_user_instances", "128\n"},
++        {"/proc/sys/fs/inotify/max_queued_events", "16384\n"},
++        {"/proc/vmstat",
++         "nr_free_pages 100000\nnr_inactive_anon 20000\nnr_active_anon 30000\n"
++         "nr_inactive_file 40000\nnr_active_file 50000\npgpgin 1000000\npgpgout 500000\n"
++         "pswpin 0\npswpout 0\npgfault 2000000\npgmajfault 1000\n"},
++    };
++    if ((fl&O_ACCMODE_) != O_RDONLY) return -1;
++    for (unsigned i = 0; i<sizeof t/sizeof t[0]; i++)
++        if (strcmp(p, t[i].path) == 0) return fake_proc_file(t[i].txt, strlen(t[i].txt));
++    return -1;
++}

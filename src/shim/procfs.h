@@ -180,3 +180,39 @@ static size_t build_mi(char*o, size_t cap, int info) {
     }
     return n;
 }
+
+/* ---- generic fallbacks for /proc entries the host denies (Android/Termux SELinux) ----
+   Existence checks (stat/statx/access F_OK) on a denied /proc file are answered as
+   "exists, empty regular file", so launchers that only probe /proc (LibreOffice's
+   oosplash does stat("/proc/version")) stop failing. The real open()/read() is not
+   changed by this: a program that then reads the file still gets the host's error.
+   Per-process paths (/proc/<pid>/..., /proc/self/...) are never faked. */
+static int proc_fakeable(const char*p) {
+    if (!p || strncmp(p, "/proc/", 6) != 0 || !p[6]) return 0;
+    if (p[6] >= '0' && p[6] <= '9') return 0;
+    if (strncmp(p+6, "self/", 5) == 0 || strcmp(p+6, "self") == 0) return 0;
+    if (strncmp(p+6, "thread-self", 11) == 0) return 0;
+    return 1;
+}
+static int proc_denied(long r) {
+    return r == -EACCES || r == -EPERM;
+}
+/* Contents served only when the host denies the real file. */
+static int proc_fallback_open(const char*p, int fl) {
+    static const struct {
+        const char*path, *txt;
+    } t[] = {
+        {"/proc/sys/kernel/cap_last_cap", "40\n"},
+        {"/proc/sys/fs/inotify/max_user_watches", "8192\n"},
+        {"/proc/sys/fs/inotify/max_user_instances", "128\n"},
+        {"/proc/sys/fs/inotify/max_queued_events", "16384\n"},
+        {"/proc/vmstat",
+         "nr_free_pages 100000\nnr_inactive_anon 20000\nnr_active_anon 30000\n"
+         "nr_inactive_file 40000\nnr_active_file 50000\npgpgin 1000000\npgpgout 500000\n"
+         "pswpin 0\npswpout 0\npgfault 2000000\npgmajfault 1000\n"},
+    };
+    if ((fl&O_ACCMODE_) != O_RDONLY) return -1;
+    for (unsigned i = 0; i<sizeof t/sizeof t[0]; i++)
+        if (strcmp(p, t[i].path) == 0) return fake_proc_file(t[i].txt, strlen(t[i].txt));
+    return -1;
+}

@@ -11,6 +11,7 @@ static int do_access(int dfd, const char*p, int mode, int fl) {
             return 0;
         }
     }
+    if (proc_denied(r) && mode == 0 && proc_fakeable(p)) return 0;
     return (int) ret(r);
 }
 EXP int access(const char*p, int m) {

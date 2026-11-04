@@ -44,8 +44,18 @@ static void fixstat_c(void*b, int root) {
     if (u[0] == g_ruid) u[0] = 0;
     if (u[1] == g_rgid) u[1] = 0;
 }
+/* stat() of a /proc entry the host denies: stat an empty fake file instead. */
+static int stat_fake_proc(const char*p, void*buf) {
+    if (!proc_fakeable(p)) return 0;
+    int mfd = fake_proc_file("", 0);
+    if (mfd<0) return 0;
+    long r = SC3(N_fstat, mfd, buf, 0);
+    sc(N_close, mfd, 0, 0, 0, 0, 0);
+    return r == 0;
+}
 static int do_stat(int dfd, const char*p, void*buf, int fl) {
     TR1(dfd, p, !(fl&AT_SYMLINK_NOFOLLOW)) long r = SC4(N_newfstatat, dfd, h1, buf, fl);
+    if (proc_denied(r) && stat_fake_proc(p, buf)) return 0;
     if (r == 0) fixstat_c(buf, g_user ? ((p && *p && h1[0] == '/') ? own_is_root_host(h1) : own_is_root_fd(dfd)) : 1);
     return (int) ret(r);
 }
@@ -145,6 +155,14 @@ EXP int __fxstatat64(int v, int d, const char*p, void*b, int f) {
 }
 EXP int statx(int dfd, const char*p, int fl, unsigned mask, void*buf) {
     TR1(dfd, p, !(fl&AT_SYMLINK_NOFOLLOW)) long r = SC5(N_statx, dfd, h1, fl, mask, buf);
+    if (proc_denied(r) && proc_fakeable(p)) {
+        int mfd = fake_proc_file("", 0);
+        if (mfd >= 0) {
+            r = SC5(N_statx, mfd, "", AT_EMPTY_PATH, mask, buf);
+            sc(N_close, mfd, 0, 0, 0, 0, 0);
+            if (r == 0) return 0;
+        }
+    }
     if (r == 0) {
         char*c = (char*) buf;
         u32*nl = (u32*)(c+16);
