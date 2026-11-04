@@ -191,8 +191,12 @@ def gen_one(a, depth=0):
                 m = mem_operand(a)
                 if m.rip is not None or m.seg: m = Mem(14, None, 0, 8)
                 a.insn(b'\x8d', R.choice(FREE), m, w=int(sz == 8), p66=sz == 2)
-    elif k < 50:                                                 # not / neg
-        rm = reg_or_mem(a); sized(a, b'\xf6', b'\xf7', sz, R.choice([2, 3]), rm)
+    elif k < 50:                                                 # not / neg / mul / imul (one operand) / bswap
+        if R.random() < .15:
+            r = R.choice(FREE); w = R.choice([0, 1, 1]); rex = 0x40 | w << 3 | (r >> 3)
+            a.raw(([rex] if rex != 0x40 else []) + [0x0F, 0xC8 + (r & 7)])
+        else:
+            rm = reg_or_mem(a); sized(a, b'\xf6', b'\xf7', sz, R.choice([2, 3, 4, 5, 4, 5]), rm)
     elif k < 60:                                                 # shifts
         rm = reg_or_mem(a); t = R.choice([4, 5, 7, 4, 5, 7, 0, 1, 2, 3, 6]); f = R.randrange(3)
         if f == 0: sized(a, b'\xc0', b'\xc1', sz, t, rm, bytes([R.choice([0, 1, 2, 3, 7, 8, 15, 31, 33, 63, 64, 255])]))

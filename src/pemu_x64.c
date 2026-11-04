@@ -2334,7 +2334,9 @@ static int g_jstats;
 #define JOPT_RSB  16u                   /* return stack buffer: call/ret are host bl/ret, checked against a shadow stack */
 #define JOPT_FCMP 32u                   /* comiss/comisd/ucomiss/ucomisd with the host flags of fcmp (jb/jae/jbe/ja/jp/jnp/setcc/cmovcc) */
 #define JOPT_DIV  64u                   /* 32/64-bit div and idiv with udiv/sdiv when the dividend fits and the divisor is not 0 or -1 */
-static unsigned g_jopt = JOPT_SHFL | JOPT_FP | JOPT_PIN | JOPT_SB | JOPT_RSB | JOPT_FCMP | JOPT_DIV;   /* PEMU_JIT_OPT=<mask> overrides (0 = none): handy to bisect a misbehaving guest */
+#define JOPT_CC   128u                  /* jcc/setcc/cmovcc after an interpreter fallback: a flags-only helper call instead of interpreting them too */
+#define JOPT_INT  256u                  /* one-operand mul/imul (flags dead), bswap, 8/16-bit shl/shr/sar (flags dead) */
+static unsigned g_jopt = JOPT_SHFL | JOPT_FP | JOPT_PIN | JOPT_SB | JOPT_RSB | JOPT_FCMP | JOPT_DIV | JOPT_CC | JOPT_INT;   /* PEMU_JIT_OPT=<mask> overrides (0 = none): handy to bisect a misbehaving guest */
 /* Register pinning: guest rax,rcx,rdx,rbx,rsp,rbp,rsi,rdi (numbers 0..7) are kept in callee-saved host registers, so
  * they survive helper calls and chained block-to-block branches. The CPU struct is only written back when translated
  * code is left (jepi), around an interpreter fallback (j_pin_spill / j_pin_fill) and, after a fault, from the signal
@@ -2401,6 +2403,8 @@ static void a_sxth(int sf, int rd, int rn) { a_bfm(sf, 1, rd, rn, 0, 15); }
 static void a_sxtw(int rd, int rn) { a_bfm(1, 1, rd, rn, 0, 31); }
 static void a_mul(int sf, int rd, int rn, int rm) { E(SFB(sf) | 0x1B007C00u | (u32) rm << 16 | (u32) rn << 5 | (u32) rd); }
 static void a_csel(int sf, int cc, int rd, int rn, int rm) { E(SFB(sf) | 0x1A800000u | (u32) rm << 16 | (u32) cc << 12 | (u32) rn << 5 | (u32) rd); }
+static void a_mulh(int sgn, int rd, int rn, int rm) { E((sgn ? 0x9B407C00u : 0x9BC07C00u) | (u32) rm << 16 | (u32) rn << 5 | (u32) rd); }   /* smulh / umulh */
+static void a_rev(int sf, int rd, int rn) { E((sf ? 0xDAC00C00u : 0x5AC00800u) | (u32) rn << 5 | (u32) rd); }   /* rev: byte swap */
 static void a_rbit(int sf, int rd, int rn) { E(SFB(sf) | 0x5AC00000u | (u32) rn << 5 | (u32) rd); }   /* rbit */
 static void a_clz(int sf, int rd, int rn) { E(SFB(sf) | 0x5AC01000u | (u32) rn << 5 | (u32) rd); }    /* clz */
 static void a_cset(int rd, int cc) { E(0x1A9F07E0u | (u32)(cc ^ 1) << 12 | (u32) rd); }              /* cset wd, cc */
@@ -2583,7 +2587,7 @@ static void jit_note_rwx(u64 start, u64 len) {                  /* jmu held */
 /* ------------------------------------------------------------ decoder (static, no guest state) */
 enum { OT_NONE, OT_REG, OT_MEM, OT_IMM };
 enum { JO_FB, JO_FBT, JO_NOP, JO_MOV, JO_MOVX, JO_LEA, JO_PUSH, JO_POP, JO_ALU, JO_NOT, JO_NEG, JO_SHIFT, JO_IMUL,
-       JO_SETCC, JO_CMOV, JO_CWDE, JO_CDQ, JO_LEAVE, JO_XLD, JO_XST, JO_XLOG, JO_XMOVDLD, JO_XMOVDST, JO_XVEC, JO_PMOVMSKB, JO_XSHI, JO_FMOV, JO_FARITH, JO_CVTSI2F, JO_FCMP, JO_DIV, JO_XDUP, JO_BSF, JO_JMP, JO_JCC, JO_CALL, JO_RET, JO_JMPI, JO_CALLI };
+       JO_SETCC, JO_CMOV, JO_CWDE, JO_CDQ, JO_LEAVE, JO_XLD, JO_XST, JO_XLOG, JO_XMOVDLD, JO_XMOVDST, JO_XVEC, JO_PMOVMSKB, JO_XSHI, JO_FMOV, JO_FARITH, JO_CVTSI2F, JO_FCMP, JO_DIV, JO_XDUP, JO_BSF, JO_MUL1, JO_BSWAP, JO_JMP, JO_JCC, JO_CALL, JO_RET, JO_JMPI, JO_CALLI };
 typedef struct {
     u64 ip, imm, target; s64 disp;
     u8 len, op, sz, sz2, t, fr, fw, at, bt, ar, br, rex, lva, lvb, scale, seg, sx, cnt, nost;
@@ -2773,11 +2777,11 @@ static int jdecode(JI *j, u64 ip) {
     case 0xC0: case 0xC1: case 0xD0: case 0xD1: case 0xD2: case 0xD3: {
         int sz = (op & 1) ? opsz : 1;
         jmodrm(&p, j, &m, op <= 0xC1 ? 1 : 0); if (BADM(m)) FB();
-        int t = m.reg & 7; if (t == 2 || t == 3 || sz < 4) FB();
+        int t = m.reg & 7; if (t == 2 || t == 3 || (sz < 4 && (t < 4 || !(g_jopt & JOPT_INT)))) FB();
         j->op = JO_SHIFT; j->sz = (u8) sz; j->t = (u8) t; SETRM(m, 0);
         j->cnt = op <= 0xC1 ? 0 : op <= 0xD1 ? 1 : 2;
         if (j->cnt == 0) j->imm = (u8) *p++ & (sz == 8 ? 63 : 31); else if (j->cnt == 1) j->imm = 1;
-        if (j->cnt == 2 || !j->imm || t < 2) j->fr = 1; else j->fw = 1;
+        if (j->cnt == 2 || !j->imm || t < 2 || sz < 4) j->fr = 1; else j->fw = 1;      /* 8/16-bit: fr, so the interpreter fallback sees the merged flags */
         break; }
     case 0xC2: j->op = JO_RET; j->imm = (u16)(*p | p[1] << 8); p += 2; break;
     case 0xC3: j->op = JO_RET; break;
@@ -2795,9 +2799,10 @@ static int jdecode(JI *j, u64 ip) {
     case 0xF6: case 0xF7: {
         int ext = (*p >> 3) & 7, sz = (op & 1) ? opsz : 1;
         jmodrm(&p, j, &m, ext < 2 ? (sz == 1 ? 1 : (opsz == 2 ? 2 : 4)) : 0);
-        if (BADM(m) || (ext > 3 && !(ext >= 6 && (g_jopt & JOPT_DIV) && (sz == 4 || sz == 8)))) FB();
+        if (BADM(m) || (ext > 3 && !(((ext >= 6 && (g_jopt & JOPT_DIV)) || (ext <= 5 && (g_jopt & JOPT_INT))) && (sz == 4 || sz == 8)))) FB();
         j->sz = (u8) sz; SETRM(m, 0);
         if (ext >= 6) { j->op = JO_DIV; j->t = (u8) ext; break; }
+        if (ext >= 4) { j->op = JO_MUL1; j->t = (u8) ext; break; }       /* mul / imul r/m: rdx:rax = rax * r/m (translated only when the flags are dead; no fr/fw: the flags the interpreter leaves undefined must flow through unchanged) */
         if (ext < 2) { j->op = JO_ALU; j->t = 4; j->nost = 1; j->fw = 1; j->bt = OT_IMM; if (sz == 1) j->imm = (u8) *p++; else IMMZ(j->imm); }
         else if (ext == 2) j->op = JO_NOT; else { j->op = JO_NEG; j->fw = 1; }
         break; }
@@ -2897,6 +2902,9 @@ static int jdecode(JI *j, u64 ip) {
             u8 im = *p++;
             if (im != 0x00 && im != 0x55 && im != 0xAA && im != 0xFF) FB();
             j->op = JO_XDUP; j->imm = im & 3; j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break; }
+        case 0xC8: case 0xC9: case 0xCA: case 0xCB: case 0xCC: case 0xCD: case 0xCE: case 0xCF:
+            if (!(g_jopt & JOPT_INT) || opsz == 2 || pf3 || pf2 || lock) FB();
+            j->op = JO_BSWAP; j->sz = (u8) opsz; j->at = OT_REG; j->ar = (u8)((o2 & 7) | rexB); break;
         case 0xBC: case 0xBD:                                /* bsf/bsr, with F3: tzcnt/lzcnt (translated only when the flags are dead) */
             jmodrm(&p, j, &m, 0); if (BADM(m) || opsz == 2 || pf2) FB();
             j->op = JO_BSF; j->sz = (u8) opsz; j->t = (u8)(o2 & 1); j->sz2 = (u8) pf3; j->fw = 1; j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break;
@@ -2936,6 +2944,11 @@ static void jh_step(CPU *c) {
     if (__builtin_expect(g_jstats, 0)) { jdyn[jfb_idx((const u8*) c->rip)]++; jst_dyn++; }
     step(c);
 }
+
+/* condition helper: after an interpreter fallback the flags live in memory, so jcc/setcc/cmov evaluate them with this
+ * cheap call (it reads only the flags: no register spill/fill, no instruction decode) instead of interpreting. */
+static u64 jh_cc(CPU *c, u64 cc) { return (u64) cond(c, (int) cc); }
+static void j_cc_helper(int cc) { a_mov(0, RCPU); a_movi(1, (u64) cc); j_callabs((void*) jh_cc); fl.nz = 0; fl.pend = 0; }   /* x0 = 0 or 1 */
 
 static void fl_spill(void) {
     if (fl.kind == LZ_LOGIC) a_stp(31, 31, RCPU, (int) OFF_LA); else a_stp(9, 10, RCPU, (int) OFF_LA);
@@ -3182,7 +3195,7 @@ static int jemit(const JI *j) {          /* returns 1 when it ended the block (t
         if (j->at == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); }
         j_opld(0, j, 0, sz, rb, off); a_log(sf, 1, 1, 0, 31, 0); j_opst(0, j, sz, rb, off); break;
     case JO_SHIFT: {
-        if (j->lva && (!(g_jopt & JOPT_SHFL) || j->cnt == 2 || !j->imm || j->t < 4)) { fl_flush(j->lvb); j_fb(j); break; }   /* flags wanted: interpreter */
+        if (j->lva && (!(g_jopt & JOPT_SHFL) || j->cnt == 2 || !j->imm || j->t < 4 || sz < 4)) { fl_flush(j->lvb); j_fb(j); break; }   /* flags wanted: interpreter */
         if (j->lva) {                                            /* shl/shr/sar by a non-zero immediate, flags wanted: keep them lazy (x9 = value, x10 = count, x11 = result) */
             fl_flush(j->lvb); fl.nz = 0;
             if (j->at == OT_MEM) j_ea(j, &rb, &off);
@@ -3199,7 +3212,9 @@ static int jemit(const JI *j) {          /* returns 1 when it ended the block (t
         }
         fl_flush(j->lvb); fl.nz = 0;
         if (j->at == OT_MEM) j_ea(j, &rb, &off);
-        j_opld(0, j, 0, sz, rb, off);
+        if (sz < 4 && j->t == 7) {                       /* 8/16-bit sar: sign-extend the operand first (flags dead; shl/shr work on the zero-extended value) */
+            if (j->at == OT_MEM) m_ld(sz, 1, 0, 0, rb, off); else g_ldx(0, j->ar, sz, 1, 4, j->rex);
+        } else j_opld(0, j, 0, sz, rb, off);
         if (j->cnt == 2) {
             g_ld(1, RCX, 8, 0);
             switch (j->t) {
@@ -3230,14 +3245,26 @@ static int jemit(const JI *j) {          /* returns 1 when it ended the block (t
     case JO_SETCC: {
         fl_flush(j->lvb);
         int cc = 0, m = fl.nz ? jmapcc(j->t, &cc) : -1;
-        if (m < 0) { j_fb(j); break; }
+        if (m < 0 && !(g_jopt & JOPT_CC)) { j_fb(j); break; }
+        if (m < 0) {
+            fl_flush(1); j_cc_helper(j->t);
+            if (j->at == OT_MEM) { j_ea(j, &rb, &off); m_st(1, 0, rb, off); } else g_st(0, j->ar, 1, j->rex);
+            break;
+        }
         if (m == 0) a_cset(0, cc); else a_movz(0, 0, m == 1, 0);
         if (j->at == OT_MEM) { j_ea(j, &rb, &off); m_st(1, 0, rb, off); } else g_st(0, j->ar, 1, j->rex);
         break; }
     case JO_CMOV: {
         fl_flush(j->lvb);
         int cc = 0, m = fl.nz ? jmapcc(j->t, &cc) : -1;
-        if (m < 0) { j_fb(j); break; }
+        if (m < 0 && !(g_jopt & JOPT_CC)) { j_fb(j); break; }
+        if (m < 0) {
+            fl_flush(1); j_cc_helper(j->t); a_mov(2, 0);                  /* x2 = condition; the source is read either way */
+            if (j->bt == OT_MEM) { j_ea(j, &rb, &off); m_ld(sz, 0, 0, 1, rb, off); } else g_ld(1, j->br, sz, 0);
+            g_ld(0, j->ar, sz, 0);
+            a_addsub(1, 1, 1, 31, 2, 31); a_csel(sf, 1, 0, 1, 0);        /* subs xzr, x2, xzr; csel ne */
+            g_st(0, j->ar, sz, 0); break;
+        }
         if (j->bt == OT_MEM) { j_ea(j, &rb, &off); m_ld(sz, 0, 0, 1, rb, off); } else g_ld(1, j->br, sz, 0);
         g_ld(0, j->ar, sz, 0);
         if (m == 0) a_csel(sf, cc, 0, 1, 0); else if (m == 1) a_mov(0, 1);
@@ -3263,6 +3290,20 @@ static int jemit(const JI *j) {          /* returns 1 when it ended the block (t
         if (j->bt == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); q_ldm(1, rb, off); } else q_ldc(1, OFF_X(j->br));
         q_dup4s(0, 1, (int) j->imm);
         q_stc(0, OFF_X(j->ar)); break;
+    case JO_MUL1: {                                      /* mul / imul r/m (32 or 64 bit), flags dead: rdx:rax = rax * r/m */
+        if (j->lva) { fl_flush(j->lvb); j_fb(j); break; }
+        fl_flush(j->lvb); fl.nz = 0;
+        int sg = j->t == 5;
+        if (j->at == OT_MEM) { j_ea(j, &rb, &off); m_ld(sz, 0, 0, 1, rb, off); } else g_ld(1, j->ar, sz, j->rex);
+        g_ld(0, RAX, sz, 0);
+        if (sz == 8) { a_mul(1, 2, 0, 1); a_mulh(sg, 3, 0, 1); }
+        else {
+            if (sg) { a_sxtw(0, 0); a_sxtw(1, 1); }
+            a_mul(1, 2, 0, 1); a_lsr(1, 3, 2, 32); a_movw(2, 2);
+        }
+        g_st(2, RAX, sz, 0); g_st(3, RDX, sz, 0); break; }
+    case JO_BSWAP:
+        g_ld(0, j->ar, sz, 0); a_rev(sf, 0, 0); g_st(0, j->ar, sz, 0); break;
     case JO_BSF: {
         if (j->lva && j->sz2) { fl_flush(j->lvb); j_fb(j); break; }          /* tzcnt/lzcnt flags (CF, ZF of the result) are not modelled: interpreter */
         fl_flush(j->lvb); fl.nz = 0;                                         /* the compare below clobbers the host's flags; bsf defines ZF afresh */
@@ -3370,14 +3411,16 @@ static int jemit(const JI *j) {          /* returns 1 when it ended the block (t
         int cc = 0, m = fl.nz ? jmapcc(j->t, &cc) : -1;
         u64 next = j->ip + j->len;
         if (j->cnt) {                                    /* superblock: the fall-through path continues, the taken path is an out-of-line side exit */
-            if (m < 0) { fl_flush(1); j_fb(j); c_ld(0, OFF_RIP); jx_indirect(); return 1; }       /* flags not expressible: the interpreter decides, the inline cache jumps */
+            if (m < 0 && !(g_jopt & JOPT_CC)) { fl_flush(1); j_fb(j); c_ld(0, OFF_RIP); jx_indirect(); return 1; }
+            if (m < 0) { fl_flush(1); j_cc_helper(j->t); jstub_add(JS_SIDE, a_cbz_fwd(1, 0), NULL, j->ip, j->target); break; }   /* flags in memory: helper decides, cbnz to the side exit */
             if (m == 1) { fl_flush(1); jx_direct(j->ip, j->target); return 1; }
             if (m == 2) break;
             jstub_add(JS_SIDE, a_bcond_fwd(cc), NULL, j->ip, j->target);       /* the stub is entered by the branch itself: x9-x11 still hold the lazy flags */
             break;
         }
         fl_flush(1);
-        if (m < 0) { j_fb(j); c_ld(0, OFF_RIP); jx_indirect(); }       /* flags not expressible: the interpreter decides, the inline cache jumps */
+        if (m < 0 && !(g_jopt & JOPT_CC)) { j_fb(j); c_ld(0, OFF_RIP); jx_indirect(); }
+        else if (m < 0) { j_cc_helper(j->t); u32 *bt = a_cbz_fwd(1, 0); jx_direct(j->ip, next); jpatch19(bt); jx_direct(j->ip, j->target); }   /* flags in memory: helper decides, both exits chain */
         else if (m == 1) jx_direct(j->ip, j->target);
         else if (m == 2) jx_direct(j->ip, next);
         else { u32 *bt = a_bcond_fwd(cc); jx_direct(j->ip, next); jpatch19(bt); jx_direct(j->ip, j->target); }
