@@ -665,7 +665,7 @@ binds="${binds:+$binds:}$bh"; nbinds=$((nbinds+1)); chk_binds_total ;;
 esac
 shift 2 ;;
 -w|--workdir) [ $# -ge 2 ] || die "-w requires a directory"; case "$2" in /*) wd="$2"; wdset=1 ;; *) die "-w requires an absolute guest path: $2" ;; esac; shift 2 ;;
--e|--env)     [ $# -ge 2 ] || die "-e requires KEY=VALUE"; extra_envs+=("$2"); shift 2 ;;
+-e|--env)     [ $# -ge 2 ] || die "-e requires KEY=VALUE"; case "$2" in [A-Za-z_]*=*) ;; *) die "-e requires KEY=VALUE (got '$2')" ;; esac; case "${2%%=*}" in *[!A-Za-z0-9_]*) die "-e: invalid variable name '${2%%=*}'" ;; esac; extra_envs+=("$2"); shift 2 ;;
 --no-root-id) fake=0; shift ;;
 --no-seccomp) seccomp=0; shift ;;
 --trace)      trace=1; shift ;;

@@ -16,6 +16,9 @@
 static int g_seccomp = 1;
 #ifdef PRX_NO_SECCOMP
 #define SECCOMP_ON() 0
+/* No override in this build: declare libc's, used by fake_proc_stat() (procfs.h).
+   Without it clang (C99+) rejects the implicit declaration and the shim fails to build. */
+extern int sched_getaffinity(int, size_t, void*);
 static void seccomp_init(void) {
 }
 static long seccomp_nnp(int(*f)(int, unsigned long, unsigned long, unsigned long, unsigned long), unsigned long a2, unsigned long a3, unsigned long a4, unsigned long a5) {

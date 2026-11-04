@@ -25,7 +25,7 @@ done
 ok "man page documents the environment variables"
 # the shim compiles standalone, with and without seccomp support
 "${CC:-cc}" -fsyntax-only -w -ffreestanding "$HERE/src/prx.c" 2>/dev/null && ok "shim compiles standalone"
-"${CC:-cc}" -fsyntax-only -Wall -Wno-unused-function -ffreestanding -DPRX_NO_SECCOMP "$HERE/src/prx.c" 2>/dev/null && ok "shim compiles with -DPRX_NO_SECCOMP"
+"${CC:-cc}" -fsyntax-only -Wall -Werror=implicit-function-declaration -Wno-unused-function -ffreestanding -DPRX_NO_SECCOMP "$HERE/src/prx.c" 2>/dev/null && ok "shim compiles with -DPRX_NO_SECCOMP"
 
 # default data directory (XDG)
 "$PRX" build >/dev/null 2>&1 || fail "prx build"
@@ -63,6 +63,12 @@ if "$PRX" login t1 -w rel 2>"$T/err"; then fail "relative -w accepted"; fi
 grep -q 'absolute' "$T/err" && ok "login rejects relative -w"
 if "$PRX" login t1 -b "$T:rel" 2>"$T/err"; then fail "relative guest bind accepted"; fi
 grep -q 'absolute' "$T/err" && ok "login rejects relative guest bind path"
+
+# -e without KEY=VALUE must be an error (env would run the word as a program)
+if "$PRX" login t1 -e FOO 2>"$T/err"; then fail "-e without '=' accepted"; fi
+grep -q 'KEY=VALUE' "$T/err" && ok "login rejects -e without KEY=VALUE" || fail "login rejects -e without KEY=VALUE"
+if "$PRX" login t1 -e 'A-B=1' 2>"$T/err"; then fail "-e with invalid name accepted"; fi
+grep -q 'KEY=VALUE\|invalid variable name' "$T/err" && ok "login rejects -e with an invalid variable name" || fail "login rejects -e with an invalid variable name"
 
 # bind validation: too long / ambiguous ':'
 long="/$(printf 'x%.0s' $(seq 1 1100))"
