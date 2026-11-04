@@ -1,0 +1,63 @@
+diff -ruN a/src/shim/fs_ops.h b/src/shim/fs_ops.h
+--- a/src/shim/fs_ops.h	2026-11-04 21:47:37.137417681 +0000
++++ b/src/shim/fs_ops.h	2026-11-04 21:47:37.138697316 +0000
+@@ -165,6 +165,59 @@
+ EXP char*canonicalize_file_name(const char*p) {
+     return do_realpath(p, NULL);
+ }
++/* dladdr(): the guest loader finds libraries through the flat library path that prx
++   passes with --library-path, which beats the binary's RUNPATH ($ORIGIN). A library
++   that is only a symlink into another directory (Debian: /usr/lib/<triplet>/libuno_*.so
++   -> ../libreoffice/program/libuno_*.so) is then reported under the symlink's directory.
++   LibreOffice looks for "unorc" next to that path and fails with "Cannot open uno ini".
++   When the real file has the same name in a different directory, report the real
++   location (same-directory renames and other cases are left as the loader reported). */
++static const char*dl_lastslash(const char*s) {
++    const char*r = NULL;
++    for (; *s; s++) if (*s == '/') r = s;
++    return r;
++}
++static const char*dl_fix_fname(const char*f) {
++    static struct {
++        char*key;
++        const char*val;
++    } cache[32];
++    static int nc;
++    int n = __atomic_load_n(&nc, __ATOMIC_ACQUIRE);
++    for (int i = 0; i<n && i<32; i++) if (strcmp(cache[i].key, f) == 0) return cache[i].val;
++    const char*res = f;
++    char*rp = do_realpath(f, NULL);
++    if (rp) {
++        const char*fb = dl_lastslash(f), *rb = dl_lastslash(rp);
++        if (fb && rb && strcmp(fb, rb) == 0 && (fb-f != rb-rp || memcmp(f, rp, (size_t)(fb-f)) != 0)) {
++            res = rp;
++            rp = NULL;
++        }
++        if (rp) free(rp);
++    }
++    if (n<32) {
++        size_t kl = strlen(f)+1;
++        char*k = malloc(kl);
++        if (k) {
++            memcpy(k, f, kl);
++            cache[n].key = k;
++            cache[n].val = res;
++            __atomic_store_n(&nc, n+1, __ATOMIC_RELEASE);
++        }
++    }
++    return res;
++}
++EXP int dladdr(const void*addr, void*info) {
++    static int(*real)(const void*, void*);
++    if (!real) real = nextsym("dladdr");
++    if (!real) return 0;
++    int r = real(addr, info);
++    if (r && info && g_rl) {
++        const char**fn = (const char**) info;    /* Dl_info.dli_fname is the first member */
++        if (*fn && (*fn)[0] == '/') *fn = dl_fix_fname(*fn);
++    }
++    return r;
++}
+ EXP char*get_current_dir_name(void) {
+     return do_getcwd(NULL, 0);
+ }
