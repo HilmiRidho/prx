@@ -1024,13 +1024,6 @@ static void push(CPU*c, u64 v) { c->r[RSP] -= 8; mwr(c->r[RSP], v, 8); }
 static u64 pop(CPU*c) { u64 v = mrd(c->r[RSP], 8); c->r[RSP] += 8; return v; }
 
 static void undef(CPU*c, const u8*ip, const char*why) {
-    if (gsa[SIGILL].handler > 1) {                    /* #UD: like the CPU, hand it to the guest's SIGILL handler (rip = the instruction) */
-        memset(&pinfo[SIGILL], 0, sizeof pinfo[SIGILL]);
-        pinfo[SIGILL].si_signo = SIGILL; pinfo[SIGILL].si_code = 2 /*ILL_ILLOPN*/; pinfo[SIGILL].si_addr = (void*) c->rip;
-        if (g_trace) fprintf(stderr, "pemu: SIGILL (%s) at rip=%#llx\n", why, (unsigned long long) c->rip);
-        g_fault = SIGILL; g_faddr = 0;
-        siglongjmp(g_jb, 1);                          /* run() delivers it; also unwinds out of translated code and inline interpreter calls */
-    }
     fprintf(stderr, "pemu: unsupported instruction (%s) at rip=%#llx: %02x %02x %02x %02x %02x %02x\n", why, (unsigned long long) c->rip,
             ip[0], ip[1], ip[2], ip[3], ip[4], ip[5]);
     signal(SIGILL, SIG_DFL); raise(SIGILL); _exit(132);
@@ -1338,15 +1331,6 @@ static int sse38(CPU*c, I*in, int op, int is3a) {
         c->r[m.reg] = crc;
         return 0;
     }
-    if (!is3a && (op == 0xF0 || op == 0xF1) && !in->rep) {          /* movbe: 0F 38 F0 load / F1 store with the bytes reversed, memory operand only */
-        modrm(c, in, &m, 0);
-        if (!m.ismem) return -1;
-        int sz = in->w ? 8 : in->p66 ? 2 : 4;
-        u64 v = op == 0xF0 ? mrd(m.ea, sz) : getr(c, m.reg, sz, in->rex);
-        v = sz == 8 ? __builtin_bswap64(v) : sz == 4 ? __builtin_bswap32((u32) v) : __builtin_bswap16((u16) v);
-        if (op == 0xF0) setr(c, m.reg, sz, in->rex, v); else mwr(m.ea, v, sz);
-        return 0;
-    }
     if (!in->p66) return -1;
     modrm(c, in, &m, is3a ? 1 : 0);
     if (is3a) imm8 = *in->ip++;
@@ -1518,27 +1502,6 @@ static void fx_restore(CPU*c, const u8*p) {
     c->mxcsr = *(const u32u*)(p + 24);
     for (int i = 0; i < 8; i++) c->st[(c->top + i) & 7] = ld_from80(p + 32 + 16 * i);
     memcpy(c->x, p + 160, 256);
-}
-/* XSAVE / XRSTOR (standard format) for the two components that exist here: x87 (bit 0) and SSE (bit 1, MXCSR travels with it).
- * The legacy region is the FXSAVE image, XSTATE_BV is at 512 and the rest of the 64-byte header is left alone. */
-static void xsave_do(CPU*c, u8*p, u64 rfbm) {
-    u8 t[512]; rfbm &= 3; fx_save(c, t);
-    if (rfbm & 1) { memcpy(p, t, 24); memcpy(p + 32, t + 32, 128); }
-    if (rfbm & 2) { memcpy(p + 24, t + 24, 8); memcpy(p + 160, t + 160, 256); }
-    *(u64u*)(p + 512) = (*(u64u*)(p + 512) & ~3ULL) | rfbm;
-}
-static void xrstor_do(CPU*c, const u8*p, u64 rfbm) {
-    u8 t[512]; rfbm &= 3; u64 bv = *(const u64u*)(p + 512);
-    fx_save(c, t);
-    if (rfbm & 1) {
-        if (bv & 1) { memcpy(t, p, 24); memcpy(t + 32, p + 32, 128); }
-        else { memset(t, 0, 24); memset(t + 32, 0, 128); *(u16u*) t = 0x37F; }       /* a component that is not in the image goes to its initial state */
-    }
-    if (rfbm & 2) {
-        memcpy(t + 24, p + 24, 4);                                                   /* MXCSR is loaded whenever the SSE bit is requested */
-        if (bv & 2) memcpy(t + 160, p + 160, 256); else memset(t + 160, 0, 256);
-    }
-    fx_restore(c, t);
 }
 static void xpush(CPU*c, long double v) { c->top = (c->top - 1) & 7; c->st[c->top] = v; }
 static void xpop(CPU*c) { c->top = (c->top + 1) & 7; }
@@ -1802,26 +1765,15 @@ static void cpuid(CPU*c) {
 /* in/out/cli/sti/hlt are privileged: a real CPU raises #GP and Linux delivers SIGSEGV
  * (si_code SI_KERNEL, rip = the instruction). Programs such as lscpu probe the VMware
  * backdoor port this way and catch the signal. */
-static void gp_fault(CPU*c) {                            /* #GP: SIGSEGV, si_code SI_KERNEL; rip stays at the instruction. Never returns when a guest handler exists */
-    (void) c;
+static void gp_fault(CPU*c) {
     if (gsa[SIGSEGV].handler > 1) {
         memset(&pinfo[SIGSEGV], 0, sizeof pinfo[SIGSEGV]);
         pinfo[SIGSEGV].si_signo = SIGSEGV; pinfo[SIGSEGV].si_code = 0x80;
-        g_fault = SIGSEGV; g_faddr = 0;
-        siglongjmp(g_jb, 1);                             /* run() delivers it: also right when the interpreter was called inline from translated code */
-    }
-    signal(SIGSEGV, SIG_DFL); raise(SIGSEGV); _exit(128 + SIGSEGV);
-}
-static void trap_bp(CPU*c, u64 next) {                  /* int3 / int 3: SIGTRAP, si_code SI_KERNEL, rip after the instruction */
-    c->rip = next;
-    if (gsa[SIGTRAP].handler > 1) {
-        memset(&pinfo[SIGTRAP], 0, sizeof pinfo[SIGTRAP]);
-        pinfo[SIGTRAP].si_signo = SIGTRAP; pinfo[SIGTRAP].si_code = 0x80;
         g_fault = 0;
-        deliver_sig(c, SIGTRAP);
+        deliver_sig(c, SIGSEGV);
         return;
     }
-    raise(SIGTRAP);
+    signal(SIGSEGV, SIG_DFL); raise(SIGSEGV); _exit(128 + SIGSEGV);
 }
 static void step(CPU*c) {
     I in; memset(&in, 0, sizeof in);
@@ -1966,31 +1918,12 @@ static void step(CPU*c) {
         u64 imm = sz == 1 ? *in.ip++ : immz(&in, opsz);
         wrm(c, &in, &m, sz, imm); break; }
     case 0xC9: c->r[RSP] = c->r[RBP]; c->r[RBP] = pop(c); break;
-    case 0xC8: {                                                  /* enter imm16, imm8 (64-bit operand size; RSP/RBP are committed last so a fault can restart it) */
-        u64 fr = *(u16u*) in.ip, sp = c->r[RSP], bp0 = c->r[RBP]; unsigned lvl = in.ip[2] & 31; in.ip += 3;
-        sp -= 8; mwr(sp, bp0, 8);
-        u64 ft = sp;
-        if (lvl) { u64 bp = bp0; for (unsigned i = 1; i < lvl; i++) { bp -= 8; sp -= 8; mwr(sp, mrd(bp, 8), 8); } sp -= 8; mwr(sp, ft, 8); }
-        c->r[RBP] = ft; c->r[RSP] = sp - fr; break; }
-    case 0xCC: trap_bp(c, (u64) in.ip); return;
-    case 0xCD: {                                                  /* int imm8: int3 is a breakpoint; every other vector is out of reach of ring 3 (#GP -> SIGSEGV, */
-        u8 n = *in.ip++;                                          /* which is what int 0x80 does on a kernel without ia32 emulation) */
-        if (n == 3) { trap_bp(c, (u64) in.ip); return; }
-        gp_fault(c); return; }
-    case 0xD7: { u64 b = in.addr32 ? (u32) c->r[RBX] : c->r[RBX];       /* xlatb: al = [rbx + al] */
-        c->r[RAX] = (c->r[RAX] & ~0xffULL) | mrd(in.seg + b + (u8) c->r[RAX], 1); break; }
-    case 0xE0: case 0xE1: case 0xE2: {                            /* loopne / loope / loop rel8: rcx (ecx with 67h) counts down, flags are untouched */
-        s8 rel = (s8) *in.ip++;
-        u64 n = in.addr32 ? (u64)(u32)(c->r[RCX] - 1) : c->r[RCX] - 1;
-        c->r[RCX] = n;
-        int take = n != 0 && (op == 0xE2 || !!cond(c, 4) == (op == 0xE1));
-        c->rip = (u64) in.ip + (u64)(s64)(take ? rel : 0); return; }
+    case 0xCC: c->rip = (u64) in.ip; raise(SIGTRAP); return;
     case 0xE8: { s32 rel = imm32(&in); push(c, (u64) in.ip); c->rip = (u64) in.ip + (u64)(s64) rel; return; }
     case 0xE9: { s32 rel = imm32(&in); c->rip = (u64) in.ip + (u64)(s64) rel; return; }
     case 0xEB: { s8 rel = (s8) *in.ip++; c->rip = (u64) in.ip + (u64)(s64) rel; return; }
     case 0xE3: { s8 rel = (s8) *in.ip++; c->rip = (u64) in.ip + (u64)(s64)(c->r[RCX] == 0 ? rel : 0); return; }
     case 0xE4: case 0xE5: case 0xE6: case 0xE7: case 0xEC: case 0xED: case 0xEE: case 0xEF:
-    case 0x6C: case 0x6D: case 0x6E: case 0x6F:
     case 0xFA: case 0xFB: case 0xF4: gp_fault(c); return;
     case 0xF5: RF(c) ^= CF_; break;
     case 0xF8: RF(c) &= ~(u64)CF_; break;
@@ -2041,7 +1974,7 @@ static void step(CPU*c) {
         u8 o2 = *in.ip++;
         switch (o2) {
         case 0x05: { c->rip = (u64) in.ip; c->r[RCX] = c->rip; c->r[11] = RF(c); do_syscall(c); return; }
-        case 0x0B: undef(c, start, "ud2"); break;
+        case 0x0B: goto bad;
         case 0x0D: case 0x18: case 0x19: case 0x1A: case 0x1B: case 0x1C: case 0x1D: case 0x1E: case 0x1F:
             modrm(c, &in, &m, 0); break;
         case 0x31: { u64 t = tsc_now(); c->r[RAX] = (u32) t; c->r[RDX] = t >> 32; break; }
@@ -2083,8 +2016,6 @@ static void step(CPU*c) {
             if (sse38(c, &in, o3, o2 == 0x3A) < 0) undef(c, start, o2 == 0x3A ? "0F3A" : "0F38");
             break; }
         case 0xA2: cpuid(c); break;
-        case 0x06: case 0x07: case 0x08: case 0x09: case 0x20: case 0x21: case 0x22: case 0x23:        /* privileged (clts, sysret, invd, wbinvd, mov cr/dr, wrmsr, */
-        case 0x30: case 0x32: case 0x33: case 0x34: case 0x35: gp_fault(c); return;                   /* rdmsr, rdpmc, sysenter, sysexit): #GP -> SIGSEGV */
         case 0x40: case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: case 0x46: case 0x47:
         case 0x48: case 0x49: case 0x4A: case 0x4B: case 0x4C: case 0x4D: case 0x4E: case 0x4F: {
             modrm(c, &in, &m, 0); u64 v = rdm(c, &in, &m, opsz);
@@ -2135,24 +2066,8 @@ static void step(CPU*c) {
         case 0xAE: {
             modrm(c, &in, &m, 0);
             int ext = m.reg & 7;
-            if (!m.ismem) {
-                if (ext >= 5) { __atomic_thread_fence(__ATOMIC_SEQ_CST); break; }   /* lfence/mfence/sfence */
-                if (in.rep && ext < 4) {                                            /* F3 0F AE /0../3: rdfsbase rdgsbase wrfsbase wrgsbase */
-                    u64*bs = (ext & 1) ? &c->gs : &c->fs;
-                    if (ext < 2) c->r[m.rm] = in.w ? *bs : (u32) *bs;
-                    else { u64 v = in.w ? c->r[m.rm] : (u32) c->r[m.rm]; if ((s64)(v << 16) >> 16 != (s64) v) { gp_fault(c); return; } *bs = v; }
-                    break;
-                }
-                goto bad;
-            }
-            if (ext >= 4 && ext <= 6 && !(ext == 6 && in.p66)) {                   /* xsave, xrstor, xsaveopt (= xsave); 66 0F AE /6 is clwb: nothing to do */
-                if (m.ea & 63) { gp_fault(c); return; }
-                u64 rfbm = (c->r[RDX] << 32) | (u32) c->r[RAX];
-                if (ext == 5) xrstor_do(c, (const u8*) m.ea, rfbm); else xsave_do(c, (u8*) m.ea, rfbm);
-                break;
-            }
-            if (ext == 6) { }
-            else if (ext == 0) fx_save(c, (u8*) m.ea);
+            if (!m.ismem) { if (ext >= 5) { __atomic_thread_fence(__ATOMIC_SEQ_CST); break; } goto bad; }   /* lfence/mfence/sfence */
+            if (ext == 0) fx_save(c, (u8*) m.ea);
             else if (ext == 1) fx_restore(c, (const u8*) m.ea);
             else if (ext == 2) c->mxcsr = *(u32u*) m.ea;
             else if (ext == 3) *(u32u*) m.ea = c->mxcsr;
