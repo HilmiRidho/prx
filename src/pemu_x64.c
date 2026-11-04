@@ -79,6 +79,7 @@ typedef struct {
     union { struct { u8 lop, lsz, lcin; }; u64 lmeta; };   /* lmeta = lop | lsz << 8 | lcin << 16 (the JIT stores it in one go) */
     u64 patch;                                        /* JIT: chain patch site left by an exit stub (bit 0: it is a bl); 1 = interpret one instruction */
     u64 rsbi; u64 rsb[RSB_N][2];                      /* JIT return stack buffer: ring of (guest return address, host continuation) pairs, filled by call, checked by ret */
+    u64 mm[8];                                        /* MMX registers (kept apart from the x87 stack they alias on real hardware) */
     V x[16] __attribute__((aligned(16)));
     u32 mxcsr; u16 fcw, fsw;
     long double st[8]; int top;
@@ -1113,9 +1114,74 @@ static int cmp_pred(int p, double a, double b) {
     }
 }
 
+/* ------------------------------------------------------------ MMX (no prefix 0F xx, and the SSSE3 forms of 0F 38 / 0F 3A)
+ * mm0-mm7 live in c->mm. On real hardware they alias the x87 registers; here they are separate, which is only visible to code
+ * that mixes MMX and x87 without emms (and emms is then a no-op). The lane operations of the SSE2 integer set (pint) work on
+ * the low 64 bits unchanged; pack, punpckh*, pshufw, pextrw/pinsrw, pmovmskb and the shifts by immediate are done here. */
+static int mmx_op(int op) {
+    return (op >= 0x60 && op <= 0x6B) || op == 0x6E || op == 0x6F || (op >= 0x70 && op <= 0x77) || op == 0x7E || op == 0x7F ||
+           op == 0xC4 || op == 0xC5 || (op >= 0xD1 && op <= 0xD5) || (op >= 0xD7 && op <= 0xDF) || (op >= 0xE0 && op <= 0xE5) ||
+           (op >= 0xE7 && op <= 0xEF) || (op >= 0xF1 && op <= 0xFE);
+}
+static int mmx(CPU*c, I*in, int op) {
+    if (op == 0x77) return 0;                                   /* emms */
+    M m; int imm8 = 0, ok = 1;
+    int immb = op == 0x70 || op == 0xC4 || op == 0xC5 || (op >= 0x71 && op <= 0x73);
+    modrm(c, in, &m, immb);
+    if (immb) imm8 = *in->ip++;
+    u64*d = &c->mm[m.reg & 7], sv = 0;
+#define MSRC() do { sv = m.ismem ? *(u64u*) m.ea : c->mm[m.rm & 7]; } while (0)
+    switch (op) {
+    case 0x6E: *d = rdm(c, in, &m, in->w ? 8 : 4); return 0;                                  /* movd/movq mm, r/m */
+    case 0x7E: wrm(c, in, &m, in->w ? 8 : 4, *d); return 0;                                  /* movd/movq r/m, mm */
+    case 0x6F: MSRC(); *d = sv; return 0;                                                     /* movq mm, mm/m64 */
+    case 0x7F: if (m.ismem) *(u64u*) m.ea = *d; else c->mm[m.rm & 7] = *d; return 0;
+    case 0xE7: if (!m.ismem) return -1; *(u64u*) m.ea = *d; return 0;                        /* movntq */
+    case 0x70: { MSRC(); u64 r = 0;                                                           /* pshufw */
+        for (int i = 0; i < 4; i++) r |= ((sv >> (16 * ((imm8 >> (2 * i)) & 3))) & 0xffff) << (16 * i);
+        *d = r; return 0; }
+    case 0x71: case 0x72: case 0x73: {                                                        /* shift groups by imm8 */
+        if (m.ismem) return -1;
+        int ext = m.reg & 7, sop = -1;
+        if (op == 0x71) sop = ext == 2 ? 0xD1 : ext == 4 ? 0xE1 : ext == 6 ? 0xF1 : -1;
+        else if (op == 0x72) sop = ext == 2 ? 0xD2 : ext == 4 ? 0xE2 : ext == 6 ? 0xF2 : -1;
+        else sop = ext == 2 ? 0xD3 : ext == 6 ? 0xF3 : -1;
+        if (sop < 0) return -1;
+        V a = {{0}}, n = {{0}}; a.q[0] = c->mm[m.rm & 7]; n.q[0] = (u8) imm8;
+        pint(sop, &a, &n, &ok); c->mm[m.rm & 7] = a.q[0]; return 0; }
+    case 0xC4: { u64 v = m.ismem ? mrd(m.ea, 2) : getr(c, m.rm, 4, 0); int sh = 16 * (imm8 & 3);          /* pinsrw */
+        *d = (*d & ~(0xffffULL << sh)) | ((v & 0xffff) << sh); return 0; }
+    case 0xC5: if (m.ismem) return -1; setr(c, m.reg, 4, 0, (c->mm[m.rm & 7] >> (16 * (imm8 & 3))) & 0xffff); return 0;       /* pextrw */
+    case 0xD7: { if (m.ismem) return -1; u64 r = c->mm[m.rm & 7], v = 0;                                 /* pmovmskb */
+        for (int i = 0; i < 8; i++) v |= ((r >> (8 * i + 7)) & 1) << i;
+        setr(c, m.reg, 4, 0, v); return 0; }
+    case 0xF7: { if (m.ismem) return -1; u64 mk = c->mm[m.rm & 7], dv = *d; u8*dst = (u8*)(c->r[RDI] + in->seg);   /* maskmovq */
+        for (int i = 0; i < 8; i++) if ((mk >> (8 * i + 7)) & 1) dst[i] = (u8)(dv >> (8 * i));
+        return 0; }
+    case 0x63: case 0x67: case 0x6B: case 0x68: case 0x69: case 0x6A: {
+        MSRC(); V a = {{0}}, b = {{0}}, r = {{0}}; a.q[0] = *d; b.q[0] = sv;
+        switch (op) {
+        case 0x63: for (int i = 0; i < 4; i++) { int v = a.sw[i], w = b.sw[i]; r.sb[i] = (s8)(v > 127 ? 127 : v < -128 ? -128 : v); r.sb[4 + i] = (s8)(w > 127 ? 127 : w < -128 ? -128 : w); } break;       /* packsswb */
+        case 0x67: for (int i = 0; i < 4; i++) { int v = a.sw[i], w = b.sw[i]; r.b[i] = (u8)(v > 255 ? 255 : v < 0 ? 0 : v); r.b[4 + i] = (u8)(w > 255 ? 255 : w < 0 ? 0 : w); } break;             /* packuswb */
+        case 0x6B: for (int i = 0; i < 2; i++) { s64 v = a.sd[i], w = b.sd[i]; r.sw[i] = (s16)(v > 32767 ? 32767 : v < -32768 ? -32768 : v); r.sw[2 + i] = (s16)(w > 32767 ? 32767 : w < -32768 ? -32768 : w); } break;   /* packssdw */
+        case 0x68: for (int i = 0; i < 4; i++) { r.b[2 * i] = a.b[4 + i]; r.b[2 * i + 1] = b.b[4 + i]; } break;       /* punpckhbw */
+        case 0x69: for (int i = 0; i < 2; i++) { r.w[2 * i] = a.w[2 + i]; r.w[2 * i + 1] = b.w[2 + i]; } break;       /* punpckhwd */
+        default: r.d[0] = a.d[1]; r.d[1] = b.d[1]; break;                                                            /* punpckhdq */
+        }
+        *d = r.q[0]; return 0; }
+    default: {                                                                                /* the rest is lane-wise: the low half of the SSE2 operation */
+        MSRC(); V a = {{0}}, b = {{0}}; a.q[0] = *d; b.q[0] = sv;
+        pint(op, &a, &b, &ok);
+        if (!ok) return -1;
+        *d = a.q[0]; return 0; }
+    }
+#undef MSRC
+}
+
 static int sse(CPU*c, I*in, int op) {
     int pf = in->rep ? 3 : in->repne ? 2 : in->p66 ? 1 : 0, imm8 = 0, ok = 1;
     M m; V sv, *s = NULL;
+    if (pf == 0 && mmx_op(op)) return mmx(c, in, op);                  /* no prefix and one of the MMX opcodes: mm registers, not xmm */
     int immb = (op == 0x70 || op == 0xC2 || op == 0xC4 || op == 0xC5 || op == 0xC6 || (op >= 0x71 && op <= 0x73)) ? 1 : 0;
     modrm(c, in, &m, immb);
     if (immb) imm8 = *in->ip++;
@@ -1226,7 +1292,12 @@ static int sse(CPU*c, I*in, int op) {
     case 0xC4: d->w[imm8 & 7] = (u16)(m.ismem ? mrd(m.ea, 2) : getr(c, m.rm, 4, 0)); break;
     case 0xC5: if (m.ismem) return -1; setr(c, m.reg, 4, 0, c->x[m.rm].w[imm8 & 7]); break;
     case 0xD7: { if (m.ismem) return -1; V*r = &c->x[m.rm]; u64 v = 0; for (int i = 0; i < 16; i++) v |= (u64)(r->b[i] >> 7) << i; setr(c, m.reg, 4, 0, v); break; }
-    case 0xD6: if (pf != 1) return -1; if (m.ismem) *(u64u*) m.ea = d->q[0]; else { c->x[m.rm].q[0] = d->q[0]; c->x[m.rm].q[1] = 0; } break;
+    case 0xD6:
+        if (pf == 3) { if (m.ismem) return -1; d->q[0] = c->mm[m.rm & 7]; d->q[1] = 0; break; }       /* movq2dq xmm, mm */
+        if (pf == 2) { if (m.ismem) return -1; c->mm[m.reg & 7] = c->x[m.rm].q[0]; break; }         /* movdq2q mm, xmm */
+        if (pf != 1) return -1;
+        if (m.ismem) *(u64u*) m.ea = d->q[0]; else { c->x[m.rm].q[0] = d->q[0]; c->x[m.rm].q[1] = 0; }
+        break;
     case 0x6E: if (pf != 1) return -1; d->q[0] = rdm(c, in, &m, in->w ? 8 : 4); d->q[1] = 0; break;
     case 0x7E:
         if (pf == 1) wrm(c, in, &m, in->w ? 8 : 4, d->q[0]);
@@ -1270,7 +1341,7 @@ static int sse(CPU*c, I*in, int op) {
 
 
 /* ------------------------------------------------------------ SSSE3 / SSE4.1 / SSE4.2 (0F 38 xx, 0F 3A xx)
- * Only the 66-prefixed XMM forms exist here (the MMX forms are not emulated), plus crc32 (F2 0F 38 F0/F1). */
+ * The XMM forms are 66-prefixed; the SSSE3 ones also exist without a prefix on mm registers (mmx38), plus crc32 (F2 0F 38 F0/F1). */
 static inline s16 sat16(s32 v) { return (s16)(v > 32767 ? 32767 : v < -32768 ? -32768 : v); }
 static inline u16 satu16(s32 v) { return (u16)(v > 65535 ? 65535 : v < 0 ? 0 : v); }
 static inline float rnd_f(float v, int md) { switch (md & 3) { case 0: return nearbyintf(v); case 1: return floorf(v); case 2: return ceilf(v); default: return truncf(v); } }
@@ -1320,6 +1391,38 @@ static int pc_elen(CPU*c, int reg, int w, int imm) {
     return v > n ? n : (int) v;
 }
 
+static int mmx38(CPU*c, I*in, int op, int is3a) {               /* SSSE3 on mm registers: pshufb, phadd*, phsub*, pmaddubsw, psign*, pmulhrsw, pabs*, palignr */
+    if (is3a ? op != 0x0F : !((op <= 0x0B) || (op >= 0x1C && op <= 0x1E))) return -1;
+    M m; int imm8 = 0;
+    modrm(c, in, &m, is3a);
+    if (is3a) imm8 = *in->ip++;
+    u64*d = &c->mm[m.reg & 7];
+    V t = {{0}}, s = {{0}}, r = {{0}}; t.q[0] = *d; s.q[0] = m.ismem ? *(u64u*) m.ea : c->mm[m.rm & 7];
+    if (is3a) {                                                  /* palignr: (dest:src) >> imm8 bytes */
+        u8 cat[16]; memcpy(cat, s.b, 8); memcpy(cat + 8, t.b, 8);
+        for (int i = 0; i < 8; i++) { int j = i + imm8; r.b[i] = j < 16 ? cat[j] : 0; }
+        *d = r.q[0]; return 0;
+    }
+    switch (op) {
+    case 0x00: for (int i = 0; i < 8; i++) r.b[i] = (s.b[i] & 0x80) ? 0 : t.b[s.b[i] & 7]; break;                                     /* pshufb */
+    case 0x01: case 0x03: case 0x05: case 0x07: {                                                                                     /* phaddw/phaddsw/phsubw/phsubsw */
+        int sub = op >= 5; s16 a[4] = {t.sw[0], t.sw[2], s.sw[0], s.sw[2]}, b[4] = {t.sw[1], t.sw[3], s.sw[1], s.sw[3]};
+        for (int i = 0; i < 4; i++) { s32 v = sub ? a[i] - b[i] : a[i] + b[i]; r.sw[i] = (op == 0x03 || op == 0x07) ? sat16(v) : (s16) v; }
+        break; }
+    case 0x02: case 0x06: { int sub = op >= 5; u32 a[2] = {t.d[0], s.d[0]}, b[2] = {t.d[1], s.d[1]};                                   /* phaddd/phsubd */
+        for (int i = 0; i < 2; i++) r.d[i] = sub ? a[i] - b[i] : a[i] + b[i];
+        break; }
+    case 0x04: for (int i = 0; i < 4; i++) r.sw[i] = sat16((s32) t.b[2 * i] * s.sb[2 * i] + (s32) t.b[2 * i + 1] * s.sb[2 * i + 1]); break;   /* pmaddubsw */
+    case 0x08: for (int i = 0; i < 8; i++) r.sb[i] = s.sb[i] < 0 ? (s8)(0 - t.sb[i]) : s.sb[i] == 0 ? 0 : t.sb[i]; break;             /* psignb/w/d */
+    case 0x09: for (int i = 0; i < 4; i++) r.sw[i] = s.sw[i] < 0 ? (s16)(0 - t.sw[i]) : s.sw[i] == 0 ? 0 : t.sw[i]; break;
+    case 0x0A: for (int i = 0; i < 2; i++) r.sd[i] = s.sd[i] < 0 ? (s32)(0u - t.d[i]) : s.sd[i] == 0 ? 0 : t.sd[i]; break;
+    case 0x0B: for (int i = 0; i < 4; i++) r.sw[i] = (s16)(((((s32) t.sw[i] * s.sw[i]) >> 14) + 1) >> 1); break;                      /* pmulhrsw */
+    case 0x1C: for (int i = 0; i < 8; i++) r.b[i] = (u8)(s.sb[i] < 0 ? 0 - s.sb[i] : s.sb[i]); break;                                 /* pabsb/w/d */
+    case 0x1D: for (int i = 0; i < 4; i++) r.w[i] = (u16)(s.sw[i] < 0 ? 0 - s.sw[i] : s.sw[i]); break;
+    default:   for (int i = 0; i < 2; i++) r.d[i] = s.sd[i] < 0 ? 0u - s.d[i] : s.d[i]; break;
+    }
+    *d = r.q[0]; return 0;
+}
 static int sse38(CPU*c, I*in, int op, int is3a) {
     M m; V sv, *s = NULL; int imm8 = 0;
     if (!is3a && in->repne) {                                       /* crc32 (CRC-32C), F2 [66|REX.W] 0F 38 F0/F1 */
@@ -1331,7 +1434,7 @@ static int sse38(CPU*c, I*in, int op, int is3a) {
         c->r[m.reg] = crc;
         return 0;
     }
-    if (!in->p66) return -1;
+    if (!in->p66) return in->rep ? -1 : mmx38(c, in, op, is3a);
     modrm(c, in, &m, is3a ? 1 : 0);
     if (is3a) imm8 = *in->ip++;
     V*d = &c->x[m.reg], t = *d;

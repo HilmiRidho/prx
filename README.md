@@ -108,7 +108,7 @@ A small user-mode emulator that can stand in for `qemu-user` when running a root
 | Host | Guest rootfs | Source | Notes |
 | --- | --- | --- | --- |
 | x86_64 | aarch64 | `src/pemu.c` | JIT + interpreter; integer ISA, scalar FP, small NEON subset; no threads |
-| aarch64 | x86_64 | `src/pemu_x64.c` | JIT + interpreter; integer ISA, SSE2 to SSE4.2 (no AVX), x87 subset; threads |
+| aarch64 | x86_64 | `src/pemu_x64.c` | JIT + interpreter; integer ISA, MMX, SSE2 to SSE4.2 (no AVX), x87 subset; threads |
 
     prx build                       # also builds $PRX_HOME/lib/pemu
     PRX_QEMU=pemu prx login debian
