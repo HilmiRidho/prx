@@ -1,4 +1,5 @@
 flags consistent with cpuid: yes
+brand string matches model name: yes
 processors listed: >=1
 seek and reread: same
 fopen + fgets: flags line found

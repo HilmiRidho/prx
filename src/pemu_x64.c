@@ -743,6 +743,13 @@ static long mmap32(u64 len, u64 prot, u64 flags, u64 fd, u64 off) {
     return -ENOMEM;
 }
 
+/* The emulated CPU is an Intel Core i7-920 (Bloomfield, Nehalem, D0 stepping): family 6 model 0x1a stepping 5, 2.66 GHz, 4 cores,
+ * 32K+32K L1, 256K L2, 8M L3. It is the real CPU whose feature set matches what pemu implements (x86-64-v2: SSE4.2, POPCNT,
+ * CMPXCHG16B, no AES/PCLMUL/AVX). cpuid() and /proc/cpuinfo both take their identity from here, so they cannot disagree. */
+#define PEMU_BRAND     "Intel(R) Core(TM) i7 CPU         920  @ 2.67GHz"     /* 47 characters: leaves 0x80000002-4 hold 48 bytes */
+#define PEMU_MHZ_STR   "2666.667"
+#define PEMU_BOGO_STR  "5333.33"                                              /* Linux prints about 2 x MHz */
+
 /* /proc/cpuinfo as an x86 CPU. The host's file lists ARM flags (asimd, fp, ...), so a guest that decides what the CPU can do by
  * parsing it finds no sse3/pni and refuses to run. The text is consistent with cpuid (see cpuid()). */
 static const char cpuinfo_flags[] = "fpu tsc cx8 cmov mmx fxsr sse sse2 syscall nx lm constant_tsc nopl pni ssse3 cx16 sse4_1 sse4_2 popcnt lahf_lm";
@@ -752,10 +759,10 @@ static long cpuinfo_fd(long hostflags) {
     if (!b) return -ENOMEM;
     for (int i = 0; i < n; i++)
         len += (size_t) snprintf(b + len, cap - len,
-            "processor\t: %d\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 26\nmodel name\t: Intel(R) Core(TM) i7 CPU (pemu, emulated x86-64)\n"
-            "stepping\t: 5\ncpu MHz\t\t: 2000.000\ncache size\t: 8192 KB\nphysical id\t: 0\nsiblings\t: %ld\ncore id\t\t: %d\ncpu cores\t: %ld\n"
+            "processor\t: %d\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 26\nmodel name\t: " PEMU_BRAND "\n"
+            "stepping\t: 5\ncpu MHz\t\t: " PEMU_MHZ_STR "\ncache size\t: 8192 KB\nphysical id\t: 0\nsiblings\t: %ld\ncore id\t\t: %d\ncpu cores\t: %ld\n"
             "apicid\t\t: %d\ninitial apicid\t: %d\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 4\nwp\t\t: yes\nflags\t\t: %s\n"
-            "bogomips\t: 4000.00\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 40 bits physical, 48 bits virtual\npower management:\n\n",
+            "bogomips\t: " PEMU_BOGO_STR "\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 40 bits physical, 48 bits virtual\npower management:\n\n",
             i, n, i, n, i, i, cpuinfo_flags);
     int cloexec = (hostflags & O_CLOEXEC) != 0; long fd = -1;
 #ifdef SYS_memfd_create
@@ -1860,8 +1867,13 @@ static void cpuid(CPU*c) {
         };
         if (sub < 4) { a = e[sub][0]; b = e[sub][1]; cc = e[sub][2]; d = e[sub][3]; }
     }
-    else if (leaf == 0x80000000u) { a = 0x80000001u; }
+    else if (leaf == 0x80000000u) { a = 0x80000008u; }
     else if (leaf == 0x80000001u) { cc = 1; d = (1 << 11) | (1 << 20) | (1 << 29); }
+    else if (leaf >= 0x80000002u && leaf <= 0x80000004u) {                              /* processor brand string, 16 bytes per leaf */
+        char br[48] = PEMU_BRAND; u32 w[4]; memcpy(w, br + 16 * (leaf - 0x80000002u), 16);
+        a = w[0]; b = w[1]; cc = w[2]; d = w[3]; }
+    else if (leaf == 0x80000006u) { cc = 0x01006040u; }                                 /* L2: 256 KB, 8-way, 64-byte lines (as leaf 4) */
+    else if (leaf == 0x80000008u) { a = 0x00003028u; }                                  /* 40 bits physical, 48 virtual (as /proc/cpuinfo) */
     c->r[RAX] = a; c->r[RBX] = b; c->r[RCX] = cc; c->r[RDX] = d;
 }
 
@@ -2488,10 +2500,15 @@ static void g_ldx(int rt, int n, int sz2, int sx, int dsz, int rex) {   /* low s
 }
 static void j_pin_spill(void) { if (g_jpin) { a_stp(19, 20, RCPU, (int) OFF_R(0)); a_stp(21, 22, RCPU, (int) OFF_R(2)); a_stp(23, 24, RCPU, (int) OFF_R(4)); a_stp(25, 29, RCPU, (int) OFF_R(6)); } }
 static void j_pin_fill(void)  { if (g_jpin) { a_ldp(19, 20, RCPU, (int) OFF_R(0)); a_ldp(21, 22, RCPU, (int) OFF_R(2)); a_ldp(23, 24, RCPU, (int) OFF_R(4)); a_ldp(25, 29, RCPU, (int) OFF_R(6)); } }
-/* x86 memory ordering for guests with more than one thread (g_jmt): loads are followed by a load barrier, stores are
- * preceded by a full barrier (only store->load reordering is allowed on x86). Single-threaded guests pay nothing. */
+/* x86 memory ordering (TSO) for guests with more than one thread (g_jmt): every load is followed by dmb ishld and every
+ * store is preceded by dmb ishst. ishld orders the load before all later loads AND stores (load->load, load->store);
+ * ishst orders all earlier stores before the store (store->store). Only store->load may be reordered, as on x86. A full
+ * dmb ish before each store is not needed: it would only add the load->store order that ishld already gives, and it is
+ * much more expensive. Every translated load goes through a_dmb_ld, so no load escapes the argument.
+ * (ldar/stlr would be cheaper still, but they fault on unaligned addresses, which x86 guests use freely.)
+ * Single-threaded guests pay nothing. */
 static void a_dmb_ld(void) { if (g_jmt) E(0xD50339BFu); }               /* dmb ishld */
-static void a_dmb_st(void) { if (g_jmt) E(0xD5033BBFu); }               /* dmb ish */
+static void a_dmb_st(void) { if (g_jmt) E(0xD5033ABFu); }               /* dmb ishst */
 static void m_ld(int sz, int sgn, int sf, int rt, int rn, int off) {      /* guest memory, [rn + off], off in -256..255 */
     int size = sz == 1 ? 0 : sz == 2 ? 1 : sz == 4 ? 2 : 3;
     a_ldst_s(size, !sgn ? 1 : (sf ? 2 : 3), rt, rn, off); a_dmb_ld();

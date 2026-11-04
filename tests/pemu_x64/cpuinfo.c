@@ -24,10 +24,23 @@ static int consistent(const char*t) {
     for (unsigned i = 0; i < sizeof f / sizeof f[0]; i++) if (has_flag(t, f[i].n) != f[i].v) { printf("MISMATCH %s: cpuid %d cpuinfo %d\n", f[i].n, f[i].v, has_flag(t, f[i].n)); ok = 0; }
     return ok;
 }
+/* The brand string of cpuid leaves 0x80000002-4 and the "model name" line must be the same text (Linux derives one from the other). */
+static int brand_matches(const char*t) {
+    unsigned a, b, c, d; char br[49] = {0};
+    if (__get_cpuid_max(0x80000000u, 0) < 0x80000004u) return 0;
+    for (unsigned l = 0; l < 3; l++) { __cpuid(0x80000002u + l, a, b, c, d); memcpy(br + 16 * l, &a, 4); memcpy(br + 16 * l + 4, &b, 4); memcpy(br + 16 * l + 8, &c, 4); memcpy(br + 16 * l + 12, &d, 4); }
+    const char*m = strstr(t, "model name"); if (!m) return 0;
+    m = strchr(m, ':'); if (!m) return 0;
+    for (m++; *m == ' ' || *m == '\t'; m++) ;
+    const char*e = strchr(m, '\n'); if (!e) return 0;
+    const char*q = br; while (*q == ' ') q++;
+    return (size_t)(e - m) == strlen(q) && !strncmp(m, q, (size_t)(e - m));
+}
 int main(void) {
     int fd = open("/proc/cpuinfo", O_RDONLY); if (fd < 0) { puts("open failed"); return 1; }
     char*t = slurp(fd);
     printf("flags consistent with cpuid: %s\n", consistent(t) ? "yes" : "NO");
+    printf("brand string matches model name: %s\n", brand_matches(t) ? "yes" : "NO");
     int np = 0; for (const char*p = t; (p = strstr(p, "processor")); p++) np++;
     printf("processors listed: %s\n", np >= 1 ? ">=1" : "none");
     lseek(fd, 0, SEEK_SET); char*t2 = slurp(fd); printf("seek and reread: %s\n", !strcmp(t, t2) ? "same" : "DIFFERENT");
