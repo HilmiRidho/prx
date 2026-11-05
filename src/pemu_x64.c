@@ -2139,6 +2139,17 @@ static void step(CPU*c) {
     case 0x88: case 0x89: { int sz = op & 1 ? opsz : 1; modrm(c, &in, &m, 0); wrm(c, &in, &m, sz, getr(c, m.reg, sz, in.rex)); break; }
     case 0x8A: case 0x8B: { int sz = op & 1 ? opsz : 1; modrm(c, &in, &m, 0); setr(c, m.reg, sz, in.rex, rdm(c, &in, &m, sz)); break; }
     case 0x8D: { in.seg = 0; modrm(c, &in, &m, 0); if (!m.ismem) goto bad; setr(c, m.reg, opsz, in.rex, m.ea); break; }
+    case 0x8C: {                                    /* mov r/m16, Sreg: the selectors a Linux x86_64 user process sees (Wine reads them at startup) */
+        static const u16 sel[6] = { 0 /*es*/, 0x33 /*cs*/, 0x2b /*ss*/, 0 /*ds*/, 0 /*fs*/, 0 /*gs*/ };
+        modrm(c, &in, &m, 0);
+        int sr = m.reg & 7; if (sr > 5) goto bad;
+        wrm(c, &in, &m, m.ismem ? 2 : opsz, sel[sr]);   /* a register destination is zero-extended to the operand size */
+        break; }
+    case 0x8E: {                                    /* mov Sreg, r/m16: flat model, so loading es/ss/ds/fs/gs is accepted and ignored (fs/gs bases come from arch_prctl) */
+        modrm(c, &in, &m, 0);
+        int sr = m.reg & 7; if (sr == 1 || sr > 5) goto bad;      /* cs cannot be loaded */
+        (void) rdm(c, &in, &m, 2);
+        break; }
     case 0x8F: { modrm(c, &in, &m, 0); u64 v = pop(c); if (m.ismem && (m.rm == RSP)) {} wrm(c, &in, &m, 8, v); break; }
     case 0x90:
         if (rexB) { u64 t = c->r[8]; c->r[8] = c->r[RAX]; c->r[RAX] = t; }

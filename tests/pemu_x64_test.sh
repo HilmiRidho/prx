@@ -46,5 +46,6 @@ ARGS="" run winelike 0 -O1 -static "$D/winelike.c"
 ARGS="" run sys3 0 -O1 -static "$D/sys3.c"
 ARGS="" run clone3 0 -O1 -static "$D/clone3.c"
 ARGS="" run execveat 0 -O1 -static "$D/execveat.c"
+ARGS="" run seg 0 -O1 -static "$D/seg.c"
 [ $fail = 0 ] && echo "RESULT PASS" || echo "RESULT FAIL"
 exit $fail

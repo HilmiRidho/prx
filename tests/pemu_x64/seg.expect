@@ -1,0 +1,3 @@
+es=0 cs=33 ss=2b ds=0 fs=0 gs=0
+rax=33 eax=33 ax=ffffffffffff0033
+after load ds=0
