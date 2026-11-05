@@ -2239,6 +2239,11 @@ static void step(CPU*c) {
         wrm(c, &in, &m, sz, imm); break; }
     case 0xC9: c->r[RSP] = c->r[RBP]; c->r[RBP] = pop(c); break;
     case 0xCC: c->rip = (u64) in.ip; raise(SIGTRAP); return;
+    case 0xCF: {                                     /* iretq (REX.W): Wine's syscall dispatcher returns to user code this way. Flat user-mode model: cs/ss are popped and ignored */
+        if (opsz != 8) goto bad;
+        u64 nip = pop(c); (void) pop(c); u64 fl = pop(c); u64 nsp = pop(c); (void) pop(c);
+        RF(c) = (fl & (CF_ | PF_ | AF_ | ZF_ | SF_ | DF_ | OF_)) | 0x202;
+        c->r[RSP] = nsp; c->rip = nip; return; }
     case 0xE8: { s32 rel = imm32(&in); push(c, (u64) in.ip); c->rip = (u64) in.ip + (u64)(s64) rel; return; }
     case 0xE9: { s32 rel = imm32(&in); c->rip = (u64) in.ip + (u64)(s64) rel; return; }
     case 0xEB: { s8 rel = (s8) *in.ip++; c->rip = (u64) in.ip + (u64)(s64) rel; return; }
@@ -2882,7 +2887,7 @@ static const u8 *jfb_end(const u8 *p, int p66, int rexw, int *neutral, int *term
     case 0xB0: case 0xB1: case 0xB2: case 0xB3: case 0xB4: case 0xB5: case 0xB6: case 0xB7: return p + 1;
     case 0xB8: case 0xB9: case 0xBA: case 0xBB: case 0xBC: case 0xBD: case 0xBE: case 0xBF: return p + (rexw ? 8 : p66 ? 2 : 4);
     case 0xC2: *term = 1; return p + 2;
-    case 0xC3: case 0xCC: case 0xE4: case 0xE5: case 0xE6: case 0xE7: case 0xEC: case 0xED: case 0xEE: case 0xEF:
+    case 0xC3: case 0xCC: case 0xCF: case 0xE4: case 0xE5: case 0xE6: case 0xE7: case 0xEC: case 0xED: case 0xEE: case 0xEF:
     case 0xF4: case 0xFA: case 0xFB: *term = 1; return p;
     case 0xE8: case 0xE9: *term = 1; return p + 4;
     case 0xF6: case 0xF7: { int ext = (*p >> 3) & 7; const u8 *e = jmodrm_skip(p); if (ext < 2) e += op == 0xF6 ? 1 : zi; return e; }
