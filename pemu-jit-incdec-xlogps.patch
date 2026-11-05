@@ -1,0 +1,198 @@
+diff -ruN -x '*.orig' orig/prx-main/src/pemu_x64.c prx/prx-main/src/pemu_x64.c
+--- orig/prx-main/src/pemu_x64.c	2026-11-06 03:33:28.000000000 +0700
++++ prx/prx-main/src/pemu_x64.c	2026-11-06 03:44:14.413640321 +0700
+@@ -132,7 +132,7 @@
+ 
+ /* ---- lazy flags: add/sub/logic only record their operands; CF/OF/AF/ZF/SF/PF are computed when somebody reads them.
+  * RF(c) is an lvalue that first materialises any pending flags, so every other use of the flags stays unchanged. */
+-enum { LZ_NONE, LZ_ADD, LZ_SUB, LZ_LOGIC, LZ_SHL, LZ_SHR, LZ_SAR, LZ_FCMP };   /* LZ_SH*: la = value, lb = count (1..bits-1), lr = result (only recorded by the JIT); LZ_FCMP: la, lb = the two operands of comiss/comisd (bit patterns, lsz 4 or 8), only recorded by the JIT */
++enum { LZ_NONE, LZ_ADD, LZ_SUB, LZ_LOGIC, LZ_SHL, LZ_SHR, LZ_SAR, LZ_FCMP, LZ_INC, LZ_DEC };   /* LZ_INC/LZ_DEC (JIT only): la = operand, lb = the CF that inc/dec leave unchanged (0 or 1), lr = result; LZ_SH*: la = value, lb = count (1..bits-1), lr = result (only recorded by the JIT); LZ_FCMP: la, lb = the two operands of comiss/comisd (bit patterns, lsz 4 or 8), only recorded by the JIT */
+ static const u8 g_par[256] = {
+ #define PT2(n) n, n ^ 1, n ^ 1, n
+ #define PT4(n) PT2(n), PT2(n ^ 1), PT2(n ^ 1), PT2(n)
+@@ -173,6 +173,16 @@
+     case LZ_SAR:
+         if ((u64)(sx(a, sz) >> (b - 1)) & 1) f |= CF_;
+         break;
++    case LZ_INC:
++        if (b) f |= CF_;
++        if (r == 1ULL << sb) f |= OF_;
++        if ((a ^ 1 ^ r) & 0x10) f |= AF_;
++        break;
++    case LZ_DEC:
++        if (b) f |= CF_;
++        if (a == 1ULL << sb) f |= OF_;
++        if ((a ^ 1 ^ r) & 0x10) f |= AF_;
++        break;
+     default: break;
+     }
+     (void) m;
+@@ -3071,10 +3081,10 @@
+         break; }
+     case 0xFE: case 0xFF: {
+         int ext = (*p >> 3) & 7;
+-        if (ext < 2) {                                   /* inc / dec: add or sub 1 that leaves CF alone. Translated only when the flags are dead (JO_ALU); with live flags it runs in the interpreter, as before */
++        if (ext < 2) {                                   /* inc / dec: add or sub 1 that leaves CF alone (JO_ALU; with live flags see the incdec case there) */
+             jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
+             j->op = JO_ALU; j->t = ext ? 5 : 0; j->sz = op == 0xFE ? 1 : (u8) opsz; SETRM(m, 0);
+-            j->bt = OT_IMM; j->imm = 1; j->incdec = 1; j->fr = j->fw = 1; j->len = (u8)(p - s); return 1;
++            j->bt = OT_IMM; j->imm = 1; j->incdec = 1; j->len = (u8)(p - s); return 1;   /* no fr/fw: CF passes through, so the flags are live before it exactly when they are live after it */
+         }
+         if (op == 0xFE || (ext != 2 && ext != 4)) FB();
+         jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
+@@ -3133,6 +3143,11 @@
+             jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
+             j->op = JO_XLOG; j->t = o2 == 0xEF ? 0 : o2 == 0xEB ? 1 : o2 == 0xDB ? 2 : 3;
+             j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break;
++        case 0x54: case 0x55: case 0x56: case 0x57:          /* andps/andnps/orps/xorps and the pd forms: the same bit operations as pand/pandn/por/pxor */
++            if (pf3 || pf2) FB();
++            jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
++            j->op = JO_XLOG; j->t = o2 == 0x57 ? 0 : o2 == 0x56 ? 1 : o2 == 0x54 ? 2 : 3;
++            j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break;
+         case 0xFC: case 0xFD: case 0xFE: case 0xD4: case 0xF8: case 0xF9: case 0xFA: case 0xFB: case 0x74: case 0x75: case 0x76:
+             if (!(p66 && !pf3 && !pf2)) FB();
+             jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
+@@ -3241,6 +3256,7 @@
+ /* condition helper: after an interpreter fallback the flags live in memory, so jcc/setcc/cmov evaluate them with this
+  * cheap call (it reads only the flags: no register spill/fill, no instruction decode) instead of interpreting. */
+ static u64 jh_cc(CPU *c, u64 cc) { return (u64) cond(c, (int) cc); }
++static u64 jh_cf(CPU *c) { return (u64)(RF(c) & CF_ ? 1 : 0); }
+ static void j_cc_helper(int cc) { a_mov(0, RCPU); a_movi(1, (u64) cc); j_callabs((void*) jh_cc); fl.nz = 0; fl.pend = 0; }   /* x0 = 0 or 1 */
+ 
+ static void fl_spill(void) {
+@@ -3257,11 +3273,12 @@
+     static const s8 sub_t[16] = { 6, 7, 3, 2, 0, 1, 9, 8, 4, 5, -1, -1, 11, 10, 13, 12 };
+     static const s8 add_t[16] = { 6, 7, 2, 3, 0, 1, -1, -1, 4, 5, -1, -1, 11, 10, 13, 12 };
+     static const s8 log_t[16] = { -2, -3, -2, -3, 0, 1, 0, 1, 4, 5, -1, -1, 11, 10, 13, 12 };
++    static const s8 id_t[16] = { 6, 7, -1, -1, 0, 1, -1, -1, 4, 5, -1, -1, 11, 10, 13, 12 };   /* after inc/dec: CF is the old one, the rest come from adds/subs #1 */
+     static const s8 sh_t[16] = { -1, -1, -1, -1, 0, 1, -1, -1, 4, 5, -1, -1, -1, -1, -1, -1 };   /* after shl/shr/sar only e/ne/s/ns come from the host flags */
+     /* after comis*: CF = below or unordered, ZF = equal or unordered, PF = unordered, OF = SF = 0. fcmp leaves unordered V=1 N=0 Z=0 C=1, equal Z=1 C=1, less N=1,
+      * greater C=1: below = lt, ae = ge, be = le, a = gt, p = vs, np = vc. e/ne/le/g also need the unordered case of ZF: not one A64 condition. */
+     static const s8 fc_t[16] = { -2, -3, 11, 10, -1, -1, 13, 12, -2, -3, 6, 7, -2, -3, -1, -1 };
+-    int v = fl.kind == LZ_FCMP ? fc_t[x86cc] : fl.kind == LZ_SUB ? sub_t[x86cc] : fl.kind == LZ_ADD ? add_t[x86cc] : fl.kind >= LZ_SHL ? sh_t[x86cc] : log_t[x86cc];
++    int v = fl.kind == LZ_FCMP ? fc_t[x86cc] : fl.kind == LZ_SUB ? sub_t[x86cc] : fl.kind == LZ_ADD ? add_t[x86cc] : fl.kind >= LZ_INC ? id_t[x86cc] : fl.kind >= LZ_SHL ? sh_t[x86cc] : log_t[x86cc];
+     if (v == -2) return 2;
+     if (v == -3) return 1;
+     if (v < 0) return -1;
+@@ -3471,7 +3488,23 @@
+         break;
+     case JO_ALU: {
+         int nf = j->lva;
+-        if (j->incdec && nf) { fl_flush(j->lvb); j_fb(j); break; }   /* inc/dec with live flags: CF must pass through, the interpreter knows how */
++        if (j->incdec && nf) {                                       /* inc/dec with live flags: CF passes through. x8 = the CF of the flags so far; the new state is kind INC/DEC with lb = that CF */
++            if (fl.nz && (fl.kind == LZ_ADD || fl.kind == LZ_SUB || fl.kind == LZ_LOGIC || fl.kind == LZ_INC || fl.kind == LZ_DEC)) {
++                if (fl.kind == LZ_ADD) a_cset(8, 2);                 /* carry set: hs */
++                else if (fl.kind == LZ_SUB) a_cset(8, 3);            /* x86 CF is the borrow: lo */
++                else if (fl.kind == LZ_LOGIC) a_movi(8, 0);
++                else a_mov(8, 10);
++            } else { fl_flush(1); a_mov(0, RCPU); j_callabs((void*) jh_cf); a_mov(8, 0); }      /* flags in memory (or shift/comis state): helper */
++            if (hm) fl_flush(1);                                     /* the access below can fault: the old flags must be in memory then */
++            fl.nz = 0; fl.pend = 0;
++            if (hm) j_ea(j, &rb, &off);
++            j_opld(9, j, 0, sz, rb, off); a_movi(10, 1);
++            alu_core(j->t ? 5 : 0, sz, 1);
++            a_mov(10, 8);
++            fl.kind = j->t ? LZ_DEC : LZ_INC;
++            j_opst(11, j, sz, rb, off);
++            break;
++        }
+         fl_flush(j->lvb); fl.nz = 0;
+         if (hm) j_ea(j, &rb, &off);
+         j_opld(9, j, 0, sz, rb, off); j_opld(10, j, 1, sz, rb, off);
+diff -ruN -x '*.orig' orig/prx-main/tests/pemu_x64/jitincdec.c prx/prx-main/tests/pemu_x64/jitincdec.c
+--- orig/prx-main/tests/pemu_x64/jitincdec.c	2026-11-06 03:33:28.000000000 +0700
++++ prx/prx-main/tests/pemu_x64/jitincdec.c	2026-11-06 03:43:23.384663187 +0700
+@@ -41,6 +41,30 @@
+     LIVE_REG(ins, b, b, pre); LIVE_REG(ins, w, w, pre); LIVE_REG(ins, l, k, pre); LIVE_REG(ins, q, q, pre); \
+     LIVE_MEM(ins, b, u8, pre); LIVE_MEM(ins, w, u16, pre); LIVE_MEM(ins, l, u32, pre); LIVE_MEM(ins, q, u64, pre)
+ 
++
++/* inc/dec right after a flag producer in the same block, all flags read after: CF must be the producer's CF */
++#define PRODUCED(pre, ins, sfx, m, T) do { u64 x = edge(i), y = rnd(), z = edge((i * 7 + 3) % 25); u8 f[10]; \
++    __asm__ volatile(pre "\n\t" ins #sfx " %" #m "0\n\t" \
++        "setc %1\n\t" "setz %2\n\t" "seto %3\n\t" "sets %4\n\t" "setp %5\n\t" "setl %6\n\t" "setbe %7\n\t" "setg %8\n\t" "setb %9" \
++        : "+q"(x), "=q"(f[0]), "=q"(f[1]), "=q"(f[2]), "=q"(f[3]), "=q"(f[4]), "=q"(f[5]), "=q"(f[6]), "=q"(f[7]), "=q"(f[8]), "+r"(y) : "r"(z) : "cc"); \
++    mix(x); for (int k = 0; k < 9; k++) mix(f[k]); } while (0)
++#define PRODUCED_JCC(pre, ins, sfx, m, cc) do { u64 x = edge(i), y = rnd(), z = edge((i * 7 + 3) % 25); u64 r = 0; \
++    __asm__ volatile(pre "\n\t" ins #sfx " %" #m "1\n\t" "j" #cc " 1f\n\t" "leal 1(%k0), %k0\n\t" "1:" \
++        : "+r"(r), "+q"(x), "+r"(y) : "r"(z) : "cc"); \
++    mix(x); mix(r); } while (0)
++/* every condition code right after inc/dec, so each one is decided from the lazy flags of the previous instruction */
++#define ALLCC(pre, ins, sfx, m) \
++    PRODUCED_JCC(pre, ins, sfx, m, o); PRODUCED_JCC(pre, ins, sfx, m, no); PRODUCED_JCC(pre, ins, sfx, m, b); PRODUCED_JCC(pre, ins, sfx, m, ae); \
++    PRODUCED_JCC(pre, ins, sfx, m, e); PRODUCED_JCC(pre, ins, sfx, m, ne); PRODUCED_JCC(pre, ins, sfx, m, be); PRODUCED_JCC(pre, ins, sfx, m, a); \
++    PRODUCED_JCC(pre, ins, sfx, m, s); PRODUCED_JCC(pre, ins, sfx, m, ns); PRODUCED_JCC(pre, ins, sfx, m, p); PRODUCED_JCC(pre, ins, sfx, m, np); \
++    PRODUCED_JCC(pre, ins, sfx, m, l); PRODUCED_JCC(pre, ins, sfx, m, ge); PRODUCED_JCC(pre, ins, sfx, m, le); PRODUCED_JCC(pre, ins, sfx, m, g)
++#define PRODUCERS(ins, sfx, m, kz) \
++    PRODUCED("add %" #kz "11, %" #kz "10", ins, sfx, m, 0); PRODUCED("sub %" #kz "11, %" #kz "10", ins, sfx, m, 0); \
++    PRODUCED("and %" #kz "11, %" #kz "10", ins, sfx, m, 0); PRODUCED("cmp %" #kz "11, %" #kz "10", ins, sfx, m, 0); \
++    PRODUCED("shr $1, %" #kz "10", ins, sfx, m, 0); PRODUCED("xor %" #kz "11, %" #kz "10", ins, sfx, m, 0); \
++    PRODUCED("add $1, %" #kz "10\n\tinc %" #kz "10", ins, sfx, m, 0); PRODUCED("sub $1, %" #kz "10\n\tdec %" #kz "10", ins, sfx, m, 0); \
++    ALLCC("add %" #kz "3, %" #kz "2", ins, sfx, m); ALLCC("sub %" #kz "3, %" #kz "2", ins, sfx, m); ALLCC("and %" #kz "3, %" #kz "2", ins, sfx, m)
++
+ int main(void) {
+     for (int i = 0; i < 3000; i++) { ALL_DEAD("inc"); ALL_DEAD("dec"); }
+     printf("incdec dead %016llx\n", (unsigned long long) sum);
+@@ -49,6 +73,13 @@
+     printf("incdec live %016llx\n", (unsigned long long) sum);
+ 
+     sum = 0;
++    for (int i = 0; i < 2000; i++) {
++        PRODUCERS("inc", b, b, b); PRODUCERS("inc", w, w, w); PRODUCERS("inc", l, k, k); PRODUCERS("inc", q, q, q);
++        PRODUCERS("dec", b, b, b); PRODUCERS("dec", w, w, w); PRODUCERS("dec", l, k, k); PRODUCERS("dec", q, q, q);
++    }
++    printf("incdec after producer %016llx\n", (unsigned long long) sum);
++
++    sum = 0;
+     for (int i = 0; i < 3000; i++) {
+         u64 s = edge(i % 25), d = rnd(), r;
+         static volatile u8 b8[8]; b8[0] = (u8) s;
+diff -ruN -x '*.orig' orig/prx-main/tests/pemu_x64/jitincdec.expect prx/prx-main/tests/pemu_x64/jitincdec.expect
+--- orig/prx-main/tests/pemu_x64/jitincdec.expect	2026-11-06 03:33:28.000000000 +0700
++++ prx/prx-main/tests/pemu_x64/jitincdec.expect	2026-11-06 03:44:14.512998462 +0700
+@@ -1,3 +1,4 @@
+ incdec dead d894021737f9ad14
+ incdec live cdefe298b14f5487
+-movx16 6de16615369bd607
++incdec after producer 2ec9250c6296709a
++movx16 7f27c826840d47cd
+diff -ruN -x '*.orig' orig/prx-main/tests/pemu_x64/jitxlogps.c prx/prx-main/tests/pemu_x64/jitxlogps.c
+--- orig/prx-main/tests/pemu_x64/jitxlogps.c	1970-01-01 07:00:00.000000000 +0700
++++ prx/prx-main/tests/pemu_x64/jitxlogps.c	2026-11-06 03:44:14.418482158 +0700
+@@ -0,0 +1,20 @@
++/* JIT: andps/andnps/orps/xorps and the pd forms, register and memory operands, in a loop so the blocks get translated. */
++#include <stdio.h>
++#include <stdint.h>
++#include <string.h>
++typedef uint64_t u64;
++static u64 seed = 0x2545F4914F6CDD1DULL;
++static inline __attribute__((always_inline)) u64 rnd(void) { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; return seed; }
++static u64 sum;
++static inline __attribute__((always_inline)) void mix(u64 v) { sum = sum * 1000003ULL + v; sum ^= sum >> 29; }
++typedef struct { u64 q[2]; } v128 __attribute__((aligned(16)));
++#define OP(ins) do { v128 a, b, c; a.q[0] = rnd(); a.q[1] = rnd(); b.q[0] = rnd(); b.q[1] = rnd(); c = a; \
++    __asm__ volatile("movups %1, %%xmm0\n\tmovups %2, %%xmm1\n\t" ins " %%xmm1, %%xmm0\n\tmovups %%xmm0, %0" : "=m"(c) : "m"(a), "m"(b) : "xmm0", "xmm1"); \
++    mix(c.q[0]); mix(c.q[1]); \
++    __asm__ volatile("movups %1, %%xmm0\n\t" ins " %2, %%xmm0\n\tmovups %%xmm0, %0" : "=m"(c) : "m"(a), "m"(b) : "xmm0"); \
++    mix(c.q[0]); mix(c.q[1]); } while (0)
++int main(void) {
++    for (int i = 0; i < 2000; i++) { OP("andps"); OP("andnps"); OP("orps"); OP("xorps"); OP("andpd"); OP("andnpd"); OP("orpd"); OP("xorpd"); }
++    printf("xlogps %016llx\n", (unsigned long long) sum);
++    return 0;
++}
+diff -ruN -x '*.orig' orig/prx-main/tests/pemu_x64/jitxlogps.expect prx/prx-main/tests/pemu_x64/jitxlogps.expect
+--- orig/prx-main/tests/pemu_x64/jitxlogps.expect	1970-01-01 07:00:00.000000000 +0700
++++ prx/prx-main/tests/pemu_x64/jitxlogps.expect	2026-11-06 03:44:14.498344500 +0700
+@@ -0,0 +1 @@
++xlogps 07cae59847d9adac
+diff -ruN -x '*.orig' orig/prx-main/tests/pemu_x64_test.sh prx/prx-main/tests/pemu_x64_test.sh
+--- orig/prx-main/tests/pemu_x64_test.sh	2026-11-06 03:33:28.000000000 +0700
++++ prx/prx-main/tests/pemu_x64_test.sh	2026-11-06 03:44:14.518852503 +0700
+@@ -34,6 +34,7 @@
+ ARGS="" run jitopt 0 -O1 -static -pthread "$D/jitopt.c"
+ ARGS="" run jitint 0 -O1 -static "$D/jitint.c"
+ ARGS="" run jitincdec 0 -O1 -static "$D/jitincdec.c"
++ARGS="" run jitxlogps 0 -O1 -static "$D/jitxlogps.c"
+ ARGS="" run jitfp 0 -O1 -static "$D/jitfp.c" -lm
+ ARGS="" run mmx 0 -O1 -static "$D/mmx.c"
+ ARGS="" run sse42 0 -O1 -static -msse4.2 -mcx16 -pthread "$D/sse42.c"
