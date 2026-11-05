@@ -2789,6 +2789,11 @@ static void q_v3(int kind, int size, int vd, int vn, int vm) {          /* vd = 
         0x4E003800u, 0x4E007800u };                                              /* 14 zip1 (punpckl*) 15 zip2 (punpckh*) */
     E(base[kind] | (u32) size << 22 | (u32) vm << 16 | (u32) vn << 5 | (u32) vd);
 }
+static void q_shi(int kind, int esz, int vd, int vn, int n) {            /* 16b vector shift by immediate; kind 2 = srl (ushr), 4 = sra (sshr), 6 = sll (shl); esz = lane bits; 1 <= n < esz (sra: n <= esz - 1) */
+    u32 sh = kind == 6 ? (u32)(esz + n) : (u32)(2 * esz - n);
+    E((kind == 2 ? 0x6F000400u : kind == 4 ? 0x4F000400u : 0x4F005400u) | sh << 16 | (u32) vn << 5 | (u32) vd);
+}
+static void q_ins4s(int vd, int di, int vn, int si) { E(0x6E040400u | (u32)((di << 3) | 4) << 16 | (u32)(si << 2) << 11 | (u32) vn << 5 | (u32) vd); }   /* mov vd.s[di], vn.s[si] */
 static void q_dup4s(int vd, int vn, int lane) { E(0x4E040400u | (u32)(lane << 3) << 16 | (u32) vn << 5 | (u32) vd); }   /* dup vd.4s, vn.s[lane] */
 /* scalar float: sz 8 = double (d regs), 4 = single (s regs). Loads/stores touch only the low sz bytes of the xmm slot. */
 static void f_ldc(int sz, int vt, u32 off) { E((sz == 8 ? 0xFD400000u : 0xBD400000u) | ((off >> (sz == 8 ? 3 : 2)) & 0xfff) << 10 | (u32) RCPU << 5 | (u32) vt); }   /* ldr dt/st, [cpu, #off] */
@@ -2860,7 +2865,7 @@ static void jit_note_rwx(u64 start, u64 len) {                  /* jmu held */
 /* ------------------------------------------------------------ decoder (static, no guest state) */
 enum { OT_NONE, OT_REG, OT_MEM, OT_IMM };
 enum { JO_FB, JO_FBT, JO_NOP, JO_MOV, JO_MOVX, JO_LEA, JO_PUSH, JO_POP, JO_ALU, JO_NOT, JO_NEG, JO_SHIFT, JO_IMUL,
-       JO_SETCC, JO_CMOV, JO_CWDE, JO_CDQ, JO_LEAVE, JO_XLD, JO_XST, JO_XLOG, JO_XMOVDLD, JO_XMOVDST, JO_XVEC, JO_PMOVMSKB, JO_XSHI, JO_FMOV, JO_FARITH, JO_CVTSI2F, JO_FCMP, JO_DIV, JO_XDUP, JO_BSF, JO_MUL1, JO_BSWAP, JO_JMP, JO_JCC, JO_CALL, JO_RET, JO_JMPI, JO_CALLI };
+       JO_SETCC, JO_CMOV, JO_CWDE, JO_CDQ, JO_LEAVE, JO_XLD, JO_XST, JO_XLOG, JO_XMOVDLD, JO_XMOVDST, JO_XVEC, JO_PMOVMSKB, JO_XSHI, JO_FMOV, JO_FARITH, JO_CVTSI2F, JO_FCMP, JO_DIV, JO_XDUP, JO_BSF, JO_MUL1, JO_BSWAP, JO_XSHN, JO_XSHUF, JO_JMP, JO_JCC, JO_CALL, JO_RET, JO_JMPI, JO_CALLI };
 typedef struct {
     u64 ip, imm, target; s64 disp;
     u8 len, op, sz, sz2, t, fr, fw, at, bt, ar, br, rex, lva, lvb, scale, seg, sx, cnt, nost, incdec;
@@ -3183,7 +3188,7 @@ static int jdecode(JI *j, u64 ip) {
             if (!(p66 && !pf3 && !pf2)) FB();
             jmodrm(&p, j, &m, 1); if (BADM(m)) FB();
             u8 im = *p++;
-            if (im != 0x00 && im != 0x55 && im != 0xAA && im != 0xFF) FB();
+            if (im != 0x00 && im != 0x55 && im != 0xAA && im != 0xFF) { j->op = JO_XSHUF; j->imm = im; j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break; }
             j->op = JO_XDUP; j->imm = im & 3; j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break; }
         case 0xC8: case 0xC9: case 0xCA: case 0xCB: case 0xCC: case 0xCD: case 0xCE: case 0xCF:
             if (!(g_jopt & JOPT_INT) || opsz == 2 || pf3 || pf2 || lock) FB();
@@ -3195,6 +3200,23 @@ static int jdecode(JI *j, u64 ip) {
             if (!(p66 && !pf3 && !pf2)) FB();
             jmodrm(&p, j, &m, 0); if (m.ismem || lock) FB();
             j->op = JO_PMOVMSKB; j->at = OT_REG; j->ar = (u8) m.reg; j->bt = OT_REG; j->br = (u8) m.rm; break;
+        case 0x71: case 0x72: {                              /* psrlw/psraw/psllw (71) and psrld/psrad/pslld (72) xmm, imm8 */
+            if (!(p66 && !pf3 && !pf2)) FB();
+            jmodrm(&p, j, &m, 1); if (m.ismem || lock) FB();
+            int ext = m.reg & 7; if (ext != 2 && ext != 4 && ext != 6) FB();
+            j->op = JO_XSHN; j->t = (u8) ext; j->sz = (u8)(o2 == 0x71 ? 16 : 32); j->imm = *p++; j->br = (u8) m.rm; break; }
+        case 0x2B: case 0xE7:                                /* movntps/movntpd/movntdq: a plain 16-byte store */
+            if (pf3 || pf2 || (o2 == 0xE7 && !p66)) FB();
+            jmodrm(&p, j, &m, 0); if (BADM(m) || !m.ismem) FB();
+            j->op = JO_XST; SETRM(m, 0); j->bt = OT_REG; j->br = (u8) m.reg; break;
+        case 0xD6:                                           /* movq xmm/m64, xmm: the store form */
+            if (!(p66 && !pf3 && !pf2)) FB();
+            jmodrm(&p, j, &m, 0); if (BADM(m) || !m.ismem) FB();
+            j->op = JO_XMOVDST; j->sz = 8; SETRM(m, 0); j->bt = OT_REG; j->br = (u8) m.reg; break;
+        case 0x67:                                           /* packuswb */
+            if (!(p66 && !pf3 && !pf2)) FB();
+            jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
+            j->op = JO_XVEC; j->t = 16; j->sz = 0; j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break;
         case 0x73: {                                         /* psrlq/psllq/psrldq/pslldq xmm, imm8 */
             if (!(p66 && !pf3 && !pf2)) FB();
             jmodrm(&p, j, &m, 1); if (m.ismem || lock) FB();
@@ -3611,7 +3633,17 @@ static int jemit(const JI *j) {          /* returns 1 when it ended the block (t
     case JO_XVEC:
         if (j->bt == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); q_ldm(1, rb, off); } else q_ldc(1, OFF_X(j->br));
         q_ldc(0, OFF_X(j->ar));
-        q_v3(j->t, j->sz, 0, 0, 1);
+        if (j->t == 16) { E(0x2E212800u | 0u << 5 | 0u); E(0x6E212800u | 1u << 5 | 0u); }       /* packuswb: sqxtun v0.8b, v0.8h; sqxtun2 v0.16b, v1.8h */
+        else q_v3(j->t, j->sz, 0, 0, 1);
+        q_stc(0, OFF_X(j->ar)); break;
+    case JO_XSHN: {                                      /* psrl/psra/psll w|d by an immediate */
+        unsigned n = (unsigned) j->imm; int esz = j->sz;
+        if (n >= (unsigned) esz) { if (j->t == 4) n = (unsigned) esz - 1; else { c_st(31, OFF_X(j->br)); c_st(31, OFF_X(j->br) + 8); break; } }
+        if (n == 0) break;
+        q_ldc(0, OFF_X(j->br)); q_shi(j->t, esz, 0, 0, (int) n); q_stc(0, OFF_X(j->br)); break; }
+    case JO_XSHUF:                                       /* pshufd xmm, xmm/m128, imm8 */
+        if (j->bt == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); q_ldm(1, rb, off); } else q_ldc(1, OFF_X(j->br));
+        for (int k = 0; k < 4; k++) q_ins4s(0, k, 1, (int)((j->imm >> (2 * k)) & 3));
         q_stc(0, OFF_X(j->ar)); break;
     case JO_XDUP:
         if (j->bt == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); q_ldm(1, rb, off); } else q_ldc(1, OFF_X(j->br));

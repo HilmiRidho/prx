@@ -540,6 +540,36 @@ static int simd_insn(CPU*c, u32 i) {
         }
         memcpy(d, t, 16); return 0;
     }
+    if ((i & 0x9F800400) == 0x0F000400 && ((i >> 19) & 15) && (((i >> 11) & 31) == 0 || ((i >> 11) & 31) == 10)) {   /* USHR / SSHR / SHL (vector, immediate) */
+        int u = (i >> 29) & 1, immh = (i >> 19) & 15, sh = (i >> 16) & 127, op = (i >> 11) & 31;
+        int sz = 31 - __builtin_clz((unsigned) immh), esz = 1 << sz, bits = esz * 8;
+        if (sz == 3 && !q) return -1;
+        if (op == 0 || op == 10) {
+            int n = op == 10 ? sh - bits : 2 * bits - sh;
+            u8 *d = (u8*) c->v[rd], *nn = (u8*) c->v[rn], t[16] = {0};
+            for (int k = 0; k < (q ? 16 : 8) / esz; k++) {
+                u64 a = 0, r; memcpy(&a, nn + k * esz, (size_t) esz);
+                if (op == 10) r = a << n;
+                else if (u) r = a >> n;
+                else r = (u64)(((s64)(a << (64 - bits))) >> (64 - bits) >> n);
+                memcpy(t + k * esz, &r, (size_t) esz);
+            }
+            memcpy(d, t, 16); return 0;
+        }
+    }
+    if ((i & 0xBF3FFC00) == 0x2E212800) {                      /* SQXTUN / SQXTUN2: signed lanes narrowed to unsigned half-width with saturation */
+        int sz = (i >> 22) & 3; if (sz == 3) return -1;
+        int esz = 1 << sz, wide = esz * 2, lanes = 8 / esz;
+        u8 *d = (u8*) c->v[rd], *n = (u8*) c->v[rn], t[16] = {0};
+        if (q) memcpy(t, d, 8);
+        for (int k = 0; k < lanes; k++) {
+            u64 a = 0; memcpy(&a, n + k * wide, (size_t) wide);
+            s64 v = wide == 2 ? (s64)(int16_t) a : wide == 4 ? (s64)(int32_t) a : (s64) a;
+            s64 mx = (1LL << (esz * 8)) - 1; u64 r = (u64)(v < 0 ? 0 : v > mx ? mx : v);
+            memcpy(t + (q ? 8 : 0) + k * esz, &r, (size_t) esz);
+        }
+        memcpy(d, t, 16); return 0;
+    }
     if ((i & 0xBF20FC00) == 0x0E003800 || (i & 0xBF20FC00) == 0x0E007800) {   /* ZIP1 / ZIP2 */
         int sz = (i >> 22) & 3, esz = 1 << sz, part = (i >> 14) & 1, lanes = (q ? 16 : 8) / esz, half = lanes / 2;
         if (sz == 3 && !q) return -1;
