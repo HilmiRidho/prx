@@ -1,0 +1,8 @@
+child runs
+fork-style clone3: ok
+thread clone3: ok
+pidfd: ok
+small size EINVAL: ok
+newns EPERM: ok
+clear_sighand EINVAL: ok
+stack without size EINVAL: ok

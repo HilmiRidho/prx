@@ -1,0 +1,9 @@
+child empty
+status 0
+child dirfd
+status 0
+child cwd
+status 0
+enoent ok
+einval ok
+empty without flag ok

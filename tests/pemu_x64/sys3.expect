@@ -1,0 +1,11 @@
+a reg
+bb reg
+ccc reg
+dd dir
+records ok
+ptrace EPERM: ok
+reboot EPERM: ok
+iopl EPERM: ok
+ioperm EPERM: ok
+init_module EPERM: ok
+setfsuid: ok

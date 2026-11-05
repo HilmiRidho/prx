@@ -43,5 +43,8 @@ ARGS="" run uring 0 -O1 -static "$D/uring.c"
 ARGS="" run sse2jit 0 -O1 -static -msse2 "$D/sse2jit.c"
 ARGS="" run cpuinfo 0 -O1 -static "$D/cpuinfo.c"
 ARGS="" run winelike 0 -O1 -static "$D/winelike.c"
+ARGS="" run sys3 0 -O1 -static "$D/sys3.c"
+ARGS="" run clone3 0 -O1 -static "$D/clone3.c"
+ARGS="" run execveat 0 -O1 -static "$D/execveat.c"
 [ $fail = 0 ] && echo "RESULT PASS" || echo "RESULT FAIL"
 exit $fail

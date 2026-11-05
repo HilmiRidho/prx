@@ -620,6 +620,102 @@ static long pass_nr2(u64 n) {
 #ifdef SYS_pidfd_getfd
     P2(438, SYS_pidfd_getfd)
 #endif
+#ifdef SYS_setfsuid
+    P2(122, SYS_setfsuid)
+#endif
+#ifdef SYS_setfsgid
+    P2(123, SYS_setfsgid)
+#endif
+#ifdef SYS_perf_event_open
+    P2(298, SYS_perf_event_open)                  /* perf_event_attr has the same layout on every 64-bit arch; counters measure the emulator */
+#endif
+#ifdef SYS_kcmp
+    P2(312, SYS_kcmp)
+#endif
+#ifdef SYS_bpf
+    P2(321, SYS_bpf)                              /* union bpf_attr is arch independent and guest pointers are host pointers */
+#endif
+#ifdef SYS_io_pgetevents
+    P2(333, SYS_io_pgetevents)
+#endif
+#ifdef SYS_open_tree
+    P2(428, SYS_open_tree)
+#endif
+#ifdef SYS_move_mount
+    P2(429, SYS_move_mount)
+#endif
+#ifdef SYS_fsopen
+    P2(430, SYS_fsopen)
+#endif
+#ifdef SYS_fsconfig
+    P2(431, SYS_fsconfig)
+#endif
+#ifdef SYS_fsmount
+    P2(432, SYS_fsmount)
+#endif
+#ifdef SYS_fspick
+    P2(433, SYS_fspick)
+#endif
+#ifdef SYS_process_madvise
+    P2(440, SYS_process_madvise)
+#endif
+#ifdef SYS_mount_setattr
+    P2(442, SYS_mount_setattr)
+#endif
+#ifdef SYS_quotactl_fd
+    P2(443, SYS_quotactl_fd)
+#endif
+#ifdef SYS_landlock_create_ruleset
+    P2(444, SYS_landlock_create_ruleset)
+#endif
+#ifdef SYS_landlock_add_rule
+    P2(445, SYS_landlock_add_rule)
+#endif
+#ifdef SYS_landlock_restrict_self
+    P2(446, SYS_landlock_restrict_self)
+#endif
+#ifdef SYS_memfd_secret
+    P2(447, SYS_memfd_secret)
+#endif
+#ifdef SYS_process_mrelease
+    P2(448, SYS_process_mrelease)
+#endif
+#ifdef SYS_futex_waitv
+    P2(449, SYS_futex_waitv)
+#endif
+#ifdef SYS_set_mempolicy_home_node
+    P2(450, SYS_set_mempolicy_home_node)
+#endif
+#ifdef SYS_cachestat
+    P2(451, SYS_cachestat)
+#endif
+#ifdef SYS_fchmodat2
+    P2(452, SYS_fchmodat2)
+#endif
+#ifdef SYS_futex_wake
+    P2(454, SYS_futex_wake)
+#endif
+#ifdef SYS_futex_wait
+    P2(455, SYS_futex_wait)
+#endif
+#ifdef SYS_futex_requeue
+    P2(456, SYS_futex_requeue)
+#endif
+#ifdef SYS_statmount
+    P2(457, SYS_statmount)
+#endif
+#ifdef SYS_listmount
+    P2(458, SYS_listmount)
+#endif
+#ifdef SYS_lsm_get_self_attr
+    P2(459, SYS_lsm_get_self_attr)
+#endif
+#ifdef SYS_lsm_set_self_attr
+    P2(460, SYS_lsm_set_self_attr)
+#endif
+#ifdef SYS_lsm_list_modules
+    P2(461, SYS_lsm_list_modules)
+#endif
     default: return -1;
     }
 }
@@ -782,6 +878,96 @@ static long cpuinfo_fd(long hostflags) {
 }
 static int is_cpuinfo(const char*p, long hostflags) { return p && !strcmp(p, "/proc/cpuinfo") && (hostflags & O_ACCMODE) == O_RDONLY; }
 
+/* getdents(2): the host has only getdents64. A struct linux_dirent record has the same length as a linux_dirent64 one (the name
+ * starts one byte earlier and d_type moves to the last byte of the record), so the host buffer is converted in place. */
+static long g_getdents(long fd, u8*buf, long count) {
+    long r = hs(SYS_getdents64, fd, (long) buf, count, 0, 0, 0);
+    for (long off = 0; r > 0 && off < r; ) {
+        u8*p = buf + off; u32 len = *(u16u*)(p + 16); u8 type = p[18];
+        if (len < 24 || off + len > r) break;
+        memmove(p + 18, p + 19, strlen((char*) p + 19) + 1);
+        p[len - 1] = type;
+        off += len;
+    }
+    return r;
+}
+
+/* execveat(dirfd, path, argv, envp, flags) on top of do_execve: a path is needed to tell guest ELF files from host ones */
+static long do_execveat(int dirfd, const char*path, char**argv, char**envp, long flags) {
+    char buf[4096 + 64];
+    if (flags & ~(long)(0x1000 | 0x100)) return -EINVAL;                       /* AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW */
+    if (!path) return -EFAULT;
+    if (!*path) {
+        if (!(flags & 0x1000)) return -ENOENT;
+        if (snprintf(buf, sizeof buf, "/proc/self/fd/%d", dirfd) >= (int) sizeof buf) return -ENAMETOOLONG;
+        path = buf;
+    } else {
+        if (flags & 0x100) {
+            struct stat st;
+            if (hs(SYS_newfstatat, dirfd, (long) path, (long) &st, AT_SYMLINK_NOFOLLOW, 0, 0) == 0 && S_ISLNK(st.st_mode)) return -ELOOP;
+        }
+        if (path[0] != '/' && dirfd != AT_FDCWD) {
+            if (snprintf(buf, sizeof buf, "/proc/self/fd/%d/%s", dirfd, path) >= (int) sizeof buf) return -ENAMETOOLONG;
+            path = buf;
+        }
+    }
+    return do_execve(path, argv, envp);
+}
+
+/* clone / fork / vfork / clone3 for a guest that does not share the address space (CLONE_THREAD goes to clone_thread). isclone: the
+ * stack, tls and tid arguments are meaningful. pidfd: address for CLONE_PIDFD (clone3 only), or 0. */
+static long clone_common(CPU*c, int isclone, u64 flags, u64 stack, u64 ptid, u64 ctid, u64 tls, u64 pidfd, int*noset) {
+    if (flags & 0x10000 /*CLONE_THREAD*/) return clone_thread(c, flags, stack, ptid, ctid, tls);
+#ifdef HAVE_JIT
+    if (g_jit_on) jit_atfork(0);                  /* no other thread may hold the JIT lock across the fork */
+#endif
+    long pid = fork(); int fe = errno;
+#ifdef HAVE_JIT
+    if (g_jit_on) jit_atfork(pid == 0 ? 2 : 1);
+#endif
+    if (pid < 0) return -fe;
+    if (pid == 0) {
+        if (isclone && stack) c->r[RSP] = stack;
+        if (isclone && (flags & 0x01000000)) *(u32*) ctid = (u32) getpid();      /* CHILD_SETTID */
+        if (isclone && (flags & 0x00080000)) c->fs = tls;                         /* SETTLS */
+        c->r[RAX] = 0; *noset = 1;
+    } else {
+        if (isclone && (flags & 0x00100000)) *(u32*) ptid = (u32) pid;           /* PARENT_SETTID */
+        if (pidfd) {
+#ifdef SYS_pidfd_open
+            long fd = hs(SYS_pidfd_open, pid, 0, 0, 0, 0, 0);
+            if (fd < 0) { kill((pid_t) pid, SIGKILL); waitpid((pid_t) pid, NULL, 0); return fd; }
+            *(int*) pidfd = (int) fd;
+#else
+            kill((pid_t) pid, SIGKILL); waitpid((pid_t) pid, NULL, 0); return -ENOSYS;
+#endif
+        }
+    }
+    return pid;
+}
+
+/* clone3(struct clone_args *args, size_t size): translated to the same paths as clone. Things the emulator cannot give are refused
+ * instead of silently ignored: namespaces (EPERM, as for an unprivileged process), set_tid, CLONE_CLEAR_SIGHAND, CLONE_INTO_CGROUP. */
+static long do_clone3(CPU*c, const u8*uargs, u64 size, int*noset) {
+    struct { u64 flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls, set_tid, set_tid_size, cgroup; } ca;
+    if (!uargs) return -EFAULT;
+    if (size < 64 /*CLONE_ARGS_SIZE_VER0*/) return -EINVAL;
+    if (size > 4096) return -E2BIG;
+    memset(&ca, 0, sizeof ca);
+    memcpy(&ca, uargs, size < sizeof ca ? (size_t) size : sizeof ca);
+    for (u64 i = sizeof ca; i < size; i++) if (uargs[i]) return -E2BIG;       /* unknown trailing fields must be zero */
+    if (ca.flags >> 32) return -EINVAL;
+    if (ca.exit_signal > 0xff || ca.set_tid_size) return -EINVAL;
+    if (ca.flags & 0x7e0200a0ULL) return -EPERM;                               /* CLONE_NEW{NS,CGROUP,UTS,IPC,USER,PID,NET,TIME} */
+    if ((ca.stack != 0) != (ca.stack_size != 0)) return -EINVAL;
+    u64 sp = ca.stack ? ca.stack + ca.stack_size : 0;                          /* clone3 passes the lowest address, clone the top */
+    if (ca.flags & 0x10000 /*CLONE_THREAD*/) {
+        if (ca.exit_signal || (ca.flags & 0x1000 /*CLONE_PIDFD*/)) return -EINVAL;
+        return clone_thread(c, ca.flags, sp, ca.parent_tid, ca.child_tid, ca.tls);
+    }
+    return clone_common(c, 1, ca.flags, sp, ca.parent_tid, ca.child_tid, ca.tls, (ca.flags & 0x1000) ? ca.pidfd : 0, noset);
+}
+
 static long gsys(CPU*c, int*noset) {
     u64 n = c->r[RAX], a0 = c->r[RDI], a1 = c->r[RSI], a2 = c->r[RDX], a3 = c->r[10], a4 = c->r[8], a5 = c->r[9];
     long r, nr;
@@ -811,6 +997,10 @@ static long gsys(CPU*c, int*noset) {
         if (is_cpuinfo((const char*) a1, (long) how[0])) return cpuinfo_fd((long) how[0]);
         return hs(SYS_openat2, (long) a0, (long) a1, (long) how, (long) sz, 0, 0); }
 #endif
+    case 78: return g_getdents((long) a0, (u8*) a1, (long) a2);
+    case 101: return -EPERM;                          /* ptrace: the host would trace the emulator (aarch64 registers, no guest view); refused like a container whose seccomp profile blocks it */
+    case 155: case 163: case 167: case 168: case 169: case 172: case 173: case 175: case 176: case 246: case 313: case 320:
+        return -EPERM;                                /* pivot_root, acct, swapon/off, reboot, iopl, ioperm, init/finit/delete_module, kexec_load/kexec_file_load: never act on the host */
     case 4: return g_stat(AT_FDCWD, (const char*) a0, (u8*) a1, 0);
     case 6: return g_stat(AT_FDCWD, (const char*) a0, (u8*) a1, AT_SYMLINK_NOFOLLOW);
     case 262: return g_stat((long) a0, (const char*) a1, (u8*) a2, (long) a3);
@@ -906,25 +1096,10 @@ static long gsys(CPU*c, int*noset) {
     }
     case 213: return hs(SYS_epoll_create1, 0, 0, 0, 0, 0, 0);
     case 284: return hs(SYS_eventfd2, (long) a0, 0, 0, 0, 0, 0);
-    case 56: case 57: case 58: {                      /* clone / fork / vfork */
-        u64 flags = n == 56 ? a0 : SIGCHLD;
-        if (flags & 0x10000 /*CLONE_THREAD*/) return clone_thread(c, flags, a1, a2, a3, a4);
-#ifdef HAVE_JIT
-        if (g_jit_on) jit_atfork(0);                  /* no other thread may hold the JIT lock across the fork */
-#endif
-        long pid = fork(); int fe = errno;
-#ifdef HAVE_JIT
-        if (g_jit_on) jit_atfork(pid == 0 ? 2 : 1);
-#endif
-        if (pid < 0) return -fe;
-        if (pid == 0) {
-            if (n == 56 && a1) c->r[RSP] = a1;
-            if (n == 56 && (flags & 0x01000000)) *(u32*) a3 = (u32) getpid();     /* CHILD_SETTID: ctid */
-            if (n == 56 && (flags & 0x00080000)) c->fs = a4;                        /* SETTLS */
-            c->r[RAX] = 0; *noset = 1;
-        } else if (n == 56 && (flags & 0x00100000)) *(u32*) a2 = (u32) pid;      /* PARENT_SETTID */
-        return pid;
-    }
+    case 56: return clone_common(c, 1, a0, a1, a2, a3, a4, 0, noset);                                      /* clone */
+    case 57: case 58: return clone_common(c, 0, SIGCHLD, 0, 0, 0, 0, 0, noset);                            /* fork / vfork */
+    case 435: return do_clone3(c, (const u8*) a0, a1, noset);
+    case 322: return do_execveat((int) a0, (const char*) a1, (char**) a2, (char**) a3, (long) a4);
     case 59: return do_execve((const char*) a0, (char**) a1, (char**) a2);
     case 9:
         if (a3 & 0x40 /*MAP_32BIT*/ && !a0) return mmap32(a1, a2, a3 & ~0x40UL & ~(u64) MAP_FIXED, a4, a5);
@@ -947,7 +1122,7 @@ static long gsys(CPU*c, int*noset) {
                 return hs(SYS_utimensat, (long) a0, (long) a1, (long) tp, 0, 0, 0); }
     case 253: return hs(SYS_inotify_init1, 0, 0, 0, 0, 0, 0);
     case 282: return hs(SYS_signalfd4, (long) a0, (long) a1, (long) a2, 0, 0, 0);
-    case 322: case 435: case 334: case 317: return -ENOSYS;
+    case 334: case 317: return -ENOSYS;                                                                      /* rseq, seccomp: glibc and others fall back */
     case 425: { long r = hs(425 /*io_uring_setup; same number on x86_64 and aarch64*/, (long) a0, (long) a1, 0, 0, 0, 0);
                 if (r >= 0) mt_barriers();                                                                  /* the kernel now writes the rings behind our back */
                 return r; }
