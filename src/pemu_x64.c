@@ -1105,6 +1105,10 @@ static long gsys(CPU*c, int*noset) {
         free(ev); return r;
     }
     case 213: return hs(SYS_epoll_create1, 0, 0, 0, 0, 0, 0);
+    case 233: {                                       /* epoll_ctl: the x86_64 guest struct is packed (events@0, data@4, 12 bytes); the aarch64 host struct is not (data@8) */
+        struct epoll_event ev, *p = NULL;
+        if (a3) { memset(&ev, 0, sizeof ev); ev.events = *(u32u*) a3; ev.data.u64 = *(u64u*)(a3 + 4); p = &ev; }
+        return hs(SYS_epoll_ctl, (long) a0, (long) a1, (long) a2, (long) p, 0, 0); }
     case 284: return hs(SYS_eventfd2, (long) a0, 0, 0, 0, 0, 0);
     case 56: return clone_common(c, 1, a0 & 0xffffffffULL, a1, a2, a3, a4, 0, noset);                                      /* clone */
     case 57: case 58: return clone_common(c, 0, SIGCHLD, 0, 0, 0, 0, 0, noset);                            /* fork / vfork */
