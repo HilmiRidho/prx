@@ -1,0 +1,168 @@
+diff -ruN -x '*.orig' p1/prx-main/src/pemu.c prx/prx-main/src/pemu.c
+--- p1/prx-main/src/pemu.c	2026-11-06 04:12:26.675177513 +0700
++++ prx/prx-main/src/pemu.c	2026-11-06 04:11:47.230605503 +0700
+@@ -540,6 +540,36 @@
+         }
+         memcpy(d, t, 16); return 0;
+     }
++    if ((i & 0x9F800400) == 0x0F000400 && ((i >> 19) & 15) && (((i >> 11) & 31) == 0 || ((i >> 11) & 31) == 10)) {   /* USHR / SSHR / SHL (vector, immediate) */
++        int u = (i >> 29) & 1, immh = (i >> 19) & 15, sh = (i >> 16) & 127, op = (i >> 11) & 31;
++        int sz = 31 - __builtin_clz((unsigned) immh), esz = 1 << sz, bits = esz * 8;
++        if (sz == 3 && !q) return -1;
++        if (op == 0 || op == 10) {
++            int n = op == 10 ? sh - bits : 2 * bits - sh;
++            u8 *d = (u8*) c->v[rd], *nn = (u8*) c->v[rn], t[16] = {0};
++            for (int k = 0; k < (q ? 16 : 8) / esz; k++) {
++                u64 a = 0, r; memcpy(&a, nn + k * esz, (size_t) esz);
++                if (op == 10) r = a << n;
++                else if (u) r = a >> n;
++                else r = (u64)(((s64)(a << (64 - bits))) >> (64 - bits) >> n);
++                memcpy(t + k * esz, &r, (size_t) esz);
++            }
++            memcpy(d, t, 16); return 0;
++        }
++    }
++    if ((i & 0xBF3FFC00) == 0x2E212800) {                      /* SQXTUN / SQXTUN2: signed lanes narrowed to unsigned half-width with saturation */
++        int sz = (i >> 22) & 3; if (sz == 3) return -1;
++        int esz = 1 << sz, wide = esz * 2, lanes = 8 / esz;
++        u8 *d = (u8*) c->v[rd], *n = (u8*) c->v[rn], t[16] = {0};
++        if (q) memcpy(t, d, 8);
++        for (int k = 0; k < lanes; k++) {
++            u64 a = 0; memcpy(&a, n + k * wide, (size_t) wide);
++            s64 v = wide == 2 ? (s64)(int16_t) a : wide == 4 ? (s64)(int32_t) a : (s64) a;
++            s64 mx = (1LL << (esz * 8)) - 1; u64 r = (u64)(v < 0 ? 0 : v > mx ? mx : v);
++            memcpy(t + (q ? 8 : 0) + k * esz, &r, (size_t) esz);
++        }
++        memcpy(d, t, 16); return 0;
++    }
+     if ((i & 0xBF20FC00) == 0x0E003800 || (i & 0xBF20FC00) == 0x0E007800) {   /* ZIP1 / ZIP2 */
+         int sz = (i >> 22) & 3, esz = 1 << sz, part = (i >> 14) & 1, lanes = (q ? 16 : 8) / esz, half = lanes / 2;
+         if (sz == 3 && !q) return -1;
+diff -ruN -x '*.orig' p1/prx-main/src/pemu_x64.c prx/prx-main/src/pemu_x64.c
+--- p1/prx-main/src/pemu_x64.c	2026-11-06 04:12:26.685682035 +0700
++++ prx/prx-main/src/pemu_x64.c	2026-11-06 04:11:05.726781218 +0700
+@@ -2789,6 +2789,11 @@
+         0x4E003800u, 0x4E007800u };                                              /* 14 zip1 (punpckl*) 15 zip2 (punpckh*) */
+     E(base[kind] | (u32) size << 22 | (u32) vm << 16 | (u32) vn << 5 | (u32) vd);
+ }
++static void q_shi(int kind, int esz, int vd, int vn, int n) {            /* 16b vector shift by immediate; kind 2 = srl (ushr), 4 = sra (sshr), 6 = sll (shl); esz = lane bits; 1 <= n < esz (sra: n <= esz - 1) */
++    u32 sh = kind == 6 ? (u32)(esz + n) : (u32)(2 * esz - n);
++    E((kind == 2 ? 0x6F000400u : kind == 4 ? 0x4F000400u : 0x4F005400u) | sh << 16 | (u32) vn << 5 | (u32) vd);
++}
++static void q_ins4s(int vd, int di, int vn, int si) { E(0x6E040400u | (u32)((di << 3) | 4) << 16 | (u32)(si << 2) << 11 | (u32) vn << 5 | (u32) vd); }   /* mov vd.s[di], vn.s[si] */
+ static void q_dup4s(int vd, int vn, int lane) { E(0x4E040400u | (u32)(lane << 3) << 16 | (u32) vn << 5 | (u32) vd); }   /* dup vd.4s, vn.s[lane] */
+ /* scalar float: sz 8 = double (d regs), 4 = single (s regs). Loads/stores touch only the low sz bytes of the xmm slot. */
+ static void f_ldc(int sz, int vt, u32 off) { E((sz == 8 ? 0xFD400000u : 0xBD400000u) | ((off >> (sz == 8 ? 3 : 2)) & 0xfff) << 10 | (u32) RCPU << 5 | (u32) vt); }   /* ldr dt/st, [cpu, #off] */
+@@ -2860,7 +2865,7 @@
+ /* ------------------------------------------------------------ decoder (static, no guest state) */
+ enum { OT_NONE, OT_REG, OT_MEM, OT_IMM };
+ enum { JO_FB, JO_FBT, JO_NOP, JO_MOV, JO_MOVX, JO_LEA, JO_PUSH, JO_POP, JO_ALU, JO_NOT, JO_NEG, JO_SHIFT, JO_IMUL,
+-       JO_SETCC, JO_CMOV, JO_CWDE, JO_CDQ, JO_LEAVE, JO_XLD, JO_XST, JO_XLOG, JO_XMOVDLD, JO_XMOVDST, JO_XVEC, JO_PMOVMSKB, JO_XSHI, JO_FMOV, JO_FARITH, JO_CVTSI2F, JO_FCMP, JO_DIV, JO_XDUP, JO_BSF, JO_MUL1, JO_BSWAP, JO_JMP, JO_JCC, JO_CALL, JO_RET, JO_JMPI, JO_CALLI };
++       JO_SETCC, JO_CMOV, JO_CWDE, JO_CDQ, JO_LEAVE, JO_XLD, JO_XST, JO_XLOG, JO_XMOVDLD, JO_XMOVDST, JO_XVEC, JO_PMOVMSKB, JO_XSHI, JO_FMOV, JO_FARITH, JO_CVTSI2F, JO_FCMP, JO_DIV, JO_XDUP, JO_BSF, JO_MUL1, JO_BSWAP, JO_XSHN, JO_XSHUF, JO_JMP, JO_JCC, JO_CALL, JO_RET, JO_JMPI, JO_CALLI };
+ typedef struct {
+     u64 ip, imm, target; s64 disp;
+     u8 len, op, sz, sz2, t, fr, fw, at, bt, ar, br, rex, lva, lvb, scale, seg, sx, cnt, nost, incdec;
+@@ -3183,7 +3188,7 @@
+             if (!(p66 && !pf3 && !pf2)) FB();
+             jmodrm(&p, j, &m, 1); if (BADM(m)) FB();
+             u8 im = *p++;
+-            if (im != 0x00 && im != 0x55 && im != 0xAA && im != 0xFF) FB();
++            if (im != 0x00 && im != 0x55 && im != 0xAA && im != 0xFF) { j->op = JO_XSHUF; j->imm = im; j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break; }
+             j->op = JO_XDUP; j->imm = im & 3; j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break; }
+         case 0xC8: case 0xC9: case 0xCA: case 0xCB: case 0xCC: case 0xCD: case 0xCE: case 0xCF:
+             if (!(g_jopt & JOPT_INT) || opsz == 2 || pf3 || pf2 || lock) FB();
+@@ -3195,6 +3200,23 @@
+             if (!(p66 && !pf3 && !pf2)) FB();
+             jmodrm(&p, j, &m, 0); if (m.ismem || lock) FB();
+             j->op = JO_PMOVMSKB; j->at = OT_REG; j->ar = (u8) m.reg; j->bt = OT_REG; j->br = (u8) m.rm; break;
++        case 0x71: case 0x72: {                              /* psrlw/psraw/psllw (71) and psrld/psrad/pslld (72) xmm, imm8 */
++            if (!(p66 && !pf3 && !pf2)) FB();
++            jmodrm(&p, j, &m, 1); if (m.ismem || lock) FB();
++            int ext = m.reg & 7; if (ext != 2 && ext != 4 && ext != 6) FB();
++            j->op = JO_XSHN; j->t = (u8) ext; j->sz = (u8)(o2 == 0x71 ? 16 : 32); j->imm = *p++; j->br = (u8) m.rm; break; }
++        case 0x2B: case 0xE7:                                /* movntps/movntpd/movntdq: a plain 16-byte store */
++            if (pf3 || pf2 || (o2 == 0xE7 && !p66)) FB();
++            jmodrm(&p, j, &m, 0); if (BADM(m) || !m.ismem) FB();
++            j->op = JO_XST; SETRM(m, 0); j->bt = OT_REG; j->br = (u8) m.reg; break;
++        case 0xD6:                                           /* movq xmm/m64, xmm: the store form */
++            if (!(p66 && !pf3 && !pf2)) FB();
++            jmodrm(&p, j, &m, 0); if (BADM(m) || !m.ismem) FB();
++            j->op = JO_XMOVDST; j->sz = 8; SETRM(m, 0); j->bt = OT_REG; j->br = (u8) m.reg; break;
++        case 0x67:                                           /* packuswb */
++            if (!(p66 && !pf3 && !pf2)) FB();
++            jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
++            j->op = JO_XVEC; j->t = 16; j->sz = 0; j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break;
+         case 0x73: {                                         /* psrlq/psllq/psrldq/pslldq xmm, imm8 */
+             if (!(p66 && !pf3 && !pf2)) FB();
+             jmodrm(&p, j, &m, 1); if (m.ismem || lock) FB();
+@@ -3611,7 +3633,17 @@
+     case JO_XVEC:
+         if (j->bt == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); q_ldm(1, rb, off); } else q_ldc(1, OFF_X(j->br));
+         q_ldc(0, OFF_X(j->ar));
+-        q_v3(j->t, j->sz, 0, 0, 1);
++        if (j->t == 16) { E(0x2E212800u | 0u << 5 | 0u); E(0x6E212800u | 1u << 5 | 0u); }       /* packuswb: sqxtun v0.8b, v0.8h; sqxtun2 v0.16b, v1.8h */
++        else q_v3(j->t, j->sz, 0, 0, 1);
++        q_stc(0, OFF_X(j->ar)); break;
++    case JO_XSHN: {                                      /* psrl/psra/psll w|d by an immediate */
++        unsigned n = (unsigned) j->imm; int esz = j->sz;
++        if (n >= (unsigned) esz) { if (j->t == 4) n = (unsigned) esz - 1; else { c_st(31, OFF_X(j->br)); c_st(31, OFF_X(j->br) + 8); break; } }
++        if (n == 0) break;
++        q_ldc(0, OFF_X(j->br)); q_shi(j->t, esz, 0, 0, (int) n); q_stc(0, OFF_X(j->br)); break; }
++    case JO_XSHUF:                                       /* pshufd xmm, xmm/m128, imm8 */
++        if (j->bt == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); q_ldm(1, rb, off); } else q_ldc(1, OFF_X(j->br));
++        for (int k = 0; k < 4; k++) q_ins4s(0, k, 1, (int)((j->imm >> (2 * k)) & 3));
+         q_stc(0, OFF_X(j->ar)); break;
+     case JO_XDUP:
+         if (j->bt == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); q_ldm(1, rb, off); } else q_ldc(1, OFF_X(j->br));
+Binary files p1/prx-main/tests/__pycache__/pemu_test.cpython-313.pyc and prx/prx-main/tests/__pycache__/pemu_test.cpython-313.pyc differ
+diff -ruN -x '*.orig' p1/prx-main/tests/pemu_x64/jitsse2b.c prx/prx-main/tests/pemu_x64/jitsse2b.c
+--- p1/prx-main/tests/pemu_x64/jitsse2b.c	1970-01-01 07:00:00.000000000 +0700
++++ prx/prx-main/tests/pemu_x64/jitsse2b.c	2026-11-06 04:11:25.583015074 +0700
+@@ -0,0 +1,31 @@
++/* JIT: SSE2 shifts by immediate (psrlw/psraw/psllw/psrld/psrad/pslld), packuswb, pshufd with any immediate,
++ * movntps/movntdq and the store form of movq, in a loop so the blocks get translated. */
++#include <stdio.h>
++#include <stdint.h>
++typedef uint64_t u64;
++static u64 seed = 0x9E3779B97F4A7C15ULL;
++static inline __attribute__((always_inline)) u64 rnd(void) { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; return seed; }
++static u64 sum;
++static inline __attribute__((always_inline)) void mix(u64 v) { sum = sum * 1000003ULL + v; sum ^= sum >> 29; }
++typedef struct { u64 q[2]; } v128 __attribute__((aligned(16)));
++#define SH(ins, n) do { v128 a = { { rnd(), rnd() } }; \
++    __asm__ volatile("movdqa %0, %%xmm0\n\t" ins " $" #n ", %%xmm0\n\tmovdqa %%xmm0, %0" : "+m"(a) :: "xmm0"); mix(a.q[0]); mix(a.q[1]); } while (0)
++#define SHALL(n) SH("psrlw", n); SH("psraw", n); SH("psllw", n); SH("psrld", n); SH("psrad", n); SH("pslld", n)
++#define SHUF(n) do { v128 a = { { rnd(), rnd() } }, b = { { rnd(), rnd() } }; \
++    __asm__ volatile("movdqa %1, %%xmm0\n\tpshufd $" #n ", %%xmm0, %%xmm1\n\tmovdqa %%xmm1, %0\n\tpshufd $" #n ", %2, %%xmm2\n\tmovdqa %%xmm2, %1" : "=m"(a), "+m"(b) : "m"(b) : "xmm0", "xmm1", "xmm2"); \
++    mix(a.q[0]); mix(a.q[1]); mix(b.q[0]); mix(b.q[1]); } while (0)
++int main(void) {
++    for (int i = 0; i < 300; i++) {
++        SHALL(0); SHALL(1); SHALL(2); SHALL(7); SHALL(8); SHALL(15); SHALL(16); SHALL(17); SHALL(31); SHALL(32); SHALL(33); SHALL(63); SHALL(255);
++        SHUF(0x1b); SHUF(0xe4); SHUF(0x4e); SHUF(0xb1); SHUF(0x39); SHUF(0x93); SHUF(0xc6); SHUF(0x27); SHUF(0x0a); SHUF(0xf0); SHUF(0x6c);
++        v128 a = { { rnd(), rnd() } }, b = { { rnd(), rnd() } }, c, d;
++        __asm__ volatile("movdqa %2, %%xmm0\n\tmovdqa %3, %%xmm1\n\tpackuswb %%xmm1, %%xmm0\n\tmovdqa %%xmm0, %0\n\tmovdqa %2, %%xmm0\n\tpackuswb %3, %%xmm0\n\tmovdqa %%xmm0, %1"
++                         : "=m"(c), "=m"(d) : "m"(a), "m"(b) : "xmm0", "xmm1");
++        mix(c.q[0]); mix(c.q[1]); mix(d.q[0]); mix(d.q[1]);
++        v128 e = { { 1, 2 } }, f = { { 3, 4 } }, g = { { 5, 6 } };
++        __asm__ volatile("movdqa %3, %%xmm0\n\tmovntdq %%xmm0, %0\n\tmovaps %3, %%xmm1\n\tmovntps %%xmm1, %1\n\tmovq %%xmm0, %2" : "=m"(e), "=m"(f), "=m"(g.q[1]) : "m"(a) : "xmm0", "xmm1");
++        mix(e.q[0]); mix(e.q[1]); mix(f.q[0]); mix(f.q[1]); mix(g.q[0]); mix(g.q[1]);
++    }
++    printf("sse2b %016llx\n", (unsigned long long) sum);
++    return 0;
++}
+diff -ruN -x '*.orig' p1/prx-main/tests/pemu_x64/jitsse2b.expect prx/prx-main/tests/pemu_x64/jitsse2b.expect
+--- p1/prx-main/tests/pemu_x64/jitsse2b.expect	1970-01-01 07:00:00.000000000 +0700
++++ prx/prx-main/tests/pemu_x64/jitsse2b.expect	2026-11-06 04:11:25.847015090 +0700
+@@ -0,0 +1 @@
++sse2b a7a2dcfbfe3d0c92
+diff -ruN -x '*.orig' p1/prx-main/tests/pemu_x64_test.sh prx/prx-main/tests/pemu_x64_test.sh
+--- p1/prx-main/tests/pemu_x64_test.sh	2026-11-06 04:12:26.686452339 +0700
++++ prx/prx-main/tests/pemu_x64_test.sh	2026-11-06 04:11:57.612160441 +0700
+@@ -35,6 +35,7 @@
+ ARGS="" run jitint 0 -O1 -static "$D/jitint.c"
+ ARGS="" run jitincdec 0 -O1 -static "$D/jitincdec.c"
+ ARGS="" run jitxlogps 0 -O1 -static "$D/jitxlogps.c"
++ARGS="" run jitsse2b 0 -O1 -static "$D/jitsse2b.c"
+ ARGS="" run jitfp 0 -O1 -static "$D/jitfp.c" -lm
+ ARGS="" run mmx 0 -O1 -static "$D/mmx.c"
+ ARGS="" run sse42 0 -O1 -static -msse4.2 -mcx16 -pthread "$D/sse42.c"
