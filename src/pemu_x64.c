@@ -290,6 +290,26 @@ static __thread siginfo_t pinfo[65];
 static __thread u64 g_ss_sp, g_ss_size;
 static __thread sigjmp_buf g_jb;
 static __thread volatile int g_fault; static __thread volatile u64 g_faddr;
+static __thread volatile int g_fwrite;                /* the faulting access was a store (x86 page-fault error code bit 1) */
+#if defined(__aarch64__)
+#include <asm/sigcontext.h>
+#endif
+static int fault_was_write(void*u) {
+#if defined(__aarch64__) && defined(ESR_MAGIC)
+    ucontext_t*uc = u; u8*r = (u8*) uc->uc_mcontext.__reserved;
+    for (int n = 0; n < 16; n++) {                        /* walk the reserved records until the ESR one */
+        struct _aarch64_ctx*h = (struct _aarch64_ctx*) r;
+        if (!h->magic || !h->size) break;
+        if (h->magic == ESR_MAGIC) return (int)((((struct esr_context*) h)->esr >> 6) & 1);   /* data abort: WnR */
+        r += h->size;
+    }
+    return 0;
+#elif defined(__x86_64__)
+    return (int)((((ucontext_t*) u)->uc_mcontext.gregs[REG_ERR] >> 1) & 1);
+#else
+    (void) u; return 0;
+#endif
+}
 
 /* Android (and containers) kill a process with SIGSYS when it calls a syscall its seccomp filter does not allow.
  * The emulator forwards guest syscalls to the host, so turn such a kill into -ENOSYS: guests (glibc) then fall back. */
@@ -316,7 +336,7 @@ static void hsegv(int s, siginfo_t*si, void*u) {
 #else
     (void) u;
 #endif
-    if (gsa[s].handler > 1) { g_fault = s; g_faddr = (u64) si->si_addr; pinfo[s] = *si; siglongjmp(g_jb, 1); }
+    if (gsa[s].handler > 1) { g_fwrite = fault_was_write(u); g_fault = s; g_faddr = (u64) si->si_addr; pinfo[s] = *si; siglongjmp(g_jb, 1); }
     fprintf(stderr, "pemu: guest fault (signal %d) at addr=%p rip=%#llx\n", s, si->si_addr, (unsigned long long) g_cur->rip);
     signal(s, SIG_DFL); raise(s);
     _exit(128 + s);
@@ -341,6 +361,20 @@ static void deliver_sig(CPU*c, int s) {
     for (int i = 0; i < 16; i++) *(u64*)(mc + 8 * (u64) i) = c->r[gidx[i]];
     *(u64*)(mc + 8 * 16) = c->rip; *(u64*)(mc + 8 * 17) = RF(c);
     *(u64*)(mc + 8 * 22) = g_fault == s ? g_faddr : 0;
+    {   /* gregs[REG_ERR]=19, gregs[REG_TRAPNO]=20: Wine's segv_handler dispatches on the trap number */
+        u64 trap = 0, err = 0;
+        switch (s) {
+        case SIGSEGV: case SIGBUS:
+            if (pinfo[s].si_code == 0x80) trap = 13;                                    /* #GP from a privileged instruction */
+            else if (g_fault == s) { trap = 14; err = 4 | (g_fwrite ? 2 : 0) | (pinfo[s].si_code == 2 ? 1 : 0); }   /* #PF: user, write?, protection? */
+            break;
+        case SIGILL: trap = 6; break;                                                   /* #UD */
+        case SIGTRAP: trap = 3; break;                                                  /* #BP */
+        case SIGFPE: trap = (pinfo[s].si_code == 1 || pinfo[s].si_code == 2) ? 0 : 19; break;   /* #DE, else #XM */
+        default: break;
+        }
+        *(u64*)(mc + 8 * 19) = err; *(u64*)(mc + 8 * 20) = trap;
+    }
     *(u64*)(mc + 8 * 23) = fp;
     fx_save(c, (u8*) fp);
     u64 nm = old | h->mask | ((h->flags & 0x40000000) ? 0 : (1ULL << (s - 1)));
@@ -2566,7 +2600,9 @@ static unsigned g_jopt = JOPT_SHFL | JOPT_FP | JOPT_PIN | JOPT_SB | JOPT_RSB | J
 static const u8 jpin_reg[8] = { 19, 20, 21, 22, 23, 24, 25, 29 };
 static int g_jpin;
 static inline int pin(int n) { return (g_jpin && n >= 0 && n < 8) ? jpin_reg[n] : -1; }
-static unsigned long long jdyn[512], jst_dyn;                     /* statistics: interpreter fallbacks EXECUTED, by opcode (jfbh below counts translated sites) */
+static unsigned long long jdyn[512], jst_dyn;
+static unsigned long long jdynv[1 << 18];                         /* statistics: the same, by variant (see jfb_key) */
+static unsigned jfbv[1 << 18];                     /* statistics: interpreter fallbacks EXECUTED, by opcode (jfbh below counts translated sites) */
 static unsigned jfbh[512], jst_fb;                               /* statistics: interpreter fallbacks by opcode (0x100 + x for 0F xx) */
 
 /* ------------------------------------------------------------ AArch64 encoders */
@@ -2817,7 +2853,7 @@ enum { JO_FB, JO_FBT, JO_NOP, JO_MOV, JO_MOVX, JO_LEA, JO_PUSH, JO_POP, JO_ALU, 
        JO_SETCC, JO_CMOV, JO_CWDE, JO_CDQ, JO_LEAVE, JO_XLD, JO_XST, JO_XLOG, JO_XMOVDLD, JO_XMOVDST, JO_XVEC, JO_PMOVMSKB, JO_XSHI, JO_FMOV, JO_FARITH, JO_CVTSI2F, JO_FCMP, JO_DIV, JO_XDUP, JO_BSF, JO_MUL1, JO_BSWAP, JO_JMP, JO_JCC, JO_CALL, JO_RET, JO_JMPI, JO_CALLI };
 typedef struct {
     u64 ip, imm, target; s64 disp;
-    u8 len, op, sz, sz2, t, fr, fw, at, bt, ar, br, rex, lva, lvb, scale, seg, sx, cnt, nost;
+    u8 len, op, sz, sz2, t, fr, fw, at, bt, ar, br, rex, lva, lvb, scale, seg, sx, cnt, nost, incdec;
     s8 base, index;
 } JI;
 typedef struct { int reg, rm, ismem; } JM;
@@ -3033,9 +3069,14 @@ static int jdecode(JI *j, u64 ip) {
         if (ext < 2) { j->op = JO_ALU; j->t = 4; j->nost = 1; j->fw = 1; j->bt = OT_IMM; if (sz == 1) j->imm = (u8) *p++; else IMMZ(j->imm); }
         else if (ext == 2) j->op = JO_NOT; else { j->op = JO_NEG; j->fw = 1; }
         break; }
-    case 0xFF: {
+    case 0xFE: case 0xFF: {
         int ext = (*p >> 3) & 7;
-        if (ext != 2 && ext != 4) FB();
+        if (ext < 2) {                                   /* inc / dec: add or sub 1 that leaves CF alone. Translated only when the flags are dead (JO_ALU); with live flags it runs in the interpreter, as before */
+            jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
+            j->op = JO_ALU; j->t = ext ? 5 : 0; j->sz = op == 0xFE ? 1 : (u8) opsz; SETRM(m, 0);
+            j->bt = OT_IMM; j->imm = 1; j->incdec = 1; j->fr = j->fw = 1; j->len = (u8)(p - s); return 1;
+        }
+        if (op == 0xFE || (ext != 2 && ext != 4)) FB();
         jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
         j->op = ext == 2 ? JO_CALLI : JO_JMPI; j->sz = 8; SETRM(m, 0); j->len = (u8)(p - s); j->imm = ip + j->len; return 1; }
     case 0x0F: {
@@ -3058,7 +3099,7 @@ static int jdecode(JI *j, u64 ip) {
             jmodrm(&p, j, &m, 0); if (BADM(m) || opsz == 2) FB();
             j->op = JO_IMUL; j->sz = (u8) opsz; j->fr = 1; j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break;
         case 0xB6: case 0xB7: case 0xBE: case 0xBF:
-            jmodrm(&p, j, &m, 0); if (BADM(m) || opsz == 2) FB();
+            jmodrm(&p, j, &m, 0); if (BADM(m)) FB();                            /* opsz 2 (66 0f b6/be): the 16-bit merge is done by g_st */
             j->op = JO_MOVX; j->sz = (u8) opsz; j->sz2 = (o2 & 1) ? 2 : 1; j->sx = o2 >= 0xBE; j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break;
         case 0x10: case 0x28: case 0x6F: case 0x11: case 0x29: case 0x7F: {
             int pf = pf3 ? 3 : pf2 ? 2 : p66 ? 1 : 0, st = o2 == 0x11 || o2 == 0x29 || o2 == 0x7F;
@@ -3167,8 +3208,33 @@ static int jfb_idx(const u8 *q) {                               /* statistics: o
     if ((*q & 0xF0) == 0x40) q++;
     return *q == 0x0F ? 256 + q[1] : *q;
 }
+/* statistics key: bits 0-8 opcode (0x100 + x for 0F xx), bit 9 66h, bit 10 lock, bit 11 67h, bit 12 REX.W, bits 13-15 modrm.reg and
+ * bit 16 "memory operand" (both only for the opcodes whose modrm.reg selects the operation), bit 17 "has modrm.reg" */
+static unsigned jfb_key(const u8 *q) {
+    unsigned p66 = 0, lk = 0, a32 = 0, w = 0, ext = 0, mem = 0, hm = 0;
+    for (;; q++) {
+        u8 b = *q;
+        if (b == 0x66) p66 = 1; else if (b == 0xF0) lk = 1; else if (b == 0x67) a32 = 1;
+        else if (b == 0xF3 || b == 0xF2 || b == 0x64 || b == 0x65 || (b & 0xE7) == 0x26) { } else break;
+    }
+    if ((*q & 0xF0) == 0x40) { w = (*q >> 3) & 1; q++; }
+    unsigned idx = *q == 0x0F ? 256u + q[1] : *q;
+    const u8 *mp = q + (*q == 0x0F ? 2 : 1);
+    switch (idx) {
+    case 0x80: case 0x81: case 0x83: case 0xC0: case 0xC1: case 0xD0: case 0xD1: case 0xD2: case 0xD3: case 0xF6: case 0xF7: case 0xFE: case 0xFF: case 0x1BA:
+        hm = 1; ext = (*mp >> 3) & 7; mem = (*mp >> 6) != 3; break;
+    default: break;
+    }
+    return idx | p66 << 9 | lk << 10 | a32 << 11 | w << 12 | ext << 13 | mem << 16 | hm << 17;
+}
+static void jfb_keyname(unsigned k, char *out) {
+    unsigned idx = k & 511; char ext[8] = "";
+    if ((k >> 17) & 1) snprintf(ext, sizeof ext, "/%u %c", (k >> 13) & 7, (k >> 16) & 1 ? 'm' : 'r');
+    snprintf(out, 40, "%s%s%s%s%s%02x%s", (k >> 9) & 1 ? "66 " : "", (k >> 10) & 1 ? "lock " : "", (k >> 11) & 1 ? "67 " : "",
+             (k >> 12) & 1 ? "w " : "", idx >= 256 ? "0f " : "", idx & 255, ext);
+}
 static void jh_step(CPU *c) {
-    if (__builtin_expect(g_jstats, 0)) { jdyn[jfb_idx((const u8*) c->rip)]++; jst_dyn++; }
+    if (__builtin_expect(g_jstats, 0)) { jdyn[jfb_idx((const u8*) c->rip)]++; jdynv[jfb_key((const u8*) c->rip)]++; jst_dyn++; }
     step(c);
 }
 
@@ -3405,6 +3471,7 @@ static int jemit(const JI *j) {          /* returns 1 when it ended the block (t
         break;
     case JO_ALU: {
         int nf = j->lva;
+        if (j->incdec && nf) { fl_flush(j->lvb); j_fb(j); break; }   /* inc/dec with live flags: CF must pass through, the interpreter knows how */
         fl_flush(j->lvb); fl.nz = 0;
         if (hm) j_ea(j, &rb, &off);
         j_opld(9, j, 0, sz, rb, off); j_opld(10, j, 1, sz, rb, off);
@@ -3747,7 +3814,7 @@ static void jtranslate(u64 pc) {                          /* the caller is not a
     if (g_jstats)
         for (int i = 0; i < n; i++)
             if (ji[i].op == JO_FB || ji[i].op == JO_FBT) {
-                jfbh[jfb_idx((const u8*) ji[i].ip)]++; jst_fb++;
+                jfbh[jfb_idx((const u8*) ji[i].ip)]++; jfbv[jfb_key((const u8*) ji[i].ip)]++; jst_fb++;
             }
     for (int i = 0; i < n; i++) {                                 /* pages that now hold translated code */
         jpg_add(ji[i].ip >> 12);
@@ -3826,7 +3893,7 @@ static void jit_dispatch(CPU *c) {
         u64 pc = c->rip;
         if (c->patch == 1) {                                  /* the block ended with an instruction the translator does not handle: interpret it here */
             c->patch = 0;
-            if (__builtin_expect(g_jstats, 0)) { jdyn[jfb_idx((const u8*) pc)]++; jst_dyn++; }
+            if (__builtin_expect(g_jstats, 0)) { jdyn[jfb_idx((const u8*) pc)]++; jdynv[jfb_key((const u8*) pc)]++; jst_dyn++; }
             step(c); return;
         }
         jreg_enter(t, c);
@@ -3914,6 +3981,20 @@ static void jit_report(void) {
         int b = -1; for (int i = 0; i < 512; i++) if (jdyn[i] && (b < 0 || jdyn[i] > jdyn[b])) b = i;
         if (b < 0) break;
         fprintf(stderr, " %s%02x x%llu", b >= 256 ? "0f " : "", b & 255, jdyn[b]); jdyn[b] = 0;
+    }
+    fprintf(stderr, "\n");
+    fprintf(stderr, "pemu jit: fallback variants by sites (prefixes, /reg, r=register m=memory form):");
+    for (int k = 0; k < 8; k++) {
+        int b = -1; for (int i = 0; i < (1 << 18); i++) if (jfbv[i] && (b < 0 || jfbv[i] > jfbv[b])) b = i;
+        if (b < 0) break;
+        char nm[40]; jfb_keyname((unsigned) b, nm); fprintf(stderr, " [%s] x%u", nm, jfbv[b]); jfbv[b] = 0;
+    }
+    fprintf(stderr, "\n");
+    fprintf(stderr, "pemu jit: executed fallback variants:");
+    for (int k = 0; k < 12; k++) {
+        int b = -1; for (int i = 0; i < (1 << 18); i++) if (jdynv[i] && (b < 0 || jdynv[i] > jdynv[b])) b = i;
+        if (b < 0) break;
+        char nm[40]; jfb_keyname((unsigned) b, nm); fprintf(stderr, " [%s] x%llu", nm, jdynv[b]); jdynv[b] = 0;
     }
     fprintf(stderr, "\n");
 }

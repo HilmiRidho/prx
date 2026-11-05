@@ -1,0 +1,4 @@
+read unmapped: trap=14 write=0
+write unmapped: trap=14 write=1
+write read-only: trap=14 write=1
+cli: trap=13
