@@ -1009,6 +1009,7 @@ static long gsys(CPU*c, int*noset) {
               return hs(SYS_ppoll, (long) a0, (long) a1, (long) tp, 0, 8, 0); }
     case 21: return hs(SYS_faccessat, AT_FDCWD, (long) a0, (long) a1, 0, 0, 0);
     case 22: return hs(SYS_pipe2, (long) a0, 0, 0, 0, 0, 0);
+    case 43: return hs(SYS_accept4, (long) a0, (long) a1, (long) a2, 0, 0, 0);   /* accept == accept4 with flags 0. A plain accept (aarch64 202) is not in Android's app seccomp allowlist (bionic uses accept4), so it would come back ENOSYS and wineserver would spin on a ready socket */
     case 23: { struct timespec ts, *tp = NULL; if (a4) { struct timeval*tv = (struct timeval*) a4; ts.tv_sec = tv->tv_sec; ts.tv_nsec = tv->tv_usec * 1000L; tp = &ts; }
                return hs(SYS_pselect6, (long) a0, (long) a1, (long) a2, (long) a3, (long) tp, 0); }
     case 33: if (a0 == a1) return hs(SYS_fcntl, (long) a0, F_GETFD, 0, 0, 0, 0) < 0 ? -EBADF : (long) a1;
