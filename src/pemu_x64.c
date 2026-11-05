@@ -132,7 +132,7 @@ static void mwr(u64 a, u64 v, int n) {
 
 /* ---- lazy flags: add/sub/logic only record their operands; CF/OF/AF/ZF/SF/PF are computed when somebody reads them.
  * RF(c) is an lvalue that first materialises any pending flags, so every other use of the flags stays unchanged. */
-enum { LZ_NONE, LZ_ADD, LZ_SUB, LZ_LOGIC, LZ_SHL, LZ_SHR, LZ_SAR, LZ_FCMP };   /* LZ_SH*: la = value, lb = count (1..bits-1), lr = result (only recorded by the JIT); LZ_FCMP: la, lb = the two operands of comiss/comisd (bit patterns, lsz 4 or 8), only recorded by the JIT */
+enum { LZ_NONE, LZ_ADD, LZ_SUB, LZ_LOGIC, LZ_SHL, LZ_SHR, LZ_SAR, LZ_FCMP, LZ_INC, LZ_DEC };   /* LZ_INC/LZ_DEC (JIT only): la = operand, lb = the CF that inc/dec leave unchanged (0 or 1), lr = result; LZ_SH*: la = value, lb = count (1..bits-1), lr = result (only recorded by the JIT); LZ_FCMP: la, lb = the two operands of comiss/comisd (bit patterns, lsz 4 or 8), only recorded by the JIT */
 static const u8 g_par[256] = {
 #define PT2(n) n, n ^ 1, n ^ 1, n
 #define PT4(n) PT2(n), PT2(n ^ 1), PT2(n ^ 1), PT2(n)
@@ -172,6 +172,16 @@ static void mat(CPU*c) {
         break;
     case LZ_SAR:
         if ((u64)(sx(a, sz) >> (b - 1)) & 1) f |= CF_;
+        break;
+    case LZ_INC:
+        if (b) f |= CF_;
+        if (r == 1ULL << sb) f |= OF_;
+        if ((a ^ 1 ^ r) & 0x10) f |= AF_;
+        break;
+    case LZ_DEC:
+        if (b) f |= CF_;
+        if (a == 1ULL << sb) f |= OF_;
+        if ((a ^ 1 ^ r) & 0x10) f |= AF_;
         break;
     default: break;
     }
@@ -3071,10 +3081,10 @@ static int jdecode(JI *j, u64 ip) {
         break; }
     case 0xFE: case 0xFF: {
         int ext = (*p >> 3) & 7;
-        if (ext < 2) {                                   /* inc / dec: add or sub 1 that leaves CF alone. Translated only when the flags are dead (JO_ALU); with live flags it runs in the interpreter, as before */
+        if (ext < 2) {                                   /* inc / dec: add or sub 1 that leaves CF alone (JO_ALU; with live flags see the incdec case there) */
             jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
             j->op = JO_ALU; j->t = ext ? 5 : 0; j->sz = op == 0xFE ? 1 : (u8) opsz; SETRM(m, 0);
-            j->bt = OT_IMM; j->imm = 1; j->incdec = 1; j->fr = j->fw = 1; j->len = (u8)(p - s); return 1;
+            j->bt = OT_IMM; j->imm = 1; j->incdec = 1; j->len = (u8)(p - s); return 1;   /* no fr/fw: CF passes through, so the flags are live before it exactly when they are live after it */
         }
         if (op == 0xFE || (ext != 2 && ext != 4)) FB();
         jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
@@ -3132,6 +3142,11 @@ static int jdecode(JI *j, u64 ip) {
             if (!(p66 && !pf3 && !pf2)) FB();
             jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
             j->op = JO_XLOG; j->t = o2 == 0xEF ? 0 : o2 == 0xEB ? 1 : o2 == 0xDB ? 2 : 3;
+            j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break;
+        case 0x54: case 0x55: case 0x56: case 0x57:          /* andps/andnps/orps/xorps and the pd forms: the same bit operations as pand/pandn/por/pxor */
+            if (pf3 || pf2) FB();
+            jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
+            j->op = JO_XLOG; j->t = o2 == 0x57 ? 0 : o2 == 0x56 ? 1 : o2 == 0x54 ? 2 : 3;
             j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break;
         case 0xFC: case 0xFD: case 0xFE: case 0xD4: case 0xF8: case 0xF9: case 0xFA: case 0xFB: case 0x74: case 0x75: case 0x76:
             if (!(p66 && !pf3 && !pf2)) FB();
@@ -3241,6 +3256,7 @@ static void jh_step(CPU *c) {
 /* condition helper: after an interpreter fallback the flags live in memory, so jcc/setcc/cmov evaluate them with this
  * cheap call (it reads only the flags: no register spill/fill, no instruction decode) instead of interpreting. */
 static u64 jh_cc(CPU *c, u64 cc) { return (u64) cond(c, (int) cc); }
+static u64 jh_cf(CPU *c) { return (u64)(RF(c) & CF_ ? 1 : 0); }
 static void j_cc_helper(int cc) { a_mov(0, RCPU); a_movi(1, (u64) cc); j_callabs((void*) jh_cc); fl.nz = 0; fl.pend = 0; }   /* x0 = 0 or 1 */
 
 static void fl_spill(void) {
@@ -3257,11 +3273,12 @@ static int jmapcc(int x86cc, int *cc) {
     static const s8 sub_t[16] = { 6, 7, 3, 2, 0, 1, 9, 8, 4, 5, -1, -1, 11, 10, 13, 12 };
     static const s8 add_t[16] = { 6, 7, 2, 3, 0, 1, -1, -1, 4, 5, -1, -1, 11, 10, 13, 12 };
     static const s8 log_t[16] = { -2, -3, -2, -3, 0, 1, 0, 1, 4, 5, -1, -1, 11, 10, 13, 12 };
+    static const s8 id_t[16] = { 6, 7, -1, -1, 0, 1, -1, -1, 4, 5, -1, -1, 11, 10, 13, 12 };   /* after inc/dec: CF is the old one, the rest come from adds/subs #1 */
     static const s8 sh_t[16] = { -1, -1, -1, -1, 0, 1, -1, -1, 4, 5, -1, -1, -1, -1, -1, -1 };   /* after shl/shr/sar only e/ne/s/ns come from the host flags */
     /* after comis*: CF = below or unordered, ZF = equal or unordered, PF = unordered, OF = SF = 0. fcmp leaves unordered V=1 N=0 Z=0 C=1, equal Z=1 C=1, less N=1,
      * greater C=1: below = lt, ae = ge, be = le, a = gt, p = vs, np = vc. e/ne/le/g also need the unordered case of ZF: not one A64 condition. */
     static const s8 fc_t[16] = { -2, -3, 11, 10, -1, -1, 13, 12, -2, -3, 6, 7, -2, -3, -1, -1 };
-    int v = fl.kind == LZ_FCMP ? fc_t[x86cc] : fl.kind == LZ_SUB ? sub_t[x86cc] : fl.kind == LZ_ADD ? add_t[x86cc] : fl.kind >= LZ_SHL ? sh_t[x86cc] : log_t[x86cc];
+    int v = fl.kind == LZ_FCMP ? fc_t[x86cc] : fl.kind == LZ_SUB ? sub_t[x86cc] : fl.kind == LZ_ADD ? add_t[x86cc] : fl.kind >= LZ_INC ? id_t[x86cc] : fl.kind >= LZ_SHL ? sh_t[x86cc] : log_t[x86cc];
     if (v == -2) return 2;
     if (v == -3) return 1;
     if (v < 0) return -1;
@@ -3471,7 +3488,23 @@ static int jemit(const JI *j) {          /* returns 1 when it ended the block (t
         break;
     case JO_ALU: {
         int nf = j->lva;
-        if (j->incdec && nf) { fl_flush(j->lvb); j_fb(j); break; }   /* inc/dec with live flags: CF must pass through, the interpreter knows how */
+        if (j->incdec && nf) {                                       /* inc/dec with live flags: CF passes through. x8 = the CF of the flags so far; the new state is kind INC/DEC with lb = that CF */
+            if (fl.nz && (fl.kind == LZ_ADD || fl.kind == LZ_SUB || fl.kind == LZ_LOGIC || fl.kind == LZ_INC || fl.kind == LZ_DEC)) {
+                if (fl.kind == LZ_ADD) a_cset(8, 2);                 /* carry set: hs */
+                else if (fl.kind == LZ_SUB) a_cset(8, 3);            /* x86 CF is the borrow: lo */
+                else if (fl.kind == LZ_LOGIC) a_movi(8, 0);
+                else a_mov(8, 10);
+            } else { fl_flush(1); a_mov(0, RCPU); j_callabs((void*) jh_cf); a_mov(8, 0); }      /* flags in memory (or shift/comis state): helper */
+            if (hm) fl_flush(1);                                     /* the access below can fault: the old flags must be in memory then */
+            fl.nz = 0; fl.pend = 0;
+            if (hm) j_ea(j, &rb, &off);
+            j_opld(9, j, 0, sz, rb, off); a_movi(10, 1);
+            alu_core(j->t ? 5 : 0, sz, 1);
+            a_mov(10, 8);
+            fl.kind = j->t ? LZ_DEC : LZ_INC;
+            j_opst(11, j, sz, rb, off);
+            break;
+        }
         fl_flush(j->lvb); fl.nz = 0;
         if (hm) j_ea(j, &rb, &off);
         j_opld(9, j, 0, sz, rb, off); j_opld(10, j, 1, sz, rb, off);

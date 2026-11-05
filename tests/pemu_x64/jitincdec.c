@@ -41,12 +41,43 @@ static volatile u64 mem64[2];
     LIVE_REG(ins, b, b, pre); LIVE_REG(ins, w, w, pre); LIVE_REG(ins, l, k, pre); LIVE_REG(ins, q, q, pre); \
     LIVE_MEM(ins, b, u8, pre); LIVE_MEM(ins, w, u16, pre); LIVE_MEM(ins, l, u32, pre); LIVE_MEM(ins, q, u64, pre)
 
+
+/* inc/dec right after a flag producer in the same block, all flags read after: CF must be the producer's CF */
+#define PRODUCED(pre, ins, sfx, m, T) do { u64 x = edge(i), y = rnd(), z = edge((i * 7 + 3) % 25); u8 f[10]; \
+    __asm__ volatile(pre "\n\t" ins #sfx " %" #m "0\n\t" \
+        "setc %1\n\t" "setz %2\n\t" "seto %3\n\t" "sets %4\n\t" "setp %5\n\t" "setl %6\n\t" "setbe %7\n\t" "setg %8\n\t" "setb %9" \
+        : "+q"(x), "=q"(f[0]), "=q"(f[1]), "=q"(f[2]), "=q"(f[3]), "=q"(f[4]), "=q"(f[5]), "=q"(f[6]), "=q"(f[7]), "=q"(f[8]), "+r"(y) : "r"(z) : "cc"); \
+    mix(x); for (int k = 0; k < 9; k++) mix(f[k]); } while (0)
+#define PRODUCED_JCC(pre, ins, sfx, m, cc) do { u64 x = edge(i), y = rnd(), z = edge((i * 7 + 3) % 25); u64 r = 0; \
+    __asm__ volatile(pre "\n\t" ins #sfx " %" #m "1\n\t" "j" #cc " 1f\n\t" "leal 1(%k0), %k0\n\t" "1:" \
+        : "+r"(r), "+q"(x), "+r"(y) : "r"(z) : "cc"); \
+    mix(x); mix(r); } while (0)
+/* every condition code right after inc/dec, so each one is decided from the lazy flags of the previous instruction */
+#define ALLCC(pre, ins, sfx, m) \
+    PRODUCED_JCC(pre, ins, sfx, m, o); PRODUCED_JCC(pre, ins, sfx, m, no); PRODUCED_JCC(pre, ins, sfx, m, b); PRODUCED_JCC(pre, ins, sfx, m, ae); \
+    PRODUCED_JCC(pre, ins, sfx, m, e); PRODUCED_JCC(pre, ins, sfx, m, ne); PRODUCED_JCC(pre, ins, sfx, m, be); PRODUCED_JCC(pre, ins, sfx, m, a); \
+    PRODUCED_JCC(pre, ins, sfx, m, s); PRODUCED_JCC(pre, ins, sfx, m, ns); PRODUCED_JCC(pre, ins, sfx, m, p); PRODUCED_JCC(pre, ins, sfx, m, np); \
+    PRODUCED_JCC(pre, ins, sfx, m, l); PRODUCED_JCC(pre, ins, sfx, m, ge); PRODUCED_JCC(pre, ins, sfx, m, le); PRODUCED_JCC(pre, ins, sfx, m, g)
+#define PRODUCERS(ins, sfx, m, kz) \
+    PRODUCED("add %" #kz "11, %" #kz "10", ins, sfx, m, 0); PRODUCED("sub %" #kz "11, %" #kz "10", ins, sfx, m, 0); \
+    PRODUCED("and %" #kz "11, %" #kz "10", ins, sfx, m, 0); PRODUCED("cmp %" #kz "11, %" #kz "10", ins, sfx, m, 0); \
+    PRODUCED("shr $1, %" #kz "10", ins, sfx, m, 0); PRODUCED("xor %" #kz "11, %" #kz "10", ins, sfx, m, 0); \
+    PRODUCED("add $1, %" #kz "10\n\tinc %" #kz "10", ins, sfx, m, 0); PRODUCED("sub $1, %" #kz "10\n\tdec %" #kz "10", ins, sfx, m, 0); \
+    ALLCC("add %" #kz "3, %" #kz "2", ins, sfx, m); ALLCC("sub %" #kz "3, %" #kz "2", ins, sfx, m); ALLCC("and %" #kz "3, %" #kz "2", ins, sfx, m)
+
 int main(void) {
     for (int i = 0; i < 3000; i++) { ALL_DEAD("inc"); ALL_DEAD("dec"); }
     printf("incdec dead %016llx\n", (unsigned long long) sum);
     sum = 0;
     for (int i = 0; i < 3000; i++) { ALL_LIVE("inc", "stc"); ALL_LIVE("dec", "stc"); ALL_LIVE("inc", "clc"); ALL_LIVE("dec", "clc"); }
     printf("incdec live %016llx\n", (unsigned long long) sum);
+
+    sum = 0;
+    for (int i = 0; i < 2000; i++) {
+        PRODUCERS("inc", b, b, b); PRODUCERS("inc", w, w, w); PRODUCERS("inc", l, k, k); PRODUCERS("inc", q, q, q);
+        PRODUCERS("dec", b, b, b); PRODUCERS("dec", w, w, w); PRODUCERS("dec", l, k, k); PRODUCERS("dec", q, q, q);
+    }
+    printf("incdec after producer %016llx\n", (unsigned long long) sum);
 
     sum = 0;
     for (int i = 0; i < 3000; i++) {

@@ -34,6 +34,7 @@ ARGS="" run sigalt 0 -O1 -static -pthread "$D/sigalt.c"
 ARGS="" run jitopt 0 -O1 -static -pthread "$D/jitopt.c"
 ARGS="" run jitint 0 -O1 -static "$D/jitint.c"
 ARGS="" run jitincdec 0 -O1 -static "$D/jitincdec.c"
+ARGS="" run jitxlogps 0 -O1 -static "$D/jitxlogps.c"
 ARGS="" run jitfp 0 -O1 -static "$D/jitfp.c" -lm
 ARGS="" run mmx 0 -O1 -static "$D/mmx.c"
 ARGS="" run sse42 0 -O1 -static -msse4.2 -mcx16 -pthread "$D/sse42.c"
