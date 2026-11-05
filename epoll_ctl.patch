@@ -1,0 +1,13 @@
+--- a/src/pemu_x64.c	2026-11-05 14:43:41.320412671 +0000
++++ b/src/pemu_x64.c	2026-11-05 14:43:41.322207815 +0000
+@@ -900,6 +900,10 @@
+         free(ev); return r;
+     }
+     case 213: return hs(SYS_epoll_create1, 0, 0, 0, 0, 0, 0);
++    case 233: {                                       /* epoll_ctl: the x86_64 guest struct is packed (events@0, data@4, 12 bytes); the aarch64 host struct is not (data@8) */
++        struct epoll_event ev, *p = NULL;
++        if (a3) { memset(&ev, 0, sizeof ev); ev.events = *(u32u*) a3; ev.data.u64 = *(u64u*)(a3 + 4); p = &ev; }
++        return hs(SYS_epoll_ctl, (long) a0, (long) a1, (long) a2, (long) p, 0, 0); }
+     case 284: return hs(SYS_eventfd2, (long) a0, 0, 0, 0, 0, 0);
+     case 56: case 57: case 58: {                      /* clone / fork / vfork */
+         u64 flags = n == 56 ? a0 : SIGCHLD;
