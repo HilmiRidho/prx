@@ -930,6 +930,13 @@ static long clone_common(CPU*c, int isclone, u64 flags, u64 stack, u64 ptid, u64
         if (isclone && stack) c->r[RSP] = stack;
         if (isclone && (flags & 0x01000000)) *(u32*) ctid = (u32) getpid();      /* CHILD_SETTID */
         if (isclone && (flags & 0x00080000)) c->fs = tls;                         /* SETTLS */
+        if (flags & (1ULL << 32)) {                                               /* CLONE_CLEAR_SIGHAND (clone3): handled signals go back to SIG_DFL */
+            for (int sg = 1; sg <= 64; sg++) {
+                if (sg == SIGKILL || sg == SIGSTOP || sg == SIGSYS || gsa[sg].handler <= 1) continue;
+                struct sigaction sd; memset(&sd, 0, sizeof sd); sd.sa_handler = SIG_DFL;
+                sigaction(sg, &sd, NULL); memset(&gsa[sg], 0, sizeof gsa[sg]);
+            }
+        }
         c->r[RAX] = 0; *noset = 1;
     } else {
         if (isclone && (flags & 0x00100000)) *(u32*) ptid = (u32) pid;           /* PARENT_SETTID */
@@ -947,7 +954,8 @@ static long clone_common(CPU*c, int isclone, u64 flags, u64 stack, u64 ptid, u64
 }
 
 /* clone3(struct clone_args *args, size_t size): translated to the same paths as clone. Things the emulator cannot give are refused
- * instead of silently ignored: namespaces (EPERM, as for an unprivileged process), set_tid, CLONE_CLEAR_SIGHAND, CLONE_INTO_CGROUP. */
+ * instead of silently ignored: namespaces (EPERM, as for an unprivileged process), set_tid, CLONE_INTO_CGROUP. CLONE_CLEAR_SIGHAND is
+ * what glibc's posix_spawn passes. */
 static long do_clone3(CPU*c, const u8*uargs, u64 size, int*noset) {
     struct { u64 flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls, set_tid, set_tid_size, cgroup; } ca;
     if (!uargs) return -EFAULT;
@@ -956,7 +964,8 @@ static long do_clone3(CPU*c, const u8*uargs, u64 size, int*noset) {
     memset(&ca, 0, sizeof ca);
     memcpy(&ca, uargs, size < sizeof ca ? (size_t) size : sizeof ca);
     for (u64 i = sizeof ca; i < size; i++) if (uargs[i]) return -E2BIG;       /* unknown trailing fields must be zero */
-    if (ca.flags >> 32) return -EINVAL;
+    if ((ca.flags >> 32) & ~1ULL) return -EINVAL;                              /* CLONE_INTO_CGROUP and unknown flags */
+    if ((ca.flags & (1ULL << 32)) && (ca.flags & 0x800 /*CLONE_SIGHAND*/)) return -EINVAL;
     if (ca.exit_signal > 0xff || ca.set_tid_size) return -EINVAL;
     if (ca.flags & 0x7e0200a0ULL) return -EPERM;                               /* CLONE_NEW{NS,CGROUP,UTS,IPC,USER,PID,NET,TIME} */
     if ((ca.stack != 0) != (ca.stack_size != 0)) return -EINVAL;
@@ -1097,7 +1106,7 @@ static long gsys(CPU*c, int*noset) {
     }
     case 213: return hs(SYS_epoll_create1, 0, 0, 0, 0, 0, 0);
     case 284: return hs(SYS_eventfd2, (long) a0, 0, 0, 0, 0, 0);
-    case 56: return clone_common(c, 1, a0, a1, a2, a3, a4, 0, noset);                                      /* clone */
+    case 56: return clone_common(c, 1, a0 & 0xffffffffULL, a1, a2, a3, a4, 0, noset);                                      /* clone */
     case 57: case 58: return clone_common(c, 0, SIGCHLD, 0, 0, 0, 0, 0, noset);                            /* fork / vfork */
     case 435: return do_clone3(c, (const u8*) a0, a1, noset);
     case 322: return do_execveat((int) a0, (const char*) a1, (char**) a2, (char**) a3, (long) a4);

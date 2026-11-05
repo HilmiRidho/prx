@@ -13,7 +13,8 @@
 struct ca { uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls, set_tid, set_tid_size, cgroup; };
 static void res(const char*n, int ok) { printf("%s: %s\n", n, ok ? "ok" : "FAIL"); }
 
-static volatile int tidvar, shared;
+static volatile int tidvar, shared, hit;
+static void onusr1(int s) { (void) s; hit = 1; }
 static char stk[64 * 1024] __attribute__((aligned(16)));
 static int thr(void*p) { *(volatile int*) p = 42; return 0; }
 
@@ -59,12 +60,24 @@ int main(void) {
     if (r > 0) { waitpid((pid_t) r, &st, 0); res("pidfd", pfd >= 0); }
     else res("pidfd", errno == ENOSYS || errno == EPERM || errno == EINVAL);          /* the host kernel has no pidfd */
 
+    signal(SIGUSR1, onusr1);
+    for (int k = 0; k < 2; k++) {                                   /* k = 0: CLONE_CLEAR_SIGHAND, k = 1: handlers inherited */
+        memset(&a, 0, sizeof a); a.exit_signal = SIGCHLD; a.flags = k ? 0 : 1ULL << 32;
+        r = syscall(SYS_clone3, &a, sizeof a);
+        if (r == 0) { kill(getpid(), SIGUSR1); _exit(hit ? 5 : 6); }
+        int ok = r > 0 && waitpid((pid_t) r, &st, 0) == r;
+        if (k == 0) res("clear_sighand", ok && WIFSIGNALED(st) && WTERMSIG(st) == SIGUSR1);
+        else res("handler inherited", ok && WIFEXITED(st) && WEXITSTATUS(st) == 5);
+    }
+
     memset(&a, 0, sizeof a); a.exit_signal = SIGCHLD;
     errno = 0; r = syscall(SYS_clone3, &a, 8);                      res("small size EINVAL", r == -1 && errno == EINVAL);
     a.flags = 0x20000;                                              /* CLONE_NEWNS */
     errno = 0; r = syscall(SYS_clone3, &a, sizeof a);               res("newns EPERM", r == -1 && errno == EPERM);
-    a.flags = 1ULL << 32;                                           /* CLONE_CLEAR_SIGHAND */
-    errno = 0; r = syscall(SYS_clone3, &a, sizeof a);               res("clear_sighand EINVAL", r == -1 && errno == EINVAL);
+    a.flags = 1ULL << 33;                                           /* CLONE_INTO_CGROUP */
+    errno = 0; r = syscall(SYS_clone3, &a, sizeof a);               res("into_cgroup EINVAL", r == -1 && errno == EINVAL);
+    a.flags = (1ULL << 32) | 0x800 | 0x100;                         /* CLEAR_SIGHAND with CLONE_SIGHAND */
+    errno = 0; r = syscall(SYS_clone3, &a, sizeof a);               res("clear_sighand+sighand EINVAL", r == -1 && errno == EINVAL);
     a.flags = 0; a.stack = 0x1000;                                  /* stack without stack_size */
     errno = 0; r = syscall(SYS_clone3, &a, sizeof a);               res("stack without size EINVAL", r == -1 && errno == EINVAL);
     return 0;

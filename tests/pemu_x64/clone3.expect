@@ -2,7 +2,10 @@ child runs
 fork-style clone3: ok
 thread clone3: ok
 pidfd: ok
+clear_sighand: ok
+handler inherited: ok
 small size EINVAL: ok
 newns EPERM: ok
-clear_sighand EINVAL: ok
+into_cgroup EINVAL: ok
+clear_sighand+sighand EINVAL: ok
 stack without size EINVAL: ok
