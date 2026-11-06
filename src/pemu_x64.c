@@ -21,7 +21,8 @@
  * Disable it with PEMU_JIT=0 or -nojit. The JIT works with guest threads (one shared cache, see JT).
  * PEMU_JIT_OPT=<mask> (default 127) toggles optional translations: 1 = lazy flags for shift-by-immediate, 2 = scalar SSE float,
  * 4 = guest rax..rdi pinned to host registers, 8 = superblocks, 16 = return stack buffer, 32 = comiss/comisd/ucomiss/ucomisd with the host
- * flags of fcmp, 64 = div/idiv through udiv/sdiv (only when the dividend fits and the divisor is not 0 or -1; the rest is interpreted).
+ * flags of fcmp, 64 = div/idiv through udiv/sdiv (only when the dividend fits and the divisor is not 0 or -1; the rest is interpreted),
+ * 1024 = ldapur/stlur for aligned integer accesses of multi-threaded guests (needs FEAT_LRCPC2; see m_ld).
  * Not a security boundary. */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -47,6 +48,7 @@
 #include <sys/wait.h>
 #include <sys/time.h>
 #include <pthread.h>
+#include <sys/auxv.h>
 #include <linux/futex.h>
 #include <stddef.h>
 
@@ -2621,6 +2623,7 @@ static JT *jreg;                                               /* every register
 static pthread_mutex_t jmu = PTHREAD_MUTEX_INITIALIZER;
 static volatile int g_jstop;
 static volatile u32 g_jgen;
+static int g_jrcpc;                                            /* JOPT_RCPC is on and the host has FEAT_LRCPC2 (HWCAP_ILRCPC) */
 static int g_jmt;                                              /* the guest has more than one thread: translated code carries x86 memory-ordering barriers */
 static u32 *jt_start; static u64 jt_pc;                        /* block being translated (visible to its own chained exits only) */
 static unsigned long long jst_blocks, jst_flush, jst_chain, jst_ins, jst_words;
@@ -2634,8 +2637,9 @@ static int g_jstats;
 #define JOPT_DIV  64u                   /* 32/64-bit div and idiv with udiv/sdiv when the dividend fits and the divisor is not 0 or -1 */
 #define JOPT_CC   128u                  /* jcc/setcc/cmovcc after an interpreter fallback: a flags-only helper call instead of interpreting them too */
 #define JOPT_INT  256u                  /* one-operand mul/imul (flags dead), bswap, 8/16-bit shl/shr/sar (flags dead) */
+#define JOPT_RCPC 1024u                 /* multi-threaded guests: aligned integer loads/stores use ldapur/stlur (FEAT_LRCPC2) instead of ldur + dmb / dmb + stur; unaligned ones keep the dmb pair */
 #define JOPT_ATOM 512u                  /* lock-prefixed add/sub/and/or/xor/inc/dec, cmpxchg, xadd, xchg (LL/SC loops), adc/sbb, push m64, xchg rax,r, movq xmm,xmm/m64, 8/16-bit rol/ror by immediate (flags dead) */
-static unsigned g_jopt = JOPT_SHFL | JOPT_FP | JOPT_PIN | JOPT_SB | JOPT_RSB | JOPT_FCMP | JOPT_DIV | JOPT_CC | JOPT_INT | JOPT_ATOM;   /* PEMU_JIT_OPT=<mask> overrides (0 = none): handy to bisect a misbehaving guest */
+static unsigned g_jopt = JOPT_SHFL | JOPT_FP | JOPT_PIN | JOPT_SB | JOPT_RSB | JOPT_FCMP | JOPT_DIV | JOPT_CC | JOPT_INT | JOPT_ATOM | JOPT_RCPC;   /* PEMU_JIT_OPT=<mask> overrides (0 = none): handy to bisect a misbehaving guest */
 /* Register pinning: guest rax,rcx,rdx,rbx,rsp,rbp,rsi,rdi (numbers 0..7) are kept in callee-saved host registers, so
  * they survive helper calls and chained block-to-block branches. The CPU struct is only written back when translated
  * code is left (jepi), around an interpreter fallback (j_pin_spill / j_pin_fill) and, after a fault, from the signal
@@ -2798,9 +2802,38 @@ static void j_pin_fill(void)  { if (g_jpin) { a_ldp(19, 20, RCPU, (int) OFF_R(0)
  * Single-threaded guests pay nothing. */
 static void a_dmb_ld(void) { if (g_jmt) E(0xD50339BFu); }               /* dmb ishld */
 static void a_dmb_st(void) { if (g_jmt) E(0xD5033ABFu); }               /* dmb ishst */
+/* FEAT_LRCPC2 forms (HWCAP_ILRCPC): ldapur = load-acquire(PC), stlur = store-release, both with the unscaled imm9 of ldur/stur.
+ * An acquire load orders itself before all later loads and stores, a release store orders all earlier loads and stores before
+ * itself, and a release store followed by an acquire(PC) load may still be reordered: that is exactly x86 TSO, so they replace
+ * "ldur + dmb ishld" and "dmb ishst + stur" for integer accesses. They need NATURAL alignment (with FEAT_LSE2: no 16-byte
+ * boundary crossing) and fault otherwise, and x86 guests use unaligned addresses freely, so every 2/4/8-byte access is guarded:
+ * the low address bits are tested (and + cbnz: no host flags are touched, the JIT keeps them live) and a misaligned address takes
+ * the old dmb sequence. 1-byte accesses are always aligned and need no guard. x17 is the scratch (it is only ever used inside
+ * fl_spill / j_adc, never across an access); both operands must not be x17. SSE/FP accesses keep the dmb pair: LRCPC2 has no
+ * vector forms. */
+static void a_rc_s(int size, int opc, int rt, int rn, int off) {          /* opc as a_ldst_s: 0 stlur, 1 ldapur, 2 ldapurs* to x, 3 ldapurs* to w */
+    E((u32) size << 30 | 0x19000000u | (u32) opc << 22 | ((u32) off & 0x1ff) << 12 | (u32) rn << 5 | (u32) rt);
+}
+static u32 *j_align_guard(int sz, int rn, int off) {                      /* returns the cbnz to the slow path (taken when [rn + off] is not sz-aligned) */
+    int nb = sz == 2 ? 1 : sz == 4 ? 2 : 3;
+    if (off % sz == 0) a_andmask(17, rn, nb);
+    else { a_addi(off < 0, 17, rn, (u32)(off < 0 ? -off : off), 0); a_andmask(17, 17, nb); }
+    return a_cbz_fwd(1, 17);
+}
+static inline int j_rc_ok(int rt, int rn) { return g_jmt && g_jrcpc && rt != 17 && rn != 17; }
 static void m_ld(int sz, int sgn, int sf, int rt, int rn, int off) {      /* guest memory, [rn + off], off in -256..255 */
-    int size = sz == 1 ? 0 : sz == 2 ? 1 : sz == 4 ? 2 : 3;
-    a_ldst_s(size, !sgn ? 1 : (sf ? 2 : 3), rt, rn, off); a_dmb_ld();
+    int size = sz == 1 ? 0 : sz == 2 ? 1 : sz == 4 ? 2 : 3, opc = !sgn ? 1 : (sf ? 2 : 3);
+    if (j_rc_ok(rt, rn)) {
+        if (sz == 1) { a_rc_s(size, opc, rt, rn, off); return; }
+        u32 *slow = j_align_guard(sz, rn, off);
+        a_rc_s(size, opc, rt, rn, off);
+        u32 *end = a_b_fwd();
+        jpatch19(slow);
+        a_ldst_s(size, opc, rt, rn, off); a_dmb_ld();
+        jpatch26(end);
+        return;
+    }
+    a_ldst_s(size, opc, rt, rn, off); a_dmb_ld();
 }
 #define OFF_X(n) ((u32) offsetof(CPU, x) + 16u * (u32)(n))
 static void q_ldc(int vt, u32 off) { E(0x3DC00000u | ((off >> 4) & 0xfff) << 10 | (u32) RCPU << 5 | (u32) vt); }       /* ldr qt, [cpu, #off] */
@@ -2849,6 +2882,16 @@ static void f_arith(int t, int sz, int vd, int vn, int vm) {             /* t: 0
 static void f_scvtf(int sz, int src64, int vd, int rn) { E(0x1E220000u | (src64 ? 0x80000000u : 0u) | (sz == 8 ? 1u << 22 : 0u) | (u32) rn << 5 | (u32) vd); }   /* scvtf dd/sd, xn/wn */
 static void m_st(int sz, int rt, int rn, int off) {
     int size = sz == 1 ? 0 : sz == 2 ? 1 : sz == 4 ? 2 : 3;
+    if (j_rc_ok(rt, rn)) {
+        if (sz == 1) { a_rc_s(size, 0, rt, rn, off); return; }
+        u32 *slow = j_align_guard(sz, rn, off);
+        a_rc_s(size, 0, rt, rn, off);
+        u32 *end = a_b_fwd();
+        jpatch19(slow);
+        a_dmb_st(); a_ldst_s(size, 0, rt, rn, off);
+        jpatch26(end);
+        return;
+    }
     a_dmb_st(); a_ldst_s(size, 0, rt, rn, off);
 }
 
@@ -3431,13 +3474,13 @@ static void j_opst(int rt, const JI *j, int sz, int rb, int off) {
 }
 static void j_push(int rv) {                                    /* the store comes first: a fault leaves rsp unchanged */
     int hs = pin(RSP);
-    if (hs >= 0) { a_dmb_st(); a_ldst_s(3, 0, rv, hs, -8); a_addi(1, hs, hs, 8, 0); return; }
-    c_ld(1, OFF_R(RSP)); a_addi(1, 1, 1, 8, 0); a_dmb_st(); a_ldst_s(3, 0, rv, 1, 0); c_st(1, OFF_R(RSP));
+    if (hs >= 0) { m_st(8, rv, hs, -8); a_addi(1, hs, hs, 8, 0); return; }
+    c_ld(1, OFF_R(RSP)); a_addi(1, 1, 1, 8, 0); m_st(8, rv, 1, 0); c_st(1, OFF_R(RSP));
 }
 static void j_pop(int rv) {
     int hs = pin(RSP);
-    if (hs >= 0) { a_ldst_s(3, 1, rv, hs, 0); a_dmb_ld(); a_addi(0, hs, hs, 8, 0); return; }
-    c_ld(1, OFF_R(RSP)); a_ldst_s(3, 1, rv, 1, 0); a_dmb_ld(); a_addi(0, 1, 1, 8, 0); c_st(1, OFF_R(RSP));
+    if (hs >= 0) { m_ld(8, 0, 0, rv, hs, 0); a_addi(0, hs, hs, 8, 0); return; }
+    c_ld(1, OFF_R(RSP)); m_ld(8, 0, 0, rv, 1, 0); a_addi(0, 1, 1, 8, 0); c_st(1, OFF_R(RSP));
 }
 
 static void j_fb(const JI *j) {                       /* run one instruction through the interpreter */
@@ -3678,8 +3721,8 @@ static int jemit(const JI *j) {          /* returns 1 when it ended the block (t
     case JO_POP: fl_flush(j->lvb); j_pop(0); g_st(0, j->ar, 8, 0); break;
     case JO_LEAVE:
         fl_flush(j->lvb);
-        if (pin(RBP) >= 0) { a_ldst_s(3, 1, 2, pin(RBP), 0); a_dmb_ld(); a_addi(0, pin(RSP), pin(RBP), 8, 0); a_mov(pin(RBP), 2); break; }
-        c_ld(0, OFF_R(RBP)); a_ldst_s(3, 1, 2, 0, 0); a_dmb_ld(); a_addi(0, 0, 0, 8, 0); c_st(0, OFF_R(RSP)); c_st(2, OFF_R(RBP)); break;
+        if (pin(RBP) >= 0) { m_ld(8, 0, 0, 2, pin(RBP), 0); a_addi(0, pin(RSP), pin(RBP), 8, 0); a_mov(pin(RBP), 2); break; }
+        c_ld(0, OFF_R(RBP)); m_ld(8, 0, 0, 2, 0, 0); a_addi(0, 0, 0, 8, 0); c_st(0, OFF_R(RSP)); c_st(2, OFF_R(RBP)); break;
     case JO_CWDE:
         if (sz == 8) { g_ld(0, RAX, 4, 0); a_sxtw(0, 0); g_st(0, RAX, 8, 0); }
         else { g_ld(0, RAX, 2, 0); a_sxth(0, 0, 0); g_st(0, RAX, 4, 0); }
@@ -4019,11 +4062,11 @@ static int jemit(const JI *j) {          /* returns 1 when it ended the block (t
         fl_flush(j->lvb);
         if (pin(RSP) >= 0) {
             int hs = pin(RSP);
-            a_ldst_s(3, 1, 0, hs, 0); a_dmb_ld(); a_addi(0, hs, hs, 8, 0);
+            m_ld(8, 0, 0, 0, hs, 0); a_addi(0, hs, hs, 8, 0);
             if (j->imm) { a_movi(2, j->imm); a_addsh(hs, hs, 2, 0); }
             jx_ret(); return 1;
         }
-        c_ld(1, OFF_R(RSP)); a_ldst_s(3, 1, 0, 1, 0); a_dmb_ld(); a_addi(0, 1, 1, 8, 0);
+        c_ld(1, OFF_R(RSP)); m_ld(8, 0, 0, 0, 1, 0); a_addi(0, 1, 1, 8, 0);
         if (j->imm) { a_movi(2, j->imm); a_addsh(1, 1, 2, 0); }
         c_st(1, OFF_R(RSP)); jx_ret(); return 1;
     case JO_JMPI: case JO_CALLI:
@@ -4296,6 +4339,11 @@ static int jit_init(void) {
     if (!jh || !jpg || !jm_off || !jm_pc) return -1;
     { const char *eo = getenv("PEMU_JIT_OPT"); if (eo && *eo) g_jopt = (unsigned) strtoul(eo, NULL, 0); }
     g_jpin = !!(g_jopt & JOPT_PIN);
+#ifdef PEMU_JIT_EMBED
+    g_jrcpc = !!(g_jopt & JOPT_RCPC);                             /* the interpreter of pemu.c executes ldapur/stlur (and aborts on a misaligned one) */
+#else
+    g_jrcpc = (g_jopt & JOPT_RCPC) && (getauxval(AT_HWCAP) & (1ul << 26));      /* HWCAP_ILRCPC: FEAT_LRCPC2 (ldapur/stlur) */
+#endif
     jcur = jbase;
     jenter = jcur;                                                /* void jenter(CPU *c, void *code, volatile u64 *pend, JEnt *ic) */
     E(0xA9800000u | (u32)(-12 & 0x7f) << 15 | 30u << 10 | 31u << 5 | 29u);           /* stp x29, x30, [sp, #-96]! */

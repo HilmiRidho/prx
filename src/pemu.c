@@ -681,6 +681,25 @@ static int ldst(CPU*c, u32 i) {
         if (idx == 1 || idx == 3) SETS(rn, nbase);
         return 0;
     }
+    if ((i & 0x3F200C00) == 0x19000000) {                      /* LDAPUR / STLUR / LDAPURS* (FEAT_LRCPC2): unscaled offset, acquire-PC / release */
+        int size = i >> 30, opc = (i >> 22) & 3, nb = 1 << size;
+        u64 a = XS(rn) + (u64) sext((i >> 12) & 0x1ff, 9);
+#ifdef PEMU_EMBED
+        /* strict on purpose: without FEAT_LSE2 the hardware raises an alignment fault for these (with it, when the access crosses
+         * a 16-byte boundary), and pemu_x64's JIT must never emit one for an address that is not naturally aligned */
+        if (a & (u64)(nb - 1)) { fprintf(stderr, "pemu: misaligned LDAPUR/STLUR at %#llx (size %d)\n", (unsigned long long) a, nb); abort(); }
+#endif
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        if (opc == 0) mwr(a, X(rt), nb);
+        else if (opc == 1) SET(rt, mrd(a, nb));
+        else {
+            if (size == 3 || (opc == 3 && size == 2)) return -1;
+            u64 v = (u64) sext(mrd(a, nb), nb * 8); if (opc == 3) v &= M32;
+            SET(rt, v);
+        }
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        return 0;
+    }
     if ((i & 0x3B000000) == 0x38000000 || (i & 0x3B000000) == 0x39000000) {   /* register */
         int size = i >> 30, V = (i >> 26) & 1, opc = (i >> 22) & 3, sc, nb, isld, sgn = 0, to64 = 0;
         if (!V) {
