@@ -357,6 +357,9 @@ static const int gidx[16] = {8, 9, 10, 11, 12, 13, 14, 15, 7, 6, 5, 3, 2, 0, 1, 
 #define SFRAME 1088
 static void deliver_sig(CPU*c, int s) {
     struct gsa*h = &gsa[s];
+    if (g_trace && (s == SIGSEGV || s == SIGBUS || s == SIGILL || s == SIGFPE || s == SIGABRT || s == SIGTRAP))          /* diagnostics: what the guest's own handler is about to see */
+        fprintf(stderr, "pemu: signal %d to guest handler: rip=%#llx fault addr=%#llx code=%d (rsp=%#llx)\n", s, (unsigned long long) c->rip,
+                (unsigned long long)(g_fault == s ? g_faddr : 0), pinfo[s].si_code, (unsigned long long) c->r[RSP]);
     int on_alt = g_ss_size && c->r[RSP] >= g_ss_sp && c->r[RSP] - g_ss_sp < g_ss_size;     /* interrupted code already runs on the alternate stack */
     u64 top = ((h->flags & 0x08000000u /*SA_ONSTACK*/) && g_ss_size && !on_alt) ? g_ss_sp + g_ss_size : c->r[RSP] - 128;
     u64 sp = ((top - SFRAME) & ~15ULL) - 8;
