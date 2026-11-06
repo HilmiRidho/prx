@@ -39,6 +39,7 @@ ARGS="" run jitxlogps 0 -O1 -static "$D/jitxlogps.c"
 ARGS="" run jitsse2b 0 -O1 -static "$D/jitsse2b.c"
 ARGS="" run jitmmx 0 -O1 -static "$D/jitmmx.c"
 ARGS="" run jitfp 0 -O1 -static "$D/jitfp.c" -lm
+ARGS="" run jitfpmm 0 -O1 -static "$D/jitfpmm.c"
 ARGS="" run mmx 0 -O1 -static "$D/mmx.c"
 ARGS="" run sse42 0 -O1 -static -msse4.2 -mcx16 -pthread "$D/sse42.c"
 ARGS="" run x87save 0 -O1 -static "$D/x87save.c"

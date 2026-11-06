@@ -2905,7 +2905,7 @@ static void jit_note_rwx(u64 start, u64 len) {                  /* jmu held */
 /* ------------------------------------------------------------ decoder (static, no guest state) */
 enum { OT_NONE, OT_REG, OT_MEM, OT_IMM };
 enum { JO_FB, JO_FBT, JO_NOP, JO_MOV, JO_MOVX, JO_LEA, JO_PUSH, JO_POP, JO_ALU, JO_NOT, JO_NEG, JO_SHIFT, JO_IMUL,
-       JO_SETCC, JO_CMOV, JO_CWDE, JO_CDQ, JO_LEAVE, JO_XLD, JO_XST, JO_XLOG, JO_XMOVDLD, JO_XMOVDST, JO_XVEC, JO_PMOVMSKB, JO_XSHI, JO_FMOV, JO_FARITH, JO_CVTSI2F, JO_FCMP, JO_DIV, JO_XDUP, JO_BSF, JO_MUL1, JO_BSWAP, JO_XSHN, JO_XSHUF, JO_MMSHUF, JO_XCHG, JO_XCHGA, JO_CMPXCHG, JO_XADD, JO_XMOVQ, JO_JMP, JO_JCC, JO_CALL, JO_RET, JO_JMPI, JO_CALLI };
+       JO_SETCC, JO_CMOV, JO_CWDE, JO_CDQ, JO_LEAVE, JO_XLD, JO_XST, JO_XLOG, JO_XMOVDLD, JO_XMOVDST, JO_XVEC, JO_PMOVMSKB, JO_XSHI, JO_FMOV, JO_FARITH, JO_CVTSI2F, JO_FCVTF, JO_FCMP, JO_DIV, JO_XDUP, JO_BSF, JO_MUL1, JO_BSWAP, JO_XSHN, JO_XSHUF, JO_MMSHUF, JO_XCHG, JO_XCHGA, JO_CMPXCHG, JO_XADD, JO_XMOVQ, JO_JMP, JO_JCC, JO_CALL, JO_RET, JO_JMPI, JO_CALLI };
 typedef struct {
     u64 ip, imm, target; s64 disp;
     u8 len, op, sz, sz2, t, fr, fw, at, bt, ar, br, rex, lva, lvb, scale, seg, sx, cnt, nost, incdec, mmx, lk;
@@ -3190,11 +3190,16 @@ static int jdecode(JI *j, u64 ip) {
             if (mm) { m.reg &= 7; if (!m.ismem) m.rm &= 7; }
             if (st) { SETRM(m, 0); j->bt = OT_REG; j->br = (u8) m.reg; } else { j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); }
             break; }
-        case 0x51: case 0x58: case 0x59: case 0x5C: case 0x5E:             /* sqrt/add/mul/sub/div ss|sd */
+        case 0x51: case 0x58: case 0x59: case 0x5C: case 0x5D: case 0x5E: case 0x5F:             /* sqrt/add/mul/sub/min/div/max ss|sd */
             if (!(g_jopt & JOPT_FP) || pf2 == pf3) FB();
             jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
             j->op = JO_FARITH; j->sz2 = pf2 ? 8 : 4;
-            j->t = o2 == 0x58 ? 0 : o2 == 0x59 ? 1 : o2 == 0x5C ? 2 : o2 == 0x5E ? 3 : 4;
+            j->t = o2 == 0x58 ? 0 : o2 == 0x59 ? 1 : o2 == 0x5C ? 2 : o2 == 0x5E ? 3 : o2 == 0x5D ? 5 : o2 == 0x5F ? 6 : 4;     /* 5 min, 6 max */
+            j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break;
+        case 0x5A:                                           /* cvtss2sd (F3) / cvtsd2ss (F2): scalar precision change, the rest of the destination is kept */
+            if (!(g_jopt & JOPT_FP) || pf2 == pf3) FB();
+            jmodrm(&p, j, &m, 0); if (BADM(m)) FB();
+            j->op = JO_FCVTF; j->sz2 = pf2 ? 8 : 4;           /* source element size */
             j->at = OT_REG; j->ar = (u8) m.reg; SETRM(m, 1); break;
         case 0x2A:                                           /* cvtsi2ss / cvtsi2sd */
             if (!(g_jopt & JOPT_FP) || pf2 == pf3) FB();
@@ -3931,10 +3936,20 @@ static int jemit(const JI *j) {          /* returns 1 when it ended the block (t
         }
         break;
     case JO_FARITH:
+        if (j->t >= 5) fl_flush(j->lvb);                               /* min/max compare with fcmp: the host flags are overwritten */
         if (j->bt == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); f_ldm(j->sz2, 1, rb, off); } else f_ldc(j->sz2, 1, OFF_X(j->br));
         if (j->t != 4) f_ldc(j->sz2, 0, OFF_X(j->ar));
+        if (j->t >= 5) {                                               /* minsd/maxsd: dest = (dest < src) ? dest : src (max: >), so a NaN or equal operands (+0/-0) give the source, as on x86 */
+            fl.nz = 0;
+            f_cmp(j->sz2, 0, 1);
+            E(0x1E200C00u | (j->sz2 == 8 ? 1u << 22 : 0u) | 1u << 16 | (u32)(j->t == 5 ? 4 : 12) << 12 | 0u << 5 | 0u);   /* fcsel d0, d0, d1, mi (min) / gt (max) */
+        } else
         f_arith(j->t, j->sz2, 0, 0, 1);
         f_stc(j->sz2, 0, OFF_X(j->ar)); break;
+    case JO_FCVTF: {                                                   /* cvtss2sd (sz2 4): low double of the destination; cvtsd2ss (sz2 8): low float */
+        if (j->bt == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); f_ldm(j->sz2, 1, rb, off); } else f_ldc(j->sz2, 1, OFF_X(j->br));
+        E(j->sz2 == 4 ? 0x1E22C000u | 1u << 5 : 0x1E624000u | 1u << 5);            /* fcvt d0, s1 / fcvt s0, d1 */
+        f_stc(j->sz2 == 4 ? 8 : 4, 0, OFF_X(j->ar)); break; }
     case JO_CVTSI2F:
         if (j->bt == OT_MEM) { fl_flush(j->lvb); j_ea(j, &rb, &off); m_ld(sz, 0, 0, 0, rb, off); } else g_ld(0, j->br, sz, 0);
         f_scvtf(j->sz2, sz == 8, 0, 0);
