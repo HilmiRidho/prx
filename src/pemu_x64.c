@@ -355,8 +355,30 @@ static void fx_save(CPU*c, u8*p);                      /* FXSAVE image: fxsave, 
 static void fx_restore(CPU*c, const u8*p);
 static const int gidx[16] = {8, 9, 10, 11, 12, 13, 14, 15, 7, 6, 5, 3, 2, 0, 1, 4};
 #define SFRAME 1088
+static void trace_map(const char *tag, u64 a) {                  /* diagnostics: the mapping that holds address a, with the offset in its file */
+    FILE *f = fopen("/proc/self/maps", "r"); char l[512];
+    if (!f) return;
+    while (fgets(l, sizeof l, f)) {
+        unsigned long long lo, hi, off;
+        if (sscanf(l, "%llx-%llx %*s %llx", &lo, &hi, &off) == 3 && a >= lo && a < hi) {
+            l[strcspn(l, "\n")] = 0;
+            fprintf(stderr, "pemu:   %s %#llx = file offset %#llx in: %s\n", tag, (unsigned long long) a, off + (a - lo), l); break;
+        }
+    }
+    fclose(f);
+}
 static void deliver_sig(CPU*c, int s) {
     struct gsa*h = &gsa[s];
+    if (g_trace && s == SIGSEGV && g_fault == s && g_faddr < 0x10000) {                     /* a jump to a bogus address: who called, and with what */
+        fprintf(stderr, "pemu:   regs rax=%#llx rcx=%#llx rdx=%#llx rbx=%#llx rbp=%#llx rsi=%#llx rdi=%#llx r8=%#llx r9=%#llx r12=%#llx r13=%#llx r14=%#llx r15=%#llx\n",
+                (unsigned long long) c->r[0], (unsigned long long) c->r[1], (unsigned long long) c->r[2], (unsigned long long) c->r[3], (unsigned long long) c->r[5],
+                (unsigned long long) c->r[6], (unsigned long long) c->r[7], (unsigned long long) c->r[8], (unsigned long long) c->r[9], (unsigned long long) c->r[12],
+                (unsigned long long) c->r[13], (unsigned long long) c->r[14], (unsigned long long) c->r[15]);
+        for (int k = 0; k < 6; k++) {
+            u64 w = ((u64*) c->r[RSP])[k]; char t[16]; snprintf(t, sizeof t, "[rsp+%d]", 8 * k);
+            fprintf(stderr, "pemu:   %s = %#llx\n", t, (unsigned long long) w); trace_map(t, w);
+        }
+    }
     if (g_trace && (s == SIGSEGV || s == SIGBUS || s == SIGILL || s == SIGFPE || s == SIGABRT || s == SIGTRAP))          /* diagnostics: what the guest's own handler is about to see */
         fprintf(stderr, "pemu: signal %d to guest handler: rip=%#llx fault addr=%#llx code=%d (rsp=%#llx)\n", s, (unsigned long long) c->rip,
                 (unsigned long long)(g_fault == s ? g_faddr : 0), pinfo[s].si_code, (unsigned long long) c->r[RSP]);
