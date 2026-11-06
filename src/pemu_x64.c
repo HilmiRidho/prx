@@ -2240,7 +2240,7 @@ static void step(CPU*c) {
         int sr = m.reg & 7; if (sr == 1 || sr > 5) goto bad;      /* cs cannot be loaded */
         (void) rdm(c, &in, &m, 2);
         break; }
-    case 0x8F: { modrm(c, &in, &m, 0); u64 v = pop(c); if (m.ismem && (m.rm == RSP)) {} wrm(c, &in, &m, 8, v); break; }
+    case 0x8F: { u64 sp0 = c->r[RSP]; c->r[RSP] = sp0 + 8; modrm(c, &in, &m, 0); c->r[RSP] = sp0; u64 v = pop(c); wrm(c, &in, &m, 8, v); break; }
     case 0x90:
         if (rexB) { u64 t = c->r[8]; c->r[8] = c->r[RAX]; c->r[RAX] = t; }
         break;
