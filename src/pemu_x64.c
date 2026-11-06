@@ -355,6 +355,7 @@ static void fx_save(CPU*c, u8*p);                      /* FXSAVE image: fxsave, 
 static void fx_restore(CPU*c, const u8*p);
 static const int gidx[16] = {8, 9, 10, 11, 12, 13, 14, 15, 7, 6, 5, 3, 2, 0, 1, 4};
 #define SFRAME 1088
+static __thread u64 g_ring[64]; static __thread unsigned g_ringi;      /* diagnostics (QEMU_STRACE): the last interpreted instruction addresses */
 static void trace_map(const char *tag, u64 a) {                  /* diagnostics: the mapping that holds address a, with the offset in its file */
     FILE *f = fopen("/proc/self/maps", "r"); char l[512];
     if (!f) return;
@@ -377,6 +378,11 @@ static void deliver_sig(CPU*c, int s) {
         for (int k = 0; k < 6; k++) {
             u64 w = ((u64*) c->r[RSP])[k]; char t[16]; snprintf(t, sizeof t, "[rsp+%d]", 8 * k);
             fprintf(stderr, "pemu:   %s = %#llx\n", t, (unsigned long long) w); trace_map(t, w);
+        }
+        if (g_ringi) for (unsigned k = g_ringi > 24 ? g_ringi - 24 : 0; k < g_ringi; k++) {            /* the last instructions, oldest first (interpreter only: PEMU_JIT=0) */
+            const u8 *q = (const u8*) g_ring[k & 63];
+            fprintf(stderr, "pemu:   exec %#llx: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n", (unsigned long long) g_ring[k & 63], q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9]);
+            if (k == g_ringi - 1 || k == g_ringi - 24) trace_map("insn", g_ring[k & 63]);
         }
     }
     if (g_trace && (s == SIGSEGV || s == SIGBUS || s == SIGILL || s == SIGFPE || s == SIGABRT || s == SIGTRAP))          /* diagnostics: what the guest's own handler is about to see */
@@ -2156,6 +2162,7 @@ static void gp_fault(CPU*c) {
 static void step(CPU*c) {
     I in; memset(&in, 0, sizeof in);
     u8*start = (u8*) c->rip, *ip = start;
+    if (__builtin_expect(g_trace, 0)) g_ring[g_ringi++ & 63] = c->rip;
     M m;
     for (;;) {
         u8 b = *ip;
