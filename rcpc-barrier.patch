@@ -1,0 +1,268 @@
+diff -ruN a/src/pemu.c b/src/pemu.c
+--- a/src/pemu.c	2026-11-06 12:06:42.414620317 +0000
++++ b/src/pemu.c	2026-11-06 12:06:42.420890918 +0000
+@@ -681,6 +681,25 @@
+         if (idx == 1 || idx == 3) SETS(rn, nbase);
+         return 0;
+     }
++    if ((i & 0x3F200C00) == 0x19000000) {                      /* LDAPUR / STLUR / LDAPURS* (FEAT_LRCPC2): unscaled offset, acquire-PC / release */
++        int size = i >> 30, opc = (i >> 22) & 3, nb = 1 << size;
++        u64 a = XS(rn) + (u64) sext((i >> 12) & 0x1ff, 9);
++#ifdef PEMU_EMBED
++        /* strict on purpose: without FEAT_LSE2 the hardware raises an alignment fault for these (with it, when the access crosses
++         * a 16-byte boundary), and pemu_x64's JIT must never emit one for an address that is not naturally aligned */
++        if (a & (u64)(nb - 1)) { fprintf(stderr, "pemu: misaligned LDAPUR/STLUR at %#llx (size %d)\n", (unsigned long long) a, nb); abort(); }
++#endif
++        __atomic_thread_fence(__ATOMIC_SEQ_CST);
++        if (opc == 0) mwr(a, X(rt), nb);
++        else if (opc == 1) SET(rt, mrd(a, nb));
++        else {
++            if (size == 3 || (opc == 3 && size == 2)) return -1;
++            u64 v = (u64) sext(mrd(a, nb), nb * 8); if (opc == 3) v &= M32;
++            SET(rt, v);
++        }
++        __atomic_thread_fence(__ATOMIC_SEQ_CST);
++        return 0;
++    }
+     if ((i & 0x3B000000) == 0x38000000 || (i & 0x3B000000) == 0x39000000) {   /* register */
+         int size = i >> 30, V = (i >> 26) & 1, opc = (i >> 22) & 3, sc, nb, isld, sgn = 0, to64 = 0;
+         if (!V) {
+diff -ruN a/src/pemu_x64.c b/src/pemu_x64.c
+--- a/src/pemu_x64.c	2026-11-06 12:06:42.414683371 +0000
++++ b/src/pemu_x64.c	2026-11-06 12:06:42.420958592 +0000
+@@ -21,7 +21,8 @@
+  * Disable it with PEMU_JIT=0 or -nojit. The JIT works with guest threads (one shared cache, see JT).
+  * PEMU_JIT_OPT=<mask> (default 127) toggles optional translations: 1 = lazy flags for shift-by-immediate, 2 = scalar SSE float,
+  * 4 = guest rax..rdi pinned to host registers, 8 = superblocks, 16 = return stack buffer, 32 = comiss/comisd/ucomiss/ucomisd with the host
+- * flags of fcmp, 64 = div/idiv through udiv/sdiv (only when the dividend fits and the divisor is not 0 or -1; the rest is interpreted).
++ * flags of fcmp, 64 = div/idiv through udiv/sdiv (only when the dividend fits and the divisor is not 0 or -1; the rest is interpreted),
++ * 1024 = ldapur/stlur for aligned integer accesses of multi-threaded guests (needs FEAT_LRCPC2; see m_ld).
+  * Not a security boundary. */
+ #define _GNU_SOURCE
+ #include <stdio.h>
+@@ -47,6 +48,7 @@
+ #include <sys/wait.h>
+ #include <sys/time.h>
+ #include <pthread.h>
++#include <sys/auxv.h>
+ #include <linux/futex.h>
+ #include <stddef.h>
+ 
+@@ -2621,6 +2623,7 @@
+ static pthread_mutex_t jmu = PTHREAD_MUTEX_INITIALIZER;
+ static volatile int g_jstop;
+ static volatile u32 g_jgen;
++static int g_jrcpc;                                            /* JOPT_RCPC is on and the host has FEAT_LRCPC2 (HWCAP_ILRCPC) */
+ static int g_jmt;                                              /* the guest has more than one thread: translated code carries x86 memory-ordering barriers */
+ static u32 *jt_start; static u64 jt_pc;                        /* block being translated (visible to its own chained exits only) */
+ static unsigned long long jst_blocks, jst_flush, jst_chain, jst_ins, jst_words;
+@@ -2634,8 +2637,9 @@
+ #define JOPT_DIV  64u                   /* 32/64-bit div and idiv with udiv/sdiv when the dividend fits and the divisor is not 0 or -1 */
+ #define JOPT_CC   128u                  /* jcc/setcc/cmovcc after an interpreter fallback: a flags-only helper call instead of interpreting them too */
+ #define JOPT_INT  256u                  /* one-operand mul/imul (flags dead), bswap, 8/16-bit shl/shr/sar (flags dead) */
++#define JOPT_RCPC 1024u                 /* multi-threaded guests: aligned integer loads/stores use ldapur/stlur (FEAT_LRCPC2) instead of ldur + dmb / dmb + stur; unaligned ones keep the dmb pair */
+ #define JOPT_ATOM 512u                  /* lock-prefixed add/sub/and/or/xor/inc/dec, cmpxchg, xadd, xchg (LL/SC loops), adc/sbb, push m64, xchg rax,r, movq xmm,xmm/m64, 8/16-bit rol/ror by immediate (flags dead) */
+-static unsigned g_jopt = JOPT_SHFL | JOPT_FP | JOPT_PIN | JOPT_SB | JOPT_RSB | JOPT_FCMP | JOPT_DIV | JOPT_CC | JOPT_INT | JOPT_ATOM;   /* PEMU_JIT_OPT=<mask> overrides (0 = none): handy to bisect a misbehaving guest */
++static unsigned g_jopt = JOPT_SHFL | JOPT_FP | JOPT_PIN | JOPT_SB | JOPT_RSB | JOPT_FCMP | JOPT_DIV | JOPT_CC | JOPT_INT | JOPT_ATOM | JOPT_RCPC;   /* PEMU_JIT_OPT=<mask> overrides (0 = none): handy to bisect a misbehaving guest */
+ /* Register pinning: guest rax,rcx,rdx,rbx,rsp,rbp,rsi,rdi (numbers 0..7) are kept in callee-saved host registers, so
+  * they survive helper calls and chained block-to-block branches. The CPU struct is only written back when translated
+  * code is left (jepi), around an interpreter fallback (j_pin_spill / j_pin_fill) and, after a fault, from the signal
+@@ -2798,9 +2802,38 @@
+  * Single-threaded guests pay nothing. */
+ static void a_dmb_ld(void) { if (g_jmt) E(0xD50339BFu); }               /* dmb ishld */
+ static void a_dmb_st(void) { if (g_jmt) E(0xD5033ABFu); }               /* dmb ishst */
++/* FEAT_LRCPC2 forms (HWCAP_ILRCPC): ldapur = load-acquire(PC), stlur = store-release, both with the unscaled imm9 of ldur/stur.
++ * An acquire load orders itself before all later loads and stores, a release store orders all earlier loads and stores before
++ * itself, and a release store followed by an acquire(PC) load may still be reordered: that is exactly x86 TSO, so they replace
++ * "ldur + dmb ishld" and "dmb ishst + stur" for integer accesses. They need NATURAL alignment (with FEAT_LSE2: no 16-byte
++ * boundary crossing) and fault otherwise, and x86 guests use unaligned addresses freely, so every 2/4/8-byte access is guarded:
++ * the low address bits are tested (and + cbnz: no host flags are touched, the JIT keeps them live) and a misaligned address takes
++ * the old dmb sequence. 1-byte accesses are always aligned and need no guard. x17 is the scratch (it is only ever used inside
++ * fl_spill / j_adc, never across an access); both operands must not be x17. SSE/FP accesses keep the dmb pair: LRCPC2 has no
++ * vector forms. */
++static void a_rc_s(int size, int opc, int rt, int rn, int off) {          /* opc as a_ldst_s: 0 stlur, 1 ldapur, 2 ldapurs* to x, 3 ldapurs* to w */
++    E((u32) size << 30 | 0x19000000u | (u32) opc << 22 | ((u32) off & 0x1ff) << 12 | (u32) rn << 5 | (u32) rt);
++}
++static u32 *j_align_guard(int sz, int rn, int off) {                      /* returns the cbnz to the slow path (taken when [rn + off] is not sz-aligned) */
++    int nb = sz == 2 ? 1 : sz == 4 ? 2 : 3;
++    if (off % sz == 0) a_andmask(17, rn, nb);
++    else { a_addi(off < 0, 17, rn, (u32)(off < 0 ? -off : off), 0); a_andmask(17, 17, nb); }
++    return a_cbz_fwd(1, 17);
++}
++static inline int j_rc_ok(int rt, int rn) { return g_jmt && g_jrcpc && rt != 17 && rn != 17; }
+ static void m_ld(int sz, int sgn, int sf, int rt, int rn, int off) {      /* guest memory, [rn + off], off in -256..255 */
+-    int size = sz == 1 ? 0 : sz == 2 ? 1 : sz == 4 ? 2 : 3;
+-    a_ldst_s(size, !sgn ? 1 : (sf ? 2 : 3), rt, rn, off); a_dmb_ld();
++    int size = sz == 1 ? 0 : sz == 2 ? 1 : sz == 4 ? 2 : 3, opc = !sgn ? 1 : (sf ? 2 : 3);
++    if (j_rc_ok(rt, rn)) {
++        if (sz == 1) { a_rc_s(size, opc, rt, rn, off); return; }
++        u32 *slow = j_align_guard(sz, rn, off);
++        a_rc_s(size, opc, rt, rn, off);
++        u32 *end = a_b_fwd();
++        jpatch19(slow);
++        a_ldst_s(size, opc, rt, rn, off); a_dmb_ld();
++        jpatch26(end);
++        return;
++    }
++    a_ldst_s(size, opc, rt, rn, off); a_dmb_ld();
+ }
+ #define OFF_X(n) ((u32) offsetof(CPU, x) + 16u * (u32)(n))
+ static void q_ldc(int vt, u32 off) { E(0x3DC00000u | ((off >> 4) & 0xfff) << 10 | (u32) RCPU << 5 | (u32) vt); }       /* ldr qt, [cpu, #off] */
+@@ -2849,6 +2882,16 @@
+ static void f_scvtf(int sz, int src64, int vd, int rn) { E(0x1E220000u | (src64 ? 0x80000000u : 0u) | (sz == 8 ? 1u << 22 : 0u) | (u32) rn << 5 | (u32) vd); }   /* scvtf dd/sd, xn/wn */
+ static void m_st(int sz, int rt, int rn, int off) {
+     int size = sz == 1 ? 0 : sz == 2 ? 1 : sz == 4 ? 2 : 3;
++    if (j_rc_ok(rt, rn)) {
++        if (sz == 1) { a_rc_s(size, 0, rt, rn, off); return; }
++        u32 *slow = j_align_guard(sz, rn, off);
++        a_rc_s(size, 0, rt, rn, off);
++        u32 *end = a_b_fwd();
++        jpatch19(slow);
++        a_dmb_st(); a_ldst_s(size, 0, rt, rn, off);
++        jpatch26(end);
++        return;
++    }
+     a_dmb_st(); a_ldst_s(size, 0, rt, rn, off);
+ }
+ 
+@@ -3431,13 +3474,13 @@
+ }
+ static void j_push(int rv) {                                    /* the store comes first: a fault leaves rsp unchanged */
+     int hs = pin(RSP);
+-    if (hs >= 0) { a_dmb_st(); a_ldst_s(3, 0, rv, hs, -8); a_addi(1, hs, hs, 8, 0); return; }
+-    c_ld(1, OFF_R(RSP)); a_addi(1, 1, 1, 8, 0); a_dmb_st(); a_ldst_s(3, 0, rv, 1, 0); c_st(1, OFF_R(RSP));
++    if (hs >= 0) { m_st(8, rv, hs, -8); a_addi(1, hs, hs, 8, 0); return; }
++    c_ld(1, OFF_R(RSP)); a_addi(1, 1, 1, 8, 0); m_st(8, rv, 1, 0); c_st(1, OFF_R(RSP));
+ }
+ static void j_pop(int rv) {
+     int hs = pin(RSP);
+-    if (hs >= 0) { a_ldst_s(3, 1, rv, hs, 0); a_dmb_ld(); a_addi(0, hs, hs, 8, 0); return; }
+-    c_ld(1, OFF_R(RSP)); a_ldst_s(3, 1, rv, 1, 0); a_dmb_ld(); a_addi(0, 1, 1, 8, 0); c_st(1, OFF_R(RSP));
++    if (hs >= 0) { m_ld(8, 0, 0, rv, hs, 0); a_addi(0, hs, hs, 8, 0); return; }
++    c_ld(1, OFF_R(RSP)); m_ld(8, 0, 0, rv, 1, 0); a_addi(0, 1, 1, 8, 0); c_st(1, OFF_R(RSP));
+ }
+ 
+ static void j_fb(const JI *j) {                       /* run one instruction through the interpreter */
+@@ -3678,8 +3721,8 @@
+     case JO_POP: fl_flush(j->lvb); j_pop(0); g_st(0, j->ar, 8, 0); break;
+     case JO_LEAVE:
+         fl_flush(j->lvb);
+-        if (pin(RBP) >= 0) { a_ldst_s(3, 1, 2, pin(RBP), 0); a_dmb_ld(); a_addi(0, pin(RSP), pin(RBP), 8, 0); a_mov(pin(RBP), 2); break; }
+-        c_ld(0, OFF_R(RBP)); a_ldst_s(3, 1, 2, 0, 0); a_dmb_ld(); a_addi(0, 0, 0, 8, 0); c_st(0, OFF_R(RSP)); c_st(2, OFF_R(RBP)); break;
++        if (pin(RBP) >= 0) { m_ld(8, 0, 0, 2, pin(RBP), 0); a_addi(0, pin(RSP), pin(RBP), 8, 0); a_mov(pin(RBP), 2); break; }
++        c_ld(0, OFF_R(RBP)); m_ld(8, 0, 0, 2, 0, 0); a_addi(0, 0, 0, 8, 0); c_st(0, OFF_R(RSP)); c_st(2, OFF_R(RBP)); break;
+     case JO_CWDE:
+         if (sz == 8) { g_ld(0, RAX, 4, 0); a_sxtw(0, 0); g_st(0, RAX, 8, 0); }
+         else { g_ld(0, RAX, 2, 0); a_sxth(0, 0, 0); g_st(0, RAX, 4, 0); }
+@@ -4019,11 +4062,11 @@
+         fl_flush(j->lvb);
+         if (pin(RSP) >= 0) {
+             int hs = pin(RSP);
+-            a_ldst_s(3, 1, 0, hs, 0); a_dmb_ld(); a_addi(0, hs, hs, 8, 0);
++            m_ld(8, 0, 0, 0, hs, 0); a_addi(0, hs, hs, 8, 0);
+             if (j->imm) { a_movi(2, j->imm); a_addsh(hs, hs, 2, 0); }
+             jx_ret(); return 1;
+         }
+-        c_ld(1, OFF_R(RSP)); a_ldst_s(3, 1, 0, 1, 0); a_dmb_ld(); a_addi(0, 1, 1, 8, 0);
++        c_ld(1, OFF_R(RSP)); m_ld(8, 0, 0, 0, 1, 0); a_addi(0, 1, 1, 8, 0);
+         if (j->imm) { a_movi(2, j->imm); a_addsh(1, 1, 2, 0); }
+         c_st(1, OFF_R(RSP)); jx_ret(); return 1;
+     case JO_JMPI: case JO_CALLI:
+@@ -4296,6 +4339,11 @@
+     if (!jh || !jpg || !jm_off || !jm_pc) return -1;
+     { const char *eo = getenv("PEMU_JIT_OPT"); if (eo && *eo) g_jopt = (unsigned) strtoul(eo, NULL, 0); }
+     g_jpin = !!(g_jopt & JOPT_PIN);
++#ifdef PEMU_JIT_EMBED
++    g_jrcpc = !!(g_jopt & JOPT_RCPC);                             /* the interpreter of pemu.c executes ldapur/stlur (and aborts on a misaligned one) */
++#else
++    g_jrcpc = (g_jopt & JOPT_RCPC) && (getauxval(AT_HWCAP) & (1ul << 26));      /* HWCAP_ILRCPC: FEAT_LRCPC2 (ldapur/stlur) */
++#endif
+     jcur = jbase;
+     jenter = jcur;                                                /* void jenter(CPU *c, void *code, volatile u64 *pend, JEnt *ic) */
+     E(0xA9800000u | (u32)(-12 & 0x7f) << 15 | 30u << 10 | 31u << 5 | 29u);           /* stp x29, x30, [sp, #-96]! */
+diff -ruN a/tests/pemu_x64/jitrcpc.c b/tests/pemu_x64/jitrcpc.c
+--- a/tests/pemu_x64/jitrcpc.c	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/pemu_x64/jitrcpc.c	2026-11-06 12:06:42.422281154 +0000
+@@ -0,0 +1,66 @@
++/* Multi-threaded guest (so the JIT emits x86 memory-ordering code) doing integer loads/stores of 2/4/8 bytes at every offset,
++ * aligned and not, across 16/64-byte boundaries, plus push/pop/leave/ret on a misaligned rsp. With the ldapur/stlur translation
++ * (JOPT_RCPC) a misaligned address must take the dmb path; the strict interpreter of the test build aborts if one reaches ldapur/stlur. */
++#include <stdio.h>
++#include <stdint.h>
++#include <string.h>
++#include <pthread.h>
++#include <unistd.h>
++typedef uint16_t __attribute__((aligned(1), may_alias)) u16u;
++typedef uint32_t __attribute__((aligned(1), may_alias)) u32u;
++typedef uint64_t __attribute__((aligned(1), may_alias)) u64u;
++typedef int16_t  __attribute__((aligned(1), may_alias)) s16u;
++typedef int32_t  __attribute__((aligned(1), may_alias)) s32u;
++
++static volatile int stop;
++static void *idle(void *a) { (void) a; while (!stop) usleep(1000); return 0; }
++static unsigned char buf[256] __attribute__((aligned(64)));
++static int bad;
++#define CHECK(c) do { if (!(c)) { bad++; printf("FAIL line %d\n", __LINE__); } } while (0)
++
++__asm__(".text\n.globl t_leave\nt_leave:\n push %rbp\n mov %rsp,%r10\n lea 3(%rdi),%rbp\n leave\n mov %rbp,%rax\n mov %r10,%rsp\n pop %rbp\n ret\n"
++        ".globl t_ret\nt_ret:\n mov %rsp,%r10\n lea 3(%rdi),%rsp\n ret\n"
++        ".globl t_land\nt_land:\n mov %r10,%rsp\n mov $77,%eax\n ret\n");
++extern uint64_t t_leave(void *p), t_ret(void *p);
++extern char t_land[];
++
++static uint64_t pushpop(uint64_t v, void *where) {
++    uint64_t out;
++    __asm__ volatile("mov %%rsp,%%r11\n lea 3(%2),%%rsp\n push %1\n pop %0\n mov %%r11,%%rsp" : "=r"(out) : "r"(v), "r"(where) : "r11", "memory");
++    return out;
++}
++
++int main(void) {
++    pthread_t t; pthread_create(&t, 0, idle, 0);
++    for (int off = 0; off < 40; off++) {
++        unsigned char *p = buf + 16 + off;
++        uint64_t v = 0x1122334455667788ull ^ ((uint64_t) off * 0x0101010101010101ull);
++        memset(buf, 0xA5, sizeof buf);
++        *(volatile u64u *) p = v;
++        for (int i = 0; i < 8; i++) CHECK(p[i] == (unsigned char)(v >> (8 * i)));
++        CHECK(*(volatile u64u *) p == v);
++        CHECK(buf[16 + off - 1] == 0xA5 && buf[16 + off + 8] == 0xA5);
++        *(volatile u32u *) (p + 1) = (uint32_t) (v >> 7);
++        CHECK(*(volatile u32u *) (p + 1) == (uint32_t) (v >> 7));
++        *(volatile u16u *) (p + 3) = (uint16_t) (v >> 3);
++        CHECK(*(volatile u16u *) (p + 3) == (uint16_t) (v >> 3));
++        for (int i = 0; i < 8; i++) p[i] = (unsigned char) (0x80 + i + off);        /* byte stores, then wide loads */
++        uint64_t w = 0; for (int i = 7; i >= 0; i--) w = w << 8 | (unsigned char) (0x80 + i + off);
++        CHECK(*(volatile u64u *) p == w);
++        CHECK((int64_t) *(volatile s32u *) p == (int64_t) (int32_t) (uint32_t) w);         /* movsxd */
++        CHECK((int64_t) *(volatile s16u *) (p + 2) == (int64_t) (int16_t) (uint16_t) (w >> 16));   /* movsx */
++        *(volatile u64u *) p += 5; CHECK(*(volatile u64u *) p == w + 5);                    /* read-modify-write */
++    }
++    for (int off = 0; off < 16; off++) {
++        uint64_t v = 0xDEADBEEF00000000ull | (uint64_t) off;
++        memset(buf, 0, sizeof buf);
++        CHECK(pushpop(v, buf + 64 + off) == v);
++        *(volatile u64u *) (buf + 3 + off) = v;
++        CHECK(t_leave(buf + off) == v);
++        *(volatile u64u *) (buf + 3 + off) = (uint64_t) t_land;
++        CHECK(t_ret(buf + off) == 77);
++    }
++    stop = 1; pthread_join(t, 0);
++    puts(bad ? "rcpc FAIL" : "rcpc ok");
++    return bad != 0;
++}
+diff -ruN a/tests/pemu_x64/jitrcpc.expect b/tests/pemu_x64/jitrcpc.expect
+--- a/tests/pemu_x64/jitrcpc.expect	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/pemu_x64/jitrcpc.expect	2026-11-06 12:06:42.424512778 +0000
+@@ -0,0 +1 @@
++rcpc ok
+diff -ruN a/tests/pemu_x64_test.sh b/tests/pemu_x64_test.sh
+--- a/tests/pemu_x64_test.sh	2026-11-06 12:06:42.418365866 +0000
++++ b/tests/pemu_x64_test.sh	2026-11-06 12:06:42.424592297 +0000
+@@ -32,6 +32,7 @@
+ ARGS="" run atomic 0 -O1 -static -pthread "$D/atomic.c"
+ ARGS="" run sigalt 0 -O1 -static -pthread "$D/sigalt.c"
+ ARGS="" run jitopt 0 -O1 -static -pthread "$D/jitopt.c"
++ARGS="" run jitrcpc 0 -O1 -static -pthread "$D/jitrcpc.c"
+ ARGS="" run jitint 0 -O1 -static "$D/jitint.c"
+ ARGS="" run jitincdec 0 -O1 -static "$D/jitincdec.c"
+ ARGS="" run jitatom 0 -O1 -static "$D/jitatom.c"
