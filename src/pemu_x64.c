@@ -1259,6 +1259,12 @@ static void do_syscall(CPU*c) {
     u64 n = c->r[RAX];
     u64 ta0 = c->r[RDI], ta1 = c->r[RSI], ta2 = c->r[RDX];
     if (g_trace) fprintf(stderr, "pemu: syscall %llu (%lld, %llx, %llx) ...\n", (unsigned long long) n, (long long) ta0, (unsigned long long) ta1, (unsigned long long) ta2);
+    if (g_trace) {   /* show the path argument of path-taking syscalls */
+        u64 pp = 0;
+        switch (n) { case 2: case 4: case 6: case 21: case 59: case 80: case 83: case 84: case 87: case 89: case 90: case 92: pp = ta0; break;
+                     case 257: case 258: case 262: case 263: case 267: case 268: case 269: case 322: pp = ta1; break; default: break; }
+        if (pp > 0x10000 && pp < 0x7fffffffffffULL) fprintf(stderr, "pemu:   path=\"%.200s\"\n", (const char*) (uintptr_t) pp);
+    }
     long r = gsys(c, &noset);
     if (g_trace) fprintf(stderr, "pemu: syscall %llu -> %ld\n", (unsigned long long) n, r);
     if (g_trace && n == 7 && r > 0 && ta0 > 0x10000) { const short*pf = (const short*) (uintptr_t) ta0; fprintf(stderr, "pemu:   poll fd0=%d events=%#x revents=%#x nfds=%llu\n", *(const int*) pf, pf[2], pf[3], (unsigned long long) ta1); }
