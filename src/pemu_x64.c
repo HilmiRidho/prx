@@ -1257,9 +1257,12 @@ static long gsys(CPU*c, int*noset) {
 static void do_syscall(CPU*c) {
     int noset = 0;
     u64 n = c->r[RAX];
-    if (g_trace) fprintf(stderr, "pemu: syscall %llu ...\n", (unsigned long long) n);
+    u64 ta0 = c->r[RDI], ta1 = c->r[RSI], ta2 = c->r[RDX];
+    if (g_trace) fprintf(stderr, "pemu: syscall %llu (%lld, %llx, %llx) ...\n", (unsigned long long) n, (long long) ta0, (unsigned long long) ta1, (unsigned long long) ta2);
     long r = gsys(c, &noset);
     if (g_trace) fprintf(stderr, "pemu: syscall %llu -> %ld\n", (unsigned long long) n, r);
+    if (g_trace && n == 7 && r > 0 && ta0 > 0x10000) { const short*pf = (const short*) (uintptr_t) ta0; fprintf(stderr, "pemu:   poll fd0=%d events=%#x revents=%#x nfds=%llu\n", *(const int*) pf, pf[2], pf[3], (unsigned long long) ta1); }
+    if (g_trace && n == 53 && r == 0) { const int*sv = (const int*) (uintptr_t) c->r[10]; if (sv) fprintf(stderr, "pemu:   socketpair -> fds %d %d\n", sv[0], sv[1]); }
     if (!noset) c->r[RAX] = (u64) r;
 #ifdef HAVE_JIT
     if (g_jit_on) jit_post_syscall(c, n, r);
