@@ -1,0 +1,41 @@
+--- a/src/pemu_x64.c
++++ b/src/pemu_x64.c
+@@ -495,8 +495,36 @@
+     int k = 0;
+     nv[k++] = g_self; nv[k++] = "-0"; nv[k++] = n ? argv[0] : (char*) path; nv[k++] = (char*) path;
+     for (int i = 1; i < n; i++) nv[k++] = argv[i];
+-    long r = hs(SYS_execve, (long) g_self, (long) nv, (long) envp, 0, 0, 0);
+-    free(nv);
++    /* g_self is a HOST binary (bionic on Android). If the guest's LD_LIBRARY_PATH / LD_PRELOAD
++       reach it, the host linker picks up guest libs (e.g. rootfs libm.so, a GNU ld script) and
++       dies with "bad ELF magic". Hide those two from the host exec and hand them over through
++       QEMU_SET_ENV, which main() applies to the guest environment. */
++    int ne = 0; while (envp && envp[ne]) ne++;
++    char**nenv = calloc((size_t) ne + 2, sizeof *nenv);
++    const char*ldl = NULL, *ldp = NULL, *oldset = NULL;
++    int m = 0;
++    for (int i = 0; i < ne; i++) {
++        if (!strncmp(envp[i], "LD_LIBRARY_PATH=", 16)) ldl = envp[i] + 16;
++        else if (!strncmp(envp[i], "LD_PRELOAD=", 11)) ldp = envp[i] + 11;
++        else if (!strncmp(envp[i], "QEMU_SET_ENV=", 13)) oldset = envp[i] + 13;
++        else nenv[m++] = envp[i];
++    }
++    char*setv = NULL;
++    if (ldl || ldp || oldset) {
++        size_t cap = 32 + (ldl ? strlen(ldl) : 0) + (ldp ? strlen(ldp) : 0) + (oldset ? strlen(oldset) : 0);
++        setv = malloc(cap);
++        if (setv) {
++            int o = snprintf(setv, cap, "QEMU_SET_ENV=");
++            if (oldset && *oldset) o += snprintf(setv + o, cap - (size_t) o, "%s,", oldset);
++            if (ldp) o += snprintf(setv + o, cap - (size_t) o, "LD_PRELOAD=%s,", ldp);
++            if (ldl) o += snprintf(setv + o, cap - (size_t) o, "LD_LIBRARY_PATH=%s,", ldl);
++            if (o > 0 && setv[o - 1] == ',') setv[o - 1] = 0;
++            nenv[m++] = setv;
++        }
++    }
++    nenv[m] = NULL;
++    long r = hs(SYS_execve, (long) g_self, (long) nv, (long) nenv, 0, 0, 0);
++    free(nv); free(nenv); free(setv);
+     return r;
+ }
+ 
